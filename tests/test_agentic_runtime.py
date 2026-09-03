@@ -62,6 +62,50 @@ async def test_executor_internal_dispatch(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_executor_stamps_agent_tool_flag(monkeypatch):
+    """Internal tools executed through the executor must always see
+    ``agent_tool: True`` in context (on a COPY, never mutating the caller's
+    dict), so plugins like web_search take their pure-tool branch — returning
+    the results to the bounded loop instead of enqueuing a user-facing delivery
+    that spams the info summary and starves the loop of the search content
+    (one request -> many web-search replies + a never-ending loop)."""
+
+    captured = {}
+
+    async def fake_run_action(action, context, bot, original_message):
+        captured["context"] = context
+        return {"result": "did the thing"}
+
+    monkeypatch.setattr("core.action_parser.run_action", fake_run_action)
+
+    from core.tool_registry import tool_registry
+
+    tool_registry._tools.clear()
+    tool_registry.load_internal_actions(
+        {
+            "fake_action": {
+                "schema": {"type": "object", "properties": {}},
+                "brief": "test",
+                "security_level": "low",
+                "external_effects": [],
+            }
+        }
+    )
+
+    try:
+        caller_ctx = {"interface_path": "tg/1", "from_cortex": True}
+        res = await agent_tool_executor.execute(
+            "fake_action", {"payload": {"a": 1}}, context=caller_ctx
+        )
+        assert res["ok"] is True
+        assert captured["context"]["agent_tool"] is True
+        # The caller's dict is never mutated.
+        assert "agent_tool" not in caller_ctx
+    finally:
+        tool_registry._tools.clear()
+
+
+@pytest.mark.asyncio
 async def test_run_agentic_turn_completed(monkeypatch):
     """The loop ends when the model calls the attempt_completion sentinel."""
 

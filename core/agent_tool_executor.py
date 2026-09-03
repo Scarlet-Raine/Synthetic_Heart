@@ -113,9 +113,25 @@ class AgentToolExecutor:
         action = {"type": tool.name, "payload": arguments}
         try:
             log_info(f"[agent_tool_executor] Executing internal tool '{tool.name}'")
+            # Stamp the agent-tool marker onto a COPY of the caller context so
+            # plugins that behave differently when invoked as agent tools (e.g.
+            # web_search returns its results to the bounded loop instead of
+            # enqueueing a user-facing delivery) can rely on it. The caller's
+            # dict is never mutated. Prior to this the flag only appeared in the
+            # ``or`` fallback, which never fired because the Agent Lane always
+            # passes a non-empty router context WITHOUT ``agent_tool`` — so the
+            # web_search plugin took its delivery branch on every agent-loop
+            # search: it enqueued a separate info-summary message per call AND
+            # returned only ``{"status":"ok","results_count":N}`` to the loop,
+            # so the model never saw the search content and kept re-searching
+            # forever (one request -> many web-search replies + a never-ending
+            # loop).
+            exec_context = dict(context or {})
+            exec_context["agent_tool"] = True
+            exec_context.setdefault("from_cortex", True)
             result = await run_action(
                 action,
-                context or {"from_cortex": True, "agent_tool": True},
+                exec_context,
                 None,
                 original_message,
             )
