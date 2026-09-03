@@ -2829,6 +2829,12 @@ class TelegramInterface:
 
         # Unified 'reply_to' overrides the automatic original-message reply.
         explicit_reply = payload.get("reply_to") or payload.get("reply_to_message_id")
+        # Bind reply_message_id on EVERY path. A non-numeric reply_to from the
+        # LLM (int() raising in the try below) previously left the local
+        # unbound, raising UnboundLocalError at send time — which sent every
+        # following turn into the corrector loop retrying the same broken
+        # send_message (3+ attempts per message).
+        reply_message_id = None
         if explicit_reply is not None:
             try:
                 reply_message_id = int(explicit_reply)
@@ -2836,8 +2842,6 @@ class TelegramInterface:
                 log_warning(
                     f"[telegram_interface] Discarding non-numeric reply_to {explicit_reply!r}"
                 )
-        else:
-            reply_message_id = None
         if (
             original_message
             and hasattr(original_message, "chat_id")

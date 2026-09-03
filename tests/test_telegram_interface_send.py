@@ -66,3 +66,33 @@ async def test_send_message_discards_non_numeric_thread_id(monkeypatch) -> None:
     assert sent.await_args is not None
     kwargs = sent.await_args.kwargs
     assert kwargs.get("thread_id") is None
+
+
+@pytest.mark.asyncio
+async def test_send_message_discards_non_numeric_reply_to(monkeypatch) -> None:
+    """A non-numeric ``reply_to`` from the LLM must be discarded (delivered
+    without a reply) instead of raising UnboundLocalError — the bug that sent
+    every following turn into the corrector loop retrying the same
+    send_message."""
+    iface = tbot.TelegramInterface(bot=cast(Any, SimpleNamespace()))
+
+    monkeypatch.setattr(
+        tbot,
+        "resolve_and_touch",
+        AsyncMock(return_value=None),
+    )
+    sent = AsyncMock(return_value=SimpleNamespace())
+    monkeypatch.setattr(tbot, "send_with_thread_fallback", sent)
+
+    await iface.send_message(
+        {
+            "text": "hello",
+            "interface_path": "telegram_bot/5208932647",
+            "reply_to": "not-a-number",
+        }
+    )
+
+    assert sent.await_count == 1
+    assert sent.await_args is not None
+    kwargs = sent.await_args.kwargs
+    assert kwargs.get("reply_to_message_id") is None
