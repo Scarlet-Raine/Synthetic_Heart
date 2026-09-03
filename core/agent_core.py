@@ -2096,6 +2096,33 @@ class AgentLoopManager:
             ]
             if message_calls:
                 tool_calls = [c for c in tool_calls if c not in message_calls]
+                # Second consecutive message-only iteration (neither had any
+                # other tool calls): the PREVIOUS message was already delivered
+                # and IS the final answer — this reworded follow-up is a
+                # duplicate, and sending it too is the "answered twice" bug
+                # (observed live: iteration N delivered the full breakdown,
+                # then the engine re-emitted a near-identical summary on
+                # iteration N+1 and BOTH reached Telegram). Suppress the
+                # re-send and end the turn with the first message standing.
+                if prev_iteration_message_only and not tool_calls:
+                    log_info(
+                        "[agent_core] Consecutive message-only iteration — "
+                        "suppressing duplicate reply (first already "
+                        "delivered); ending the turn"
+                    )
+                    observations.append(
+                        {
+                            "iteration": i,
+                            "role": "assistant",
+                            "content": (
+                                "Duplicate consecutive message-only reply "
+                                "suppressed — the previously delivered "
+                                "message is the final answer."
+                            ),
+                        }
+                    )
+                    stop_reason = "model_done"
+                    break
                 collected: list[str] = []
                 delivered_message_texts: list[str] = []
                 for mc in message_calls:

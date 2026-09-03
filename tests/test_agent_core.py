@@ -940,6 +940,92 @@ async def test_interim_message_cap_suppresses_reworded_duplicates(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_consecutive_message_only_iterations_deliver_once(monkeypatch):
+    """Two consecutive message-only iterations used to deliver BOTH messages —
+    iteration N's full reply AND iteration N+1's reworded duplicate (live: the
+    agent answered, the nudge asked it to continue, and it re-answered with a
+    near-identical summary — both reached Telegram). The second is a duplicate,
+    so it must be suppressed and the turn ended with the first as the sole
+    reply."""
+    from core.agent_core import _agent_loop_manager
+
+    call_jsons = [
+        json.dumps(
+            {
+                "actions": [
+                    {
+                        "type": "agent_read_file",
+                        "payload": {"path": "/tmp/x"},
+                    }
+                ]
+            }
+        ),
+        json.dumps(
+            {
+                "actions": [
+                    {
+                        "type": "message_telegram_bot",
+                        "payload": {
+                            "interface_path": "telegram_bot/5208932647",
+                            "text": "Alright, I dug into that link!",
+                        },
+                    }
+                ]
+            }
+        ),
+        json.dumps(
+            {
+                "actions": [
+                    {
+                        "type": "message_telegram_bot",
+                        "payload": {
+                            "interface_path": "telegram_bot/5208932647",
+                            "text": "Alright, I've pieced it all together!",
+                        },
+                    }
+                ]
+            }
+        ),
+    ]
+
+    async def fake_call_engine_direct(prompt, engine_name, cortex_scope="agent"):
+        return call_jsons.pop(0) if call_jsons else json.dumps({"actions": []})
+
+    monkeypatch.setattr(
+        _agent_loop_manager, "_call_engine_direct", fake_call_engine_direct
+    )
+
+    async def fake_persist(**kwargs):
+        return 1
+
+    monkeypatch.setattr(_agent_loop_manager, "_persist_agentic_turn", fake_persist)
+
+    delivered: list[str] = []
+
+    async def fake_execute(name, args, context=None, original_message=None):
+        if name == "agent_read_file":
+            return {"ok": True, "result": "file content"}
+        delivered.append(str(args.get("text") or args.get("content") or ""))
+        return {"ok": True, "result": args}
+
+    monkeypatch.setattr(
+        "core.agent_tool_executor.agent_tool_executor.execute", fake_execute
+    )
+
+    result = await _agent_loop_manager.run_agentic_turn(
+        goal="dig into the link",
+        engine="fake-engine",
+        max_iterations=4,
+        timeout_seconds=30.0,
+    )
+
+    # Only the FIRST message is delivered; the reworded duplicate is dropped
+    # and the turn ends on the second message-only iteration.
+    assert delivered == ["Alright, I dug into that link!"], delivered
+    assert result["stop_reason"] == "model_done"
+
+
+@pytest.mark.asyncio
 async def test_interim_message_cap_zero_disables_interim_messages(monkeypatch):
     """AGENT_MAX_INTERIM_MESSAGES=0 silences all mid-loop updates; the final
     answer channel (attempt_completion) is unaffected."""
