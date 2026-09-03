@@ -423,6 +423,8 @@ class GrilloChatObserverPlugin:
                     WHERE created_at > %s
                       AND COALESCE(sender_id, '') NOT IN (%s, %s)
                       AND COALESCE(sender_name, '') NOT IN (%s, %s)
+                      AND COALESCE(sender_id, '') <> 'karada_touch'
+                      AND COALESCE(sender_name, '') <> 'Karada'
                     """,
                     (since_dt, "self", "synth", "self", "synth"),
                 )
@@ -611,6 +613,31 @@ class GrilloChatObserverPlugin:
         return str(sender or "").strip().lower() in ("self", "synth", "synthetic")
 
     @staticmethod
+    def _is_karada_system_line(msg: dict) -> bool:
+        """True when a chat-history row is a Karada 3D-interaction touch line.
+
+        ``core/karada_touch_events`` writes these ambient rows (sender name
+        ``Karada`` / id ``karada_touch``, metadata ``{"karada_touch": True}``)
+        so Synth is aware of physical interaction with her body in the WebUI 3D
+        scene. They are context, not conversation: a tap on a window is not a
+        human message and must never be treated as an outreach target, a fresh
+        human turn, or a replyable snippet. The WebUI already hides them from
+        visible chat replay (``core/webui.py`` ``_replay_history``); this keeps
+        G.R.I.L.L.O. consistent. Structural sender/metadata checks only — never
+        text parsing.
+        """
+        if not isinstance(msg, dict):
+            return False
+        meta = msg.get("metadata")
+        if isinstance(meta, dict) and meta.get("karada_touch"):
+            return True
+        sender_id = str(msg.get("sender_id") or "").strip().lower()
+        if sender_id == "karada_touch":
+            return True
+        sender_name = str(msg.get("sender_name") or "").strip().lower()
+        return sender_name == "karada"
+
+    @staticmethod
     def _is_placeholder_path(interface_path: str) -> bool:
         """True when an interface path contains a placeholder/garbage segment.
 
@@ -716,6 +743,12 @@ class GrilloChatObserverPlugin:
                     taken = 0
                     for msg in reversed(list(messages)):
                         if not isinstance(msg, dict):
+                            continue
+                        # Karada 3D-interaction touch lines ("tapped a window")
+                        # are system-attached context, not human conversation —
+                        # surface the same structural exclusion as the WebUI
+                        # replay and target eligibility.
+                        if self._is_karada_system_line(msg):
                             continue
                         text = msg.get("text")
                         sender = (
@@ -823,6 +856,28 @@ class GrilloChatObserverPlugin:
                     continue
                 if not messages:
                     continue
+
+                # Karada 3D-interaction touch lines are system-attached context
+                # ("Scarlet tapped a window in the webui"), not human
+                # conversation. A path whose history holds only Karada taps and
+                # the synth's own lines (a phantom WebUI session nobody chats
+                # in) is never a routable outreach target — exclude it before
+                # any sender/cooldown/human-activity logic runs, and drop it
+                # entirely when no genuine human message exists at all.
+                real_messages = [
+                    m
+                    for m in messages
+                    if isinstance(m, dict) and not self._is_karada_system_line(m)
+                ]
+                human_messages = [
+                    m
+                    for m in real_messages
+                    if str(m.get("sender_name") or m.get("sender_id") or "")
+                    not in ("self", "synth", "-1")
+                ]
+                if not human_messages:
+                    continue
+                messages = real_messages
 
                 last_msg = messages[-1] if isinstance(messages[-1], dict) else {}
                 last_sender = str(

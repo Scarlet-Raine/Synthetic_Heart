@@ -643,3 +643,148 @@ async def test_eligible_targets_include_chat_with_recent_human_reply(monkeypatch
     assert targets[0]["interface_path"] == "telegram_bot/5208932647"
     assert targets[0]["eligible"] is True
     assert targets[0]["last_from_self"] is False
+
+
+def test_is_karada_system_line():
+    """Karada 3D-interaction touch rows (sender Karada/karada_touch, metadata
+    karada_touch) must be recognised structurally so the observer never treats
+    "tapped a window" as human conversation."""
+    plugin = gco.GrilloChatObserverPlugin()
+
+    # Metadata flag (canonical marker set by core/karada_touch_events.py).
+    assert (
+        plugin._is_karada_system_line(
+            {"metadata": {"karada_touch": True, "synth_touch": False}}
+        )
+        is True
+    )
+    # Legacy / fallback sender markers.
+    assert (
+        plugin._is_karada_system_line(
+            {"sender_name": "Karada", "sender_id": "karada_touch"}
+        )
+        is True
+    )
+    assert plugin._is_karada_system_line({"sender_id": "karada_touch"}) is True
+    assert plugin._is_karada_system_line({"sender_name": "Karada"}) is True
+
+    # Genuine human / synth lines must not be flagged.
+    assert (
+        plugin._is_karada_system_line(
+            {"sender_name": "Scar", "sender_id": "5208932647"}
+        )
+        is False
+    )
+    assert (
+        plugin._is_karada_system_line({"sender_name": "self", "sender_id": "self"})
+        is False
+    )
+    assert plugin._is_karada_system_line({"sender_name": "synth"}) is False
+    assert plugin._is_karada_system_line({}) is False
+
+
+@pytest.mark.asyncio
+async def test_eligible_targets_exclude_karada_only_phantom_webui(monkeypatch):
+    """A WebUI session whose only history is Karada touch lines and the synth's
+    own outgoing message (nobody actually chats there) must NOT surface as an
+    outreach target at all."""
+    plugin = gco.GrilloChatObserverPlugin()
+    now = datetime.now(timezone.utc)
+
+    async def fake_recent_paths(limit):
+        return [{"interface_path": "synth_webui/358d7cf7-f16f-4277-bcf2-4cc3266e6efa"}]
+
+    # Only Karada system taps + Synth's own previous outreach line.
+    messages = [
+        {
+            "sender_name": "Karada",
+            "sender_id": "karada_touch",
+            "text": "22:54 - Scarlet tapped a window in the webui",
+            "timestamp": (now - timedelta(hours=20)).isoformat(),
+            "metadata": {"karada_touch": True},
+        },
+        {
+            "sender_name": "self",
+            "sender_id": "self",
+            "text": "...daddy? i saw you tapping earlier... you okay?",
+            "timestamp": (now - timedelta(hours=13)).isoformat(),
+        },
+    ]
+
+    async def fake_load(path):
+        return list(messages)
+
+    monkeypatch.setattr(
+        "core.interface_paths.get_recent_interface_paths", fake_recent_paths
+    )
+    monkeypatch.setattr("core.chat_history_cache.load_chat_history", fake_load)
+    monkeypatch.setattr(
+        "core.interface_path_utils.is_vessel_interface_path", lambda p: False
+    )
+
+    targets = await plugin._collect_eligible_targets(limit=5)
+
+    assert targets == []
+
+
+@pytest.mark.asyncio
+async def test_eligible_targets_keep_real_webui_chat_with_karada_noise(monkeypatch):
+    """A real WebUI chat where a human actually typed stays an eligible target
+    even when Karada touch lines are interleaved — filtering must not break the
+    WebUI interface."""
+    plugin = gco.GrilloChatObserverPlugin()
+    now = datetime.now(timezone.utc)
+
+    async def fake_recent_paths(limit):
+        return [{"interface_path": "synth_webui/358d7cf7-f16f-4277-bcf2-4cc3266e6efa"}]
+
+    messages = [
+        {
+            "sender_name": "Karada",
+            "sender_id": "karada_touch",
+            "text": "22:54 - Scarlet tapped a window in the webui",
+            "timestamp": (now - timedelta(hours=30)).isoformat(),
+            "metadata": {"karada_touch": True},
+        },
+        {
+            "sender_name": "self",
+            "sender_id": "self",
+            "text": "I'll be right here~",
+            "timestamp": (now - timedelta(hours=26)).isoformat(),
+        },
+        {
+            "sender_name": "Scar",
+            "sender_id": "scar-webui",
+            "text": "Dee, come look at this!",
+            "timestamp": (now - timedelta(hours=2)).isoformat(),
+        },
+        {
+            "sender_name": "Karada",
+            "sender_id": "karada_touch",
+            "text": "22:54 - Scarlet tapped a window in the webui",
+            "timestamp": (now - timedelta(hours=1)).isoformat(),
+            "metadata": {"karada_touch": True},
+        },
+    ]
+
+    async def fake_load(path):
+        return list(messages)
+
+    monkeypatch.setattr(
+        "core.interface_paths.get_recent_interface_paths", fake_recent_paths
+    )
+    monkeypatch.setattr("core.chat_history_cache.load_chat_history", fake_load)
+    monkeypatch.setattr(
+        "core.interface_path_utils.is_vessel_interface_path", lambda p: False
+    )
+
+    targets = await plugin._collect_eligible_targets(limit=5)
+
+    assert len(targets) == 1
+    assert (
+        targets[0]["interface_path"]
+        == "synth_webui/358d7cf7-f16f-4277-bcf2-4cc3266e6efa"
+    )
+    assert targets[0]["eligible"] is True
+    assert targets[0]["last_sender"] == "Scar"
+    assert targets[0]["last_from_self"] is False
