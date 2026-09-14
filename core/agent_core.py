@@ -1576,12 +1576,20 @@ class AgentLoopManager:
         # must not spam the user on every iteration (observed live: one turn
         # sent three near-identical Telegram updates because each iteration
         # re-narrated the same status slightly differently — exact-text dedup
-        # can not catch that). At most ``AGENT_MAX_INTERIM_MESSAGES``
-        # successful mid-loop user-facing deliveries per turn; anything beyond
-        # is suppressed with an observation steering the model to finish and
-        # use attempt_completion for the final answer. Failed deliveries do
-        # not count against the cap (a retry must remain possible).
-        interim_messages_delivered = 0
+        # can not catch that; also observed: four distinct rewordings of a
+        # weather answer delivered to the SAME chat because each one landed on
+        # its own message-only iteration, which the older per-turn scalar
+        # counter never capped). At most ``AGENT_MAX_INTERIM_MESSAGES``
+        # successful mid-loop user-facing deliveries **per destination**
+        # (``interface_path``); anything beyond, to that SAME destination, is
+        # suppressed with an observation steering the model to finish and use
+        # attempt_completion for the final answer. Keyed per-target (not a
+        # single per-turn scalar) so a beat that legitimately reaches out to
+        # several DIFFERENT conversations in one turn (e.g. the Grillo chat
+        # observer's multi-target fan-out) is unaffected — only repeats to the
+        # SAME destination are capped. Failed deliveries do not count against
+        # the cap (a retry must remain possible).
+        interim_messages_delivered: dict[str, int] = {}
         try:
             max_interim_messages = max(
                 0,
@@ -2105,6 +2113,18 @@ class AgentLoopManager:
                         args = {}
                     text = str(args.get("text") or args.get("content") or "").strip()
                     is_delivery = _is_delivery_action(mc_name)
+                    # The destination this specific call targets. Falls back to
+                    # the turn's own originating conversation (the same
+                    # fallback ``core.message_registry`` documents for a reply
+                    # with no explicit ``interface_path``: it auto-routes to
+                    # the origin conversation), then to a shared bucket so an
+                    # unresolvable target still gets capped rather than
+                    # silently bypassing the per-target damper below.
+                    target_key = (
+                        str(args.get("interface_path") or "").strip()
+                        or str((context or {}).get("interface_path") or "").strip()
+                        or "__unresolved_target__"
+                    )
                     # Non-delivery speech actions are only captured; delivery
                     # actions are collected once they pass the dedup + interim
                     # cap below (a suppressed message must not be hoisted into
@@ -2141,25 +2161,34 @@ class AgentLoopManager:
                                 }
                             )
                             continue
-                        # Interim-message damper: the cap for THIS turn is
+                        # Interim-message damper: the cap for THIS destination is
                         # already spent — suppress the re-worded update and
-                        # steer the model toward completing properly. Only a
-                        # MIXED iteration (message + further tool calls) is an
-                        # interim update; a message-ONLY iteration is the
-                        # model's answer channel (two consecutive message-only
-                        # iterations end the turn as model_done) and must stay
-                        # deliverable. The suppressed text is NOT hoisted into
-                        # final_text (the pause composer or attempt_completion
-                        # own the closing message).
-                        if (
-                            interim_messages_delivered >= max_interim_messages
-                            and tool_calls
-                        ):
+                        # steer the model toward completing properly. Scoped per
+                        # ``target_key`` (not the whole turn), and applied
+                        # regardless of whether this is a mixed or a
+                        # message-only iteration: a message-only iteration is
+                        # still legitimately the model's answer channel the
+                        # FIRST time it reaches a given destination, but a
+                        # repeat to that SAME destination is never a fresh
+                        # answer — it is the loop re-narrating something it
+                        # already delivered (observed live: four differently
+                        # worded weather replies to the same chat, each one
+                        # alone in its own message-only iteration, which the
+                        # old "only mixed iterations count" rule let straight
+                        # through). A different destination starts at 0 and is
+                        # unaffected — this must never block a beat that
+                        # genuinely reaches out to several different
+                        # conversations in one turn. The suppressed text is NOT
+                        # hoisted into final_text (the pause composer or
+                        # attempt_completion own the closing message).
+                        target_delivered = interim_messages_delivered.get(target_key, 0)
+                        if target_delivered >= max_interim_messages:
                             log_info(
-                                f"[agent_core] Iteration {i}: suppressing interim "
-                                f"message '{mc_name}' — cap of "
-                                f"{max_interim_messages} mid-task message(s) "
-                                "already delivered this turn"
+                                f"[agent_core] Iteration {i}: suppressing repeat "
+                                f"message '{mc_name}' to '{target_key}' — "
+                                f"{target_delivered} message(s) already "
+                                "delivered there this turn (cap "
+                                f"{max_interim_messages})"
                             )
                             observations.append(
                                 {
@@ -2170,15 +2199,17 @@ class AgentLoopManager:
                                             "tool": mc_name,
                                             "ok": True,
                                             "result": (
-                                                "suppressed: the user was "
-                                                f"already updated {interim_messages_delivered} "
-                                                "time(s) this turn — do not send "
-                                                "more interim status messages. "
-                                                "Keep working silently and "
-                                                "deliver the final answer via "
-                                                f"{_COMPLETION_TOOL} (or tell "
-                                                "the user you need more time "
-                                                "in that final message)."
+                                                "suppressed: you already sent "
+                                                f"{target_delivered} message(s) to "
+                                                "this same destination this turn — "
+                                                "do not repeat or rephrase the same "
+                                                "answer again. If there is nothing "
+                                                "NEW to add, call "
+                                                f"{_COMPLETION_TOOL} now. If you "
+                                                "genuinely have something new for a "
+                                                "DIFFERENT conversation, target "
+                                                "that conversation's own "
+                                                "interface_path instead."
                                             ),
                                             "error": None,
                                         }
@@ -2213,7 +2244,9 @@ class AgentLoopManager:
                         delivered_ok = bool(exec_result.get("ok"))
                         if delivered_ok:
                             delivered_message_ok = True
-                            interim_messages_delivered += 1
+                            interim_messages_delivered[target_key] = (
+                                interim_messages_delivered.get(target_key, 0) + 1
+                            )
                             delivered_text = str(
                                 args.get("text") or args.get("content") or ""
                             ).strip()
@@ -2756,6 +2789,38 @@ class AgentLoopManager:
                 }
             )
             stop_reason = "delivery_failed"
+
+        # Observability: a burst of delivery failures within one turn — even
+        # when the turn otherwise ends normally because a DIFFERENT message
+        # got through — previously left no trace outside raw logs. Live
+        # incident that surfaced this: ~186 failed ``message_telegram_bot``
+        # retries with an empty/malformed payload inside one turn, invisible
+        # to ``list_llm_failures``. Best-effort and fire-and-forget: logging
+        # here must never affect the turn's own outcome.
+        if len(delivery_failures) > 2:
+            try:
+                from core.llm_failure_log import (
+                    build_failure_entry,
+                    record_failure_entry,
+                )
+
+                entry = build_failure_entry(
+                    reason=(
+                        f"{len(delivery_failures)} outbound message delivery "
+                        "attempt(s) failed within one agent turn: "
+                        f"{', '.join(sorted(set(delivery_failures)))}"
+                    ),
+                    stage="agent_delivery",
+                    interface_path=(context or {}).get("interface_path"),
+                    engine=engine,
+                    failure_code="agent_delivery_storm",
+                    metadata={"goal": goal, "attempts": len(delivery_failures)},
+                )
+                await record_failure_entry(entry)
+            except Exception as exc:
+                log_debug(
+                    f"[agent_core] Could not record delivery-failure-storm entry: {exc}"
+                )
 
         result: Dict[str, Any] = {
             "iterations": len(observations),

@@ -1439,12 +1439,17 @@ async def test_run_agentic_turn_dedupes_identical_tool_calls(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_agentic_turn_ends_after_two_message_only_iterations(monkeypatch):
-    """Two consecutive message-only iterations end the turn with the reply.
+    """A second message-only iteration to the SAME destination is suppressed,
+    not delivered a second time; the turn only ends once the model properly
+    calls attempt_completion.
 
     Regression for the observed live run where the agent delivered an answer,
     was nudged to keep working, then re-issued the same file read 6 more times
-    and sent a second duplicate reply. A second consecutive message-only
-    iteration means the loop engine has no further tool intent.
+    and sent a SECOND, differently-worded reply to the same chat — the same
+    shape as the live incident (2026-09-13, four differently-worded weather
+    replies delivered to one Telegram chat in under a minute). A repeat
+    message-only iteration to a destination that already received one this
+    turn must never be treated as a fresh answer.
     """
 
     calls = []
@@ -1472,15 +1477,30 @@ async def test_run_agentic_turn_ends_after_two_message_only_iterations(monkeypat
                     ]
                 }
             )
+        if len(calls) == 3:
+            # A repeat to the SAME destination — must be suppressed, not
+            # delivered as a second answer.
+            return json.dumps(
+                {
+                    "actions": [
+                        {
+                            "type": "message_telegram_bot",
+                            "payload": {
+                                "interface_path": "telegram_bot/31321637",
+                                "text": "And one more thought on top of that.",
+                            },
+                        }
+                    ]
+                }
+            )
+        # Having been told the destination already has a reply, the model
+        # properly closes the turn instead of repeating itself again.
         return json.dumps(
             {
                 "actions": [
                     {
-                        "type": "message_telegram_bot",
-                        "payload": {
-                            "interface_path": "telegram_bot/31321637",
-                            "text": "And one more thought on top of that.",
-                        },
+                        "type": "attempt_completion",
+                        "payload": {"summary": "Shared my thoughts on the file."},
                     }
                 ]
             }
@@ -1488,7 +1508,11 @@ async def test_run_agentic_turn_ends_after_two_message_only_iterations(monkeypat
 
     monkeypatch.setattr("core.plugin_instance.handle_incoming_message", fake_handle)
 
+    delivered: list[str] = []
+
     async def fake_execute(name, arguments, context=None, original_message=None):
+        if name.startswith("message_"):
+            delivered.append(arguments.get("text"))
         return {
             "ok": True,
             "tool": name,
@@ -1503,12 +1527,14 @@ async def test_run_agentic_turn_ends_after_two_message_only_iterations(monkeypat
     out = await manager.run_agentic_turn(
         goal="give thoughts", max_iterations=10, timeout_seconds=30
     )
-    # Turn ended at the second consecutive message-only iteration, never
-    # nagging for more tools.
-    assert out["stop_reason"] == "model_done"
-    assert len(calls) == 3
-    # The messages were delivered through the executor, so final_text stays
-    # empty — a delivered message must never be re-sent as final_text.
-    assert out["final_text"] == ""
-    # The end-of-turn observation is the assistant's delivered reply marker.
-    assert out["observations"][-1].get("role") == "assistant"
+    # The turn only ends via the model's own explicit attempt_completion —
+    # the suppressed repeat never masquerades as a valid end-of-turn signal.
+    assert out["stop_reason"] == "completed"
+    assert len(calls) == 4
+    assert out["final_text"] == "Task complete: Shared my thoughts on the file."
+    # The repeat to the same destination was suppressed — it was never
+    # actually executed/delivered a second time, regardless of whether the
+    # rejected attempt is echoed back into an audit observation.
+    assert delivered == ["I read the file, here are my thoughts."]
+    obs_dump = json.dumps(out["observations"], default=str)
+    assert "suppressed" in obs_dump
