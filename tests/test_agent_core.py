@@ -1001,6 +1001,101 @@ async def test_interim_message_cap_zero_disables_interim_messages(monkeypatch):
     assert sent == []
 
 
+@pytest.mark.asyncio
+async def test_interim_message_cap_is_scoped_per_destination(monkeypatch):
+    """A repeat message to the SAME interface_path is capped even when each
+    delivery sits ALONE in its own message-only iteration (no other tool call
+    to trip the old "only mixed iterations count" rule) — live incident: four
+    differently-worded weather replies delivered to the same Telegram chat,
+    one per message-only iteration. A DIFFERENT destination must still go
+    through unaffected, since a beat (e.g. the Grillo chat observer) may
+    legitimately reach out to several different conversations in one turn."""
+    from core.agent_core import _agent_loop_manager
+
+    iteration = {"n": 0}
+
+    async def fake_call_engine_direct(prompt, engine_name, cortex_scope="agent"):
+        iteration["n"] += 1
+        n = iteration["n"]
+        if n == 1:
+            # Establish real tool intent so this isn't the iteration-1
+            # "conversational reply" shortcut.
+            return json.dumps(
+                {
+                    "actions": [
+                        {"type": "agent_read_file", "payload": {"path": "/tmp/x"}}
+                    ]
+                }
+            )
+        if n in (2, 3):
+            # Two message-ONLY iterations to the SAME destination.
+            return json.dumps(
+                {
+                    "actions": [
+                        {
+                            "type": "send_message",
+                            "payload": {
+                                "text": f"weather update {n}",
+                                "interface_path": "telegram_bot/A",
+                            },
+                        }
+                    ]
+                }
+            )
+        # A different destination, reached out to for the first time.
+        return json.dumps(
+            {
+                "actions": [
+                    {
+                        "type": "send_message",
+                        "payload": {
+                            "text": "unrelated update for someone else",
+                            "interface_path": "telegram_bot/B",
+                        },
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(
+        _agent_loop_manager, "_call_engine_direct", fake_call_engine_direct
+    )
+
+    async def fake_persist(**kwargs):
+        return 1
+
+    monkeypatch.setattr(_agent_loop_manager, "_persist_agentic_turn", fake_persist)
+
+    sent: list[tuple[str, str]] = []
+
+    async def fake_execute(name, args, context=None, original_message=None):
+        if name == "send_message":
+            sent.append((args.get("interface_path"), args.get("text")))
+            return {"ok": True, "result": "sent"}
+        return {"ok": True, "result": "done"}
+
+    monkeypatch.setattr(
+        "core.agent_tool_executor.agent_tool_executor.execute", fake_execute
+    )
+
+    result = await _agent_loop_manager.run_agentic_turn(
+        goal="tell two chats what's new",
+        engine="fake-engine",
+        max_iterations=4,
+        timeout_seconds=30.0,
+    )
+
+    # Exactly one delivery reached "telegram_bot/A" (the repeat was
+    # suppressed) and the unrelated "telegram_bot/B" delivery went through
+    # untouched — the per-destination cap never blocks a different target.
+    targets_sent = [t for t, _ in sent]
+    assert targets_sent.count("telegram_bot/A") == 1, sent
+    assert targets_sent.count("telegram_bot/B") == 1, sent
+    assert sent[0] == ("telegram_bot/A", "weather update 2")
+    obs_dump = json.dumps(result["observations"], default=str)
+    assert "suppressed" in obs_dump
+
+
 # ---------------------------------------------------------------------------
 # Persona voiceover (final agent result re-voiced through the persona engine)
 # ---------------------------------------------------------------------------

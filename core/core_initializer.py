@@ -1296,11 +1296,39 @@ class CoreInitializer:
 
                     instance = plugin_class()
 
-                    # Register the plugin immediately after instantiation so it's available for action discovery
-                    PLUGIN_REGISTRY[plugin_short_name] = instance
-                    log_debug(
-                        f"[core_initializer] Plugin {module_name} registered in PLUGIN_REGISTRY as '{plugin_short_name}'"
-                    )
+                    # Some plugins self-register under their own preferred name
+                    # via a `core_initializer.register_plugin(<name>, self)`
+                    # call inside their own `__init__` (a side effect of the
+                    # `plugin_class()` call above), where `<name>` differs from
+                    # this loader's generic file-derived `plugin_short_name`
+                    # (e.g. WeatherPlugin self-registers as "weather" while its
+                    # module file yields "weather_plugin"). Registering the
+                    # SAME instance a second time under `plugin_short_name`
+                    # does not create a second plugin, but it does make that
+                    # one instance appear twice in PLUGIN_REGISTRY.values() —
+                    # observed live: action_parser._plugins_for() reported "2
+                    # supporting plugins" for trigger_weather_report, both
+                    # entries the identical WeatherPlugin object. Skip the
+                    # generic registration when the instance is already present
+                    # under any key — an identity check, not a name comparison,
+                    # so it holds for every plugin using this self-registration
+                    # pattern (grep found ~28), not just WeatherPlugin.
+                    if any(
+                        existing is instance for existing in PLUGIN_REGISTRY.values()
+                    ):
+                        log_debug(
+                            f"[core_initializer] Plugin {module_name} already "
+                            "self-registered under its own name during "
+                            f"__init__; skipping generic registration as "
+                            f"'{plugin_short_name}' to avoid double-listing "
+                            "the same instance"
+                        )
+                    else:
+                        # Register the plugin immediately after instantiation so it's available for action discovery
+                        PLUGIN_REGISTRY[plugin_short_name] = instance
+                        log_debug(
+                            f"[core_initializer] Plugin {module_name} registered in PLUGIN_REGISTRY as '{plugin_short_name}'"
+                        )
 
                     if hasattr(instance, "start"):
                         try:
