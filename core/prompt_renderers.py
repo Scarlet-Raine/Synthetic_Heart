@@ -75,6 +75,28 @@ def _build_runtime_prefix(ctx: RuntimeContext) -> str:
     return "[" + " | ".join(parts) + "]\n"
 
 
+def _build_current_turn_anchor(ctx: RuntimeContext) -> str:
+    """Compact Reality Anchor restated on its own line above the current turn.
+
+    ``PromptRequest.context_summary`` carries the full ``[SYSTEM: REALITY
+    ANCHOR]`` block, but renderers merge that into the *system* message, so on a
+    long conversation the authoritative date/time/season can sit thousands of
+    tokens away from the text being generated.  ``RuntimeContext.reality_anchor``
+    (built by ``core.prompt_engine``) is those same facts compressed to one line;
+    rendering it directly above the current user turn keeps the temporal
+    grounding at the point of generation.
+
+    Returns the anchor line followed by a newline (so it stays a distinct line
+    from the metadata bracket and the message text), or ``""`` when the request
+    carries no anchor.
+    """
+
+    anchor = str(ctx.reality_anchor or "").strip()
+    if not anchor:
+        return ""
+    return anchor + "\n"
+
+
 def _build_multimodal_turn_text(
     ctx: RuntimeContext,
     current_text: str,
@@ -89,6 +111,10 @@ def _build_multimodal_turn_text(
     """
 
     segments: list[str] = []
+
+    anchor = _build_current_turn_anchor(ctx).strip()
+    if anchor:
+        segments.append(anchor)
 
     prefix = _build_runtime_prefix(ctx).strip()
     if prefix:
@@ -304,7 +330,11 @@ class OpenAIRenderer:
 
         # Current user turn with compact runtime context prefix
         prefix = _build_runtime_prefix(req.runtime_ctx)
-        current_content = prefix + (req.current_text or "")
+        current_content = (
+            _build_current_turn_anchor(req.runtime_ctx)
+            + prefix
+            + (req.current_text or "")
+        )
         messages.append({"role": "user", "content": current_content})
 
         return messages
@@ -484,7 +514,11 @@ class AnthropicRenderer:
 
         # Current user turn
         prefix = _build_runtime_prefix(req.runtime_ctx)
-        current_text = prefix + (req.current_text or "")
+        current_text = (
+            _build_current_turn_anchor(req.runtime_ctx)
+            + prefix
+            + (req.current_text or "")
+        )
         messages.append({"role": "user", "content": current_text})
 
         # ── Result ────────────────────────────────────────────────────
@@ -509,7 +543,11 @@ class AnthropicRenderer:
             return result
 
         prefix = _build_runtime_prefix(self.req.runtime_ctx)
-        text = prefix + (self.req.current_text or "")
+        text = (
+            _build_current_turn_anchor(self.req.runtime_ctx)
+            + prefix
+            + (self.req.current_text or "")
+        )
 
         content: list[dict[str, Any]] = []
         content.extend(image_parts)
@@ -610,7 +648,11 @@ class GeminiRenderer:
 
         # Current user turn
         prefix = _build_runtime_prefix(req.runtime_ctx)
-        current_text = prefix + (req.current_text or "")
+        current_text = (
+            _build_current_turn_anchor(req.runtime_ctx)
+            + prefix
+            + (req.current_text or "")
+        )
         contents.append({"role": "user", "parts": [{"text": current_text}]})
 
         result: dict[str, Any] = {
@@ -633,7 +675,11 @@ class GeminiRenderer:
             return result
 
         prefix = _build_runtime_prefix(self.req.runtime_ctx)
-        text = prefix + (self.req.current_text or "")
+        text = (
+            _build_current_turn_anchor(self.req.runtime_ctx)
+            + prefix
+            + (self.req.current_text or "")
+        )
 
         parts: list[dict[str, Any]] = []
         parts.extend(multimodal_parts)
@@ -724,6 +770,9 @@ class TextRenderer:
                 lines.append(f"[{tag}] {turn.content}")
 
         prefix = _build_runtime_prefix(req.runtime_ctx)
+        anchor = _build_current_turn_anchor(req.runtime_ctx).strip()
+        if anchor:
+            lines.append(f"\n{anchor}")
         lines.append(f"\n[current] {prefix}{req.current_text or ''}")
 
         # Compact tool listing (brief only)

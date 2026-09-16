@@ -185,6 +185,31 @@ class TestOpenAIRenderer:
         assert last[bracket_end + 1] == "\n"
         assert last.endswith("How are you?")
 
+    def test_current_turn_anchor_rendered_above_prefix(self) -> None:
+        req = _basic_request()
+        req.runtime_ctx.reality_anchor = (
+            "[SYSTEM: REALITY ANCHOR] Monday, April 20, 2026 · 9:27 PM (late evening)"
+        )
+        renderer = OpenAIRenderer(req)
+
+        messages = renderer.render()
+        last = messages[-1]["content"]
+
+        # Anchor sits on its own line, above the metadata bracket + text.
+        anchor_line, _, remainder = last.partition("\n")
+        assert anchor_line == req.runtime_ctx.reality_anchor
+        assert remainder.startswith("[lang:en")
+        assert remainder.endswith("How are you?")
+
+    def test_current_turn_anchor_absent_when_unset(self) -> None:
+        req = _basic_request()
+        renderer = OpenAIRenderer(req)
+
+        last = renderer.render()[-1]["content"]
+
+        assert "REALITY ANCHOR" not in last
+        assert last.startswith("[lang:en")
+
     def test_no_tools_when_disabled(self) -> None:
         req = _basic_request(supports_tool_calling=False)
         req.tool_declarations = [_make_tool()]
@@ -399,6 +424,38 @@ class TestOpenAIRenderer:
         assert len(messages) == 2
         assert messages[0]["role"] == "system"
         assert messages[1]["role"] == "user"
+
+
+# ---------------------------------------------------------------------------
+# Current-turn Reality Anchor duplicate (cross-renderer)
+# ---------------------------------------------------------------------------
+
+
+class TestCurrentTurnRealityAnchor:
+    """The compact Reality Anchor duplicate must reach every renderer's turn."""
+
+    ANCHOR = "[SYSTEM: REALITY ANCHOR] Monday, April 20, 2026 · 9:27 PM (late evening)"
+
+    def _anchored_request(self) -> PromptRequest:
+        req = _basic_request()
+        req.runtime_ctx.reality_anchor = self.ANCHOR
+        return req
+
+    def test_anthropic_current_turn_carries_anchor(self) -> None:
+        result = AnthropicRenderer(self._anchored_request()).render()
+
+        assert result["messages"][-1]["content"].startswith(self.ANCHOR)
+
+    def test_gemini_current_turn_carries_anchor(self) -> None:
+        result = GeminiRenderer(self._anchored_request()).render()
+
+        text = result["contents"][-1]["parts"][0]["text"]
+        assert text.startswith(self.ANCHOR + "\n")
+
+    def test_text_renderer_current_turn_carries_anchor(self) -> None:
+        rendered = TextRenderer(self._anchored_request()).render()
+
+        assert rendered.index(self.ANCHOR) < rendered.index("[current]")
 
 
 # ---------------------------------------------------------------------------

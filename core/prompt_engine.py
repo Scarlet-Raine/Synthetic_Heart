@@ -811,6 +811,74 @@ def _build_soul_turn_delta_prefix(context_section: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+_REALITY_ANCHOR_HEADER = "[SYSTEM: REALITY ANCHOR]"
+
+
+def _pretty_anchor_date(date_val: str, day_of_week: str = "") -> str:
+    """Render ``2026-04-20`` as ``April 20, 2026``, optionally ``Monday, …``."""
+
+    nice_date = date_val
+    try:
+        nice_date = datetime.strptime(date_val, "%Y-%m-%d").strftime("%B %d, %Y")
+    except Exception:
+        pass
+    return f"{day_of_week}, {nice_date}" if day_of_week else nice_date
+
+
+def _pretty_anchor_time(time_val: str) -> str:
+    """Render ``21:27`` as ``9:27 PM`` (falling back to the raw value)."""
+
+    try:
+        return datetime.strptime(time_val, "%H:%M").strftime("%I:%M %p").lstrip("0")
+    except Exception:
+        return time_val
+
+
+def _build_current_turn_anchor(context_section: dict[str, Any]) -> str:
+    """Build the compact one-line Reality Anchor duplicate for the current turn.
+
+    The full anchor block built by :func:`_build_context_summary` lives in
+    ``PromptRequest.context_summary``, which renderers merge into the *system*
+    message — on a long conversation that block can sit thousands of tokens away
+    from the text being generated.  This returns the same temporal facts
+    (date + day, exact time + part of day, season, location) compressed to a
+    single line that renderers place directly above the current user turn.
+
+    Deliberately omitted: the ``Temporal Delta`` sentence (stable boilerplate
+    that the system block already carries) — only the concrete, per-turn facts
+    are duplicated.  Returns ``""`` when no temporal field is available, so a
+    turn without runtime facts contributes nothing.
+    """
+
+    fields: list[str] = []
+
+    date_val = str(context_section.get("date") or "").strip()
+    if date_val:
+        day_of_week = str(context_section.get("day_of_week") or "").strip()
+        fields.append(_pretty_anchor_date(date_val, day_of_week))
+
+    time_val = str(context_section.get("time") or "").strip()
+    time_of_day = str(context_section.get("time_of_day") or "").strip()
+    if time_val:
+        nice_time = _pretty_anchor_time(time_val)
+        fields.append(f"{nice_time} ({time_of_day})" if time_of_day else nice_time)
+    elif time_of_day:
+        fields.append(time_of_day)
+
+    season = str(context_section.get("season") or "").strip()
+    if season:
+        fields.append(season)
+
+    location = str(context_section.get("location") or "").strip()
+    if location:
+        fields.append(location)
+
+    if not fields:
+        return ""
+
+    return f"{_REALITY_ANCHOR_HEADER} " + " · ".join(fields)
+
+
 def _build_context_summary(
     context_section: dict[str, Any],
     is_grillo_internal: bool = False,
@@ -836,27 +904,14 @@ def _build_context_summary(
     _season = str(context_section.get("season") or "").strip()
     _loc_val = str(context_section.get("location") or "").strip()
 
-    anchor_lines = ["[SYSTEM: REALITY ANCHOR]"]
+    anchor_lines = [_REALITY_ANCHOR_HEADER]
     if _date_val:
-        nice_date = _date_val
-        try:
-            dt_parsed = datetime.strptime(_date_val, "%Y-%m-%d")
-            nice_date = dt_parsed.strftime("%B %d, %Y")
-        except Exception:
-            pass
-        if _day_of_week:
-            anchor_lines.append(f"- Current Date: {_day_of_week}, {nice_date}")
-        else:
-            anchor_lines.append(f"- Current Date: {nice_date}")
+        anchor_lines.append(
+            f"- Current Date: {_pretty_anchor_date(_date_val, _day_of_week)}"
+        )
 
     if _time_val:
-        nice_time = _time_val
-        try:
-            dt_parsed = datetime.strptime(_time_val, "%H:%M")
-            nice_time = dt_parsed.strftime("%I:%M %p").lstrip("0")
-        except Exception:
-            pass
-        anchor_lines.append(f"- Current Time: {nice_time}")
+        anchor_lines.append(f"- Current Time: {_pretty_anchor_time(_time_val)}")
 
     if _season:
         anchor_lines.append(f"- Season: {_season}")
@@ -1612,6 +1667,7 @@ def _assemble_prompt_request(  # noqa: PLR0913
         usertag=usertag,
         timestamp=msg_timestamp,
         time_of_day=_ctx_time_of_day or None,
+        reality_anchor=_build_current_turn_anchor(context_section),
         input_source="voice" if is_voice_input else "text",
         emotions=emotions_nl,
         scope=scope,

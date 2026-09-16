@@ -6,6 +6,7 @@ from typing import Any, Sequence
 
 from core.prompt_engine import (
     _build_context_summary,
+    _build_current_turn_anchor,
     _build_soul_turn_delta_prefix,
     _build_soul_user_profile_prefix,
     build_json_prompt,
@@ -569,6 +570,79 @@ def test_build_json_prompt_demotes_persona_preferences_to_context_summary(monkey
     assert "[Persona background]" in pr.context_summary
     assert "Likes: tea" in pr.context_summary
     assert "Dislikes: liars" in pr.context_summary
+
+
+def test_build_current_turn_anchor_compresses_temporal_fields() -> None:
+    anchor = _build_current_turn_anchor(
+        {
+            "date": "2026-04-20",
+            "time": "21:27",
+            "time_of_day": "late evening",
+            "location": "Sečovlje,Slovenia",
+            "season": "Mid Spring",
+            "day_of_week": "Monday",
+        }
+    )
+
+    assert anchor.startswith("[SYSTEM: REALITY ANCHOR]")
+    assert "Monday, April 20, 2026" in anchor
+    assert "9:27 PM (late evening)" in anchor
+    assert "Mid Spring" in anchor
+    assert "Sečovlje,Slovenia" in anchor
+    # Deliberately tiny: one line, and the stable boilerplate stays in the
+    # system block only.
+    assert "\n" not in anchor
+    assert "Temporal Delta" not in anchor
+
+
+def test_build_current_turn_anchor_empty_without_runtime_facts() -> None:
+    assert _build_current_turn_anchor({}) == ""
+    assert _build_current_turn_anchor({"persona": "You are Synth."}) == ""
+
+
+def test_build_current_turn_anchor_falls_back_to_part_of_day() -> None:
+    anchor = _build_current_turn_anchor({"time_of_day": "late evening"})
+
+    assert anchor == "[SYSTEM: REALITY ANCHOR] late evening"
+
+
+def test_build_json_prompt_duplicates_anchor_next_to_current_turn(monkeypatch):
+    async def dummy_gather(message, ctx):
+        return {"location": "Sečovlje,Slovenia"}
+
+    async def dummy_local_time_fields(message_date, interface_path=None):
+        return {
+            "local_date": "2026-04-20",
+            "local_time": "21:27",
+            "time_of_day": "late evening",
+            "season": "Mid Spring",
+            "day_of_week": "Monday",
+        }
+
+    monkeypatch.setattr("core.action_parser.gather_static_injections", dummy_gather)
+    monkeypatch.setattr(
+        "core.time_zone_utils.get_local_time_fields", dummy_local_time_fields
+    )
+
+    message = SimpleNamespace(
+        chat_id=1,
+        text="How are you feeling?",
+        message_id=1,
+        from_user=SimpleNamespace(full_name="user", username="user"),
+        date=datetime.now(timezone.utc),
+    )
+
+    result = asyncio.run(build_json_prompt(message, {}, interface_name="telegram_bot"))
+    pr = result["__prompt_request"]
+    anchor = pr.runtime_ctx.reality_anchor
+    assert anchor.startswith("[SYSTEM: REALITY ANCHOR]")
+    assert "Monday, April 20, 2026" in anchor
+    assert "Sečovlje,Slovenia" in anchor
+
+    from core.prompt_renderers import OpenAIRenderer
+
+    current_turn = OpenAIRenderer(pr).render()[-1]["content"]
+    assert current_turn.split("\n", 1)[0] == anchor
 
 
 def test_build_context_summary_keeps_exact_runtime_facts_implicit_by_default() -> None:

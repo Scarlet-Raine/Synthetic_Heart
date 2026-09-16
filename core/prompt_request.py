@@ -46,6 +46,13 @@ class RuntimeContext:
     usertag: str | None = None
     timestamp: str | None = None
     time_of_day: str | None = None
+    # Compact one-line duplicate of the "[SYSTEM: REALITY ANCHOR]" block
+    # (date / day / exact time / part-of-day / season / location), pre-formatted
+    # by ``core.prompt_engine``.  Renderers place it on its own line immediately
+    # above the current user turn so the authoritative temporal grounding sits
+    # next to the text being generated instead of only in the (distant) system
+    # message.  ``None``/empty means no anchor is available for this turn.
+    reality_anchor: str | None = None
     input_source: str = "text"  # "voice" | "text"
     emotions: str | None = None  # compact NL: "curious 0.7, warm 0.4"
     scope: str = "local"
