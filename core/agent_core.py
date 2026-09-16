@@ -3194,6 +3194,7 @@ class AgentLoopManager:
                 interface_path=interface_path,
                 text=instruction,
                 sender_id=getattr(message, "sender_id", None),
+                chat_id=getattr(message, "chat_id", None),
                 is_from_self=False,
             )
             prompt = await build_prompt_request(
