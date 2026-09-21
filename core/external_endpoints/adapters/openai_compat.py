@@ -827,7 +827,14 @@ class OpenAICompatAdapter(BaseProtocolAdapter):
         return []
 
     async def list_models(self) -> list[ModelInfo]:
-        return await self._list_models_via_http()
+        models = await self._list_models_via_http()
+        # Fallback for endpoints that don't expose a /models list (or return empty):
+        # return a sensible default so the probe can still test connectivity via ping_test.
+        # This allows Zen LLM Engine and similar proxies to be probed successfully even
+        # when their model list is temporarily unavailable or empty.
+        if not models:
+            return [ModelInfo(id="default", name="Default Model")]
+        return models
 
     # ------------------------------------------------------------------
     # TTS
