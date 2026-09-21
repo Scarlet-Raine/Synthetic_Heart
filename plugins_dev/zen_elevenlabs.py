@@ -30,23 +30,23 @@ try:
 except Exception:
 
     def notify_trainer(message: str) -> None:  # pragma: no cover - fallback
-        log_warning("[selenium_elevenlabs] notifier not available")
+        log_warning("[zen_elevenlabs] notifier not available")
 
 
-class SeleniumElevenLabsPlugin:
-    """Generate speech via ElevenLabs using Selenium and dispatch audio."""
+class ZenElevenLabsPlugin:
+    """Generate speech via ElevenLabs using Zen and dispatch audio."""
 
     def __init__(self) -> None:
-        register_plugin("selenium_elevenlabs", self)
-        log_info("[selenium_elevenlabs] Plugin initialized")
+        register_plugin("zen_elevenlabs", self)
+        log_info("[zen_elevenlabs] Plugin initialized")
 
     # === Action metadata ===
     def get_supported_action_types(self) -> List[str]:
-        return ["speech_selenium_elevenlabs"]
+        return ["speech_zen_elevenlabs"]
 
     def get_supported_actions(self) -> Dict[str, Dict[str, Any]]:
         return {
-            "speech_selenium_elevenlabs": {
+            "speech_zen_elevenlabs": {
                 "description": "Generate speech via ElevenLabs and send audio to destinations",
                 "required_fields": ["message", "destinations"],
                 "optional_fields": [],
@@ -56,7 +56,7 @@ class SeleniumElevenLabsPlugin:
 
     @staticmethod
     def get_prompt_instructions(action_name: str) -> Dict[str, Any]:
-        if action_name != "speech_selenium_elevenlabs":
+        if action_name != "speech_zen_elevenlabs":
             return {}
         return {
             "description": "Convert text into speech using ElevenLabs and send it to one or more chats",
@@ -75,7 +75,7 @@ class SeleniumElevenLabsPlugin:
     # === Validation ===
     @staticmethod
     def validate_payload(action_type: str, payload: Dict[str, Any]) -> List[str]:
-        if action_type != "speech_selenium_elevenlabs":
+        if action_type != "speech_zen_elevenlabs":
             return []
 
         errors: List[str] = []
@@ -110,7 +110,7 @@ class SeleniumElevenLabsPlugin:
         payload = action.get("payload", {})
         text = payload.get("message", "")
         destinations = payload.get("destinations", [])
-        log_info(f"[selenium_elevenlabs] Executing speech action for {len(text)} chars")
+        log_info(f"[zen_elevenlabs] Executing speech action for {len(text)} chars")
 
         mp3_path = await self._generate_speech(text)
 
@@ -122,13 +122,13 @@ class SeleniumElevenLabsPlugin:
 
     # === Internal helpers ===
     async def _generate_speech(self, text: str) -> str:
-        """Generate speech using ElevenLabs web interface via Selenium."""
+        """Generate speech using ElevenLabs web interface via Zen."""
 
         download_dir = tempfile.mkdtemp(prefix="elevenlabs_")
 
         def _run() -> Tuple[str, str]:
             options = uc.ChromeOptions()
-            if os.getenv("synth_SELENIUM_HEADLESS", "1") == "1":
+            if os.getenv("synth_ZEN_HEADLESS", os.getenv("synth_SELENIUM_HEADLESS", "1")) == "1":
                 options.add_argument("--headless=new")
             prefs = {
                 "download.default_directory": download_dir,
@@ -145,7 +145,7 @@ class SeleniumElevenLabsPlugin:
             options.add_argument("--log-level=0")
             options.add_argument(f"--log-file={chromium_log}")
             log_debug(
-                f"[selenium_elevenlabs] Chromium log -> {chromium_log}, chromedriver log -> {chromedriver_log}"
+                f"[zen_elevenlabs] Chromium log -> {chromium_log}, chromedriver log -> {chromedriver_log}"
             )
 
             chromium_binary = (
@@ -153,7 +153,7 @@ class SeleniumElevenLabsPlugin:
                 or shutil.which("chromium-browser")
                 or "/usr/bin/chromium"
             )
-            log_debug(f"[selenium_elevenlabs] Using Chromium binary: {chromium_binary}")
+            log_debug(f"[zen_elevenlabs] Using Chromium binary: {chromium_binary}")
             try:
                 output = subprocess.check_output(
                     [chromium_binary, "--version"], text=True
@@ -289,11 +289,11 @@ class SeleniumElevenLabsPlugin:
         try:
             from core.core_initializer import INTERFACE_REGISTRY
         except Exception:
-            log_warning("[selenium_elevenlabs] INTERFACE_REGISTRY unavailable")
+            log_warning("[zen_elevenlabs] INTERFACE_REGISTRY unavailable")
             return
         iface = INTERFACE_REGISTRY.get(interface_name)
         if not iface or not hasattr(iface, "send_audio"):
-            log_warning(f"[selenium_elevenlabs] Interface {interface_name} unavailable")
+            log_warning(f"[zen_elevenlabs] Interface {interface_name} unavailable")
             return
         payload = {"audio": file_path, "target": {"chat_id": chat_id}}
         if thread_id is not None:
@@ -301,10 +301,10 @@ class SeleniumElevenLabsPlugin:
         try:
             await iface.send_audio(payload)
         except Exception as e:
-            log_error(f"[selenium_elevenlabs] Failed to send audio: {e}")
+            log_error(f"[zen_elevenlabs] Failed to send audio: {e}")
 
     async def _get_remaining_credits(self) -> str:
         return getattr(self, "_credits", "unknown")
 
 
-PLUGIN_CLASS = SeleniumElevenLabsPlugin
+PLUGIN_CLASS = ZenElevenLabsPlugin

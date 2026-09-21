@@ -32,7 +32,7 @@ AUDIO_KEEP_COUNT = 30
 _ON_THE_FLY_POLL_TIMEOUT_S = 60.0
 # The winding-down on-the-fly generation runs as a background task (never
 # blocking the track monitor) and waits longer than the immediate-injection
-# poll above, because a slow LLM turn (e.g. selenium) routinely exceeds 60s
+# poll above, because a slow LLM turn (e.g. zen) routinely exceeds 60s
 # and the freshness guard makes a late, stale banter safe to skip.
 _ON_THE_FLY_BACKGROUND_TIMEOUT_S = 120.0
 _ON_THE_FLY_POLL_INTERVAL_S = 0.25
@@ -197,7 +197,7 @@ register_exposed_var(
     default=_ON_THE_FLY_BACKGROUND_TIMEOUT_S,
     value_type=float,
     ui_type="string",
-    description="How long (seconds) to wait for an on-the-fly LLM banter generation before giving up. The LLM turn (e.g. a slow selenium engine) can take well over a minute, so this is run in a background task and never blocks the track monitor. Stale banter is still safely skipped by the freshness guard.",
+    description="How long (seconds) to wait for an on-the-fly LLM banter generation before giving up. The LLM turn (e.g. a slow zen engine) can take well over a minute, so this is run in a background task and never blocks the track monitor. Stale banter is still safely skipped by the freshness guard.",
     scope="plugins",
     component="radio_host",
 )

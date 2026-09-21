@@ -162,8 +162,8 @@ jobs:
         options: >-
           --health-cmd="mysqladmin ping --silent"
           --health-interval=5s --health-timeout=2s --health-retries=20
-      selenium:
-        image: selenium/standalone-chrome:115.0
+      zen:
+        image: zen/standalone-chrome:115.0
         ports:
           - 4444:4444
         options: >-
@@ -177,12 +177,12 @@ jobs:
       - name: Install deps
         run: |
           uv sync --no-cache
-          pip install pytest pytest-asyncio selenium
+          pip install pytest pytest-asyncio zen
       - name: Wait for services
         run: |
           for i in {1..30}; do mysql -h127.0.0.1 -uroot -proot -e "SELECT 1" && curl -sS http://localhost:4444/status | grep -q 'ready' && break || sleep 3; done
       - name: Run end-to-end agent tests
-        run: pytest -q tests/test_engine_adapters.py -q tests/test_selenium_queue.py -q tests/test_agent_loop.py
+        run: pytest -q tests/test_engine_adapters.py -q tests/test_zen_queue.py -q tests/test_agent_loop.py
 
   mypy-check:
     needs: unit-tests

@@ -31,7 +31,7 @@ _LOCAL_MAX_TOKENS_DEFAULT = 4096
 
 # Hard downstream character budget for the fully assembled OpenAI-style messages
 # sent to an endpoint, enforced by ``_clamp_messages_to_char_budget``. Kept
-# safely below the ``selenium-llm-engine`` 32000-char chunking threshold so the
+# safely below the ``zen-llm-engine`` 32000-char chunking threshold so the
 # chunking path — and its "reply only OK" protocol contamination / empty-actions
 # garbling — is never triggered, regardless of how large the injected action
 # catalog is.
@@ -40,8 +40,8 @@ _LOCAL_MAX_TOKENS_DEFAULT = 4096
 # each message (``_message_content_len``), but the payload the endpoint actually
 # receives is the role-separated serialization of those messages, which is
 # meaningfully larger (role labels, JSON framing/escaping, chat-template glue).
-# Measured LIVE (2026-07-28) on the selenium-llm-engine: a content-sum clamped to
-# exactly 27000 chars produced a real selenium prompt of 32232 chars — i.e.
+# Measured LIVE (2026-07-28) on the zen-llm-engine: a content-sum clamped to
+# exactly 27000 chars produced a real zen prompt of 32232 chars — i.e.
 # ~5200 chars of serialization/template overhead — which STILL exceeded the
 # 32000 limit and triggered 2-part chunking (garbled request → empty
 # ``{"actions": []}`` → corrector loop → "😵" fallback). The overhead is far

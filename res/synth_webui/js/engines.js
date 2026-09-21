@@ -90,7 +90,7 @@
     function providerIcon(icon) {
         const icons = {
             google: '🔵', anthropic: '🟠', openrouter: '⚡', github: '🐙',
-            ollama: '🦙', openai: '🟢', selenium: '🤖', fish: '🐟', custom: '⚙️',
+            ollama: '🦙', openai: '🟢', zen: '🤖', fish: '🐟', custom: '⚙️',
         };
         return icons[icon] || '🔌';
     }

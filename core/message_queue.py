@@ -274,7 +274,7 @@ def _supersede_pending_vessel_beats(world_chat_id: str) -> None:
 
     Synth's own in-world will beats/perceptions are produced on a fast timer
     (``VESSEL_WILL_INTERVAL_SEC``) but each turn can take far longer to consume
-    on a heavy engine (e.g. Selenium), so successive beats pile up behind the
+    on a heavy engine (e.g. Zen), so successive beats pile up behind the
     turn in flight. A will beat only means anything *now*: once a newer one is
     ready, the queued older ones are stale snapshots of a world that has since
     moved on. Left in the queue they would be coalesced together by
@@ -1878,7 +1878,7 @@ async def _consumer_loop() -> None:
                             _resolve_generation_animation_state("start")
                         )
 
-                        # Selenium-based LLMs manage browser state and cannot be safely
+                        # Zen-based LLMs manage browser state and cannot be safely
                         # cancelled mid-flight. All other engines (HTTP-based Gemini, OpenAI, …)
                         # support asyncio cancellation and should be stopped on timeout so they
                         # don't deliver a "ghost" reply after the fallback has already been sent.
@@ -2026,7 +2026,7 @@ async def _consumer_loop() -> None:
                                     f"[QUEUE] Processing task cancelled after timeout for chat {chat_id}"
                                 )
                             else:
-                                # Non-cancellable engine (e.g. Selenium) — let task finish in
+                                # Non-cancellable engine (e.g. Zen) — let task finish in
                                 # background and clean up when it eventually completes.
                                 log_debug(
                                     f"[QUEUE] Processing task kept alive (non-cancellable engine) for chat {chat_id}"
@@ -2279,7 +2279,7 @@ def _start_consumer_task() -> None:
 async def _supervisor_loop() -> None:
     """Watchdog that keeps the consumer alive.
 
-    A single hung LLM generation (e.g. a Selenium engine that stalls) can trigger
+    A single hung LLM generation (e.g. a Zen engine that stalls) can trigger
     a per-message timeout whose cancellation propagates up and kills the consumer
     task. Without supervision the consumer never restarts, so every subsequent
     message queues silently and is never processed. This loop detects a dead

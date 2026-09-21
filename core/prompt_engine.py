@@ -3610,7 +3610,7 @@ def reduce_prompt_for_llm_limit(prompt: dict, max_chars: int) -> dict:
     # action, and the corrector re-supplies the full detail on demand
     # (extract_for_corrector). With the full catalog this block alone can push
     # a prompt tens of thousands of chars over a browser-driven engine's hard
-    # limit (e.g. selenium-llm-engine at 32000), causing the engine's multi-part
+    # limit (e.g. zen-llm-engine at 32000), causing the engine's multi-part
     # split to garble the request and the model to return empty actions.
     # Trimming it here keeps action *selection* intact while dropping the bulk.
     if current_size > max_chars:

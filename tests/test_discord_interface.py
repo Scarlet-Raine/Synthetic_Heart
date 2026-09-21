@@ -705,7 +705,7 @@ async def test_join_voice_autostart_falls_back_to_direct_start_for_trainer(
 async def test_stop_live_voice_uses_stored_engine_not_global_cortex(monkeypatch):
     """_stop_live_voice must call stop_live_voice_session on the engine stored
     in _live_voice_state, NOT on the globally active cortex (which may be
-    selenium_gemini and wouldn't have that method)."""
+    zen_gemini and wouldn't have that method)."""
     import interface.discord_interface as _mod
 
     GUILD_ID = 42

@@ -9,19 +9,19 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-has_selenium = True
+has_zen = True
 try:
     try:
-        from plugins.selenium_ttsfree import SeleniumTTSFreePlugin  # type: ignore
+        from plugins.zen_ttsfree import ZenTTSFreePlugin  # type: ignore
     except ModuleNotFoundError:
-        from plugins_dev.selenium_ttsfree import SeleniumTTSFreePlugin
+        from plugins_dev.zen_ttsfree import ZenTTSFreePlugin
 except ModuleNotFoundError as e:
-    if "selenium" in str(e):
-        has_selenium = False
+    if "zen" in str(e) or "selenium" in str(e):
+        has_zen = False
     else:
         raise
 
-pytestmark = pytest.mark.skipif(not has_selenium, reason="selenium not installed")
+pytestmark = pytest.mark.skipif(not has_zen, reason="zen not installed")
 
 
 def test_validate_payload_success():
@@ -31,7 +31,7 @@ def test_validate_payload_success():
         "voice": ["italian", "Isabella", 10, 20],
         "interface_path": "telegram_bot/123/456",
     }
-    errs = SeleniumTTSFreePlugin.validate_payload("voice_message_ttsfree", payload)
+    errs = ZenTTSFreePlugin.validate_payload("voice_message_ttsfree", payload)
     assert errs == []
 
 
@@ -44,7 +44,7 @@ def test_validate_payload_failures():
         "voice": ["italian", "Isabella"],
         "interface_path": "x",
     }
-    errs = SeleniumTTSFreePlugin.validate_payload("voice_message_ttsfree", payload)
+    errs = ZenTTSFreePlugin.validate_payload("voice_message_ttsfree", payload)
     assert any("exceeds 500" in e for e in errs)
 
     # Emoji not allowed
@@ -54,20 +54,20 @@ def test_validate_payload_failures():
         "voice": ["italian", "Isabella"],
         "interface_path": "x",
     }
-    errs2 = SeleniumTTSFreePlugin.validate_payload("voice_message_ttsfree", payload2)
+    errs2 = ZenTTSFreePlugin.validate_payload("voice_message_ttsfree", payload2)
     assert any("unsupported characters" in e for e in errs2)
 
     # Missing voice is allowed (mapping is used instead)
     payload3 = {"message": "ok", "language": "italian", "interface_path": "x"}
-    errs3 = SeleniumTTSFreePlugin.validate_payload("voice_message_ttsfree", payload3)
+    errs3 = ZenTTSFreePlugin.validate_payload("voice_message_ttsfree", payload3)
     assert errs3 == []
 
 
 @pytest.mark.asyncio
 async def test_execute_action_dispatch(monkeypatch, tmp_path):
-    plugin = SeleniumTTSFreePlugin()
+    plugin = ZenTTSFreePlugin()
 
-    # Mock generate speech to avoid launching Selenium
+    # Mock generate speech to avoid launching Zen
     temp_mp3 = tmp_path / "out.mp3"
     temp_mp3.write_bytes(b"MP3TEST")
 
@@ -117,7 +117,7 @@ async def test_execute_action_dispatch(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_execute_action_resolves_mapping(monkeypatch, tmp_path):
     # Ensure plugin will resolve voice mapping from Free_TTS_VOICES when voice key (string) is provided
-    plugin = SeleniumTTSFreePlugin()
+    plugin = ZenTTSFreePlugin()
 
     temp_mp3 = tmp_path / "out.mp3"
     temp_mp3.write_bytes(b"MP3TEST")

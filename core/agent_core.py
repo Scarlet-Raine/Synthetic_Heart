@@ -1729,7 +1729,7 @@ class AgentLoopManager:
             remaining_budget = max(1.0, timeout_seconds - elapsed)
             # Per-call timeout must respect the real engine budget, not an
             # arbitrary hardcoded cap. Browser-backed cortex engines (e.g.
-            # selenium-llm-engine) routinely need far longer than a few seconds
+            # zen-llm-engine) routinely need far longer than a few seconds
             # to produce a response; capping each call at 8s made every
             # iteration time out with an empty reply, so the whole agentic turn
             # returned nothing. Bound the per-call wait by the engine's own
@@ -3064,7 +3064,7 @@ class AgentLoopManager:
             # would mistake that for a corrector payload (it keys off
             # ``system_message``), discarding the real GOAL/TOOLS/system text and
             # emitting an almost-empty prompt. External web-driven engines (e.g.
-            # selenium-llm-engine) then pad that empty prompt with their own
+            # zen-llm-engine) then pad that empty prompt with their own
             # canvas/JSON boilerplate. Passing explicit role-separated messages to
             # ``generate_response`` bypasses _build_messages entirely and delivers
             # the actual agentic prompt.

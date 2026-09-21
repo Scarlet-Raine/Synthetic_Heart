@@ -401,10 +401,10 @@ async def test_get_active_cortex_engine_override_to_noncortex_endpoint_falls_bac
 
     class FakeRegistry:
         def get_available_engines(self):
-            return ["selenium-llm-engine"]
+            return ["zen-llm-engine"]
 
         def get_default_engine(self):
-            return "selenium-llm-engine"
+            return "zen-llm-engine"
 
     class FakeEndpoint:
         # Auto-probe found no cortex capability (the honest signal the resolver
@@ -422,7 +422,7 @@ async def test_get_active_cortex_engine_override_to_noncortex_endpoint_falls_bac
             return [FakeEndpoint()]
 
     values = {
-        "BASE_CORTEX": "selenium-llm-engine",
+        "BASE_CORTEX": "zen-llm-engine",
         "AGENT_CORTEX": "logfare-mykey",
     }
     set_value = AsyncMock()
@@ -446,7 +446,7 @@ async def test_get_active_cortex_engine_override_to_noncortex_endpoint_falls_bac
 
     engine = await conf.get_active_cortex_engine("agent")
 
-    assert engine == "selenium-llm-engine"
+    assert engine == "zen-llm-engine"
     set_value.assert_any_await("AGENT_CORTEX", "Default")
 
 
@@ -546,10 +546,10 @@ async def test_get_active_cortex_engine_registered_noncortex_endpoint_falls_back
     class FakeRegistry:
         def get_available_engines(self):
             # logfare-mykey IS registered here -- the primary-path gap.
-            return ["selenium-llm-engine", "logfare-mykey"]
+            return ["zen-llm-engine", "logfare-mykey"]
 
         def get_default_engine(self):
-            return "selenium-llm-engine"
+            return "zen-llm-engine"
 
     class FakeEndpoint:
         # The endpoint is explicitly not configured for Cortex, so it must not
@@ -567,7 +567,7 @@ async def test_get_active_cortex_engine_registered_noncortex_endpoint_falls_back
             return [FakeEndpoint()]
 
     values = {
-        "BASE_CORTEX": "selenium-llm-engine",
+        "BASE_CORTEX": "zen-llm-engine",
         "AGENT_CORTEX": "logfare-mykey",
     }
     set_value = AsyncMock()
@@ -590,7 +590,7 @@ async def test_get_active_cortex_engine_registered_noncortex_endpoint_falls_back
 
     engine = await conf.get_active_cortex_engine("agent")
 
-    assert engine == "selenium-llm-engine"
+    assert engine == "zen-llm-engine"
     set_value.assert_any_await("AGENT_CORTEX", "Default")
 
 

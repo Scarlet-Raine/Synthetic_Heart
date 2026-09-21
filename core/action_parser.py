@@ -2089,7 +2089,7 @@ async def run_actions(actions: Any, context: Dict[str, Any], bot, original_messa
         return {"processed": [], "errors": [error_msg], "failed_actions": []}
 
     # Drop leaked Recon-schema entries before validation. A state-retaining
-    # browser engine (e.g. selenium-llm-engine) can echo the separate Recon
+    # browser engine (e.g. zen-llm-engine) can echo the separate Recon
     # call's JSON keys (tone_hint, agent_intent, language_hint, ...) back into
     # the main-pass ``actions`` array. Those keys are preflight metadata, not
     # executable actions; validating them yields "Unsupported type" errors that
@@ -2689,7 +2689,7 @@ def _generate_context_tags(
     if "event" in action_types:
         context_tags.append("scheduling")
     if (
-        "speech_selenium_elevenlabs" in action_types
+        "speech_zen_elevenlabs" in action_types
         or "audio_telegram_bot" in action_types
     ):
         context_tags.append("audio")

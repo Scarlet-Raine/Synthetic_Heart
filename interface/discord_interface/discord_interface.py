@@ -1679,7 +1679,7 @@ class DiscordInterface:
         """Stop the Gemini Live API voice session for a guild."""
         try:
             # Use the live engine stored at session start — NOT the global cortex,
-            # which may be a different engine (e.g. selenium_gemini).
+            # which may be a different engine (e.g. zen_gemini).
             _state_now = getattr(self, "_live_voice_state", {}).get(guild_id, {})
             _live_eng = _state_now.get("live_engine")
             if _live_eng and hasattr(_live_eng, "stop_live_voice_session"):

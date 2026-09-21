@@ -14,7 +14,7 @@ Prerequisites
 - `uv <https://docs.astral.sh/uv/>`_ installed (``pip install uv`` or see Astral docs)
 - A running MySQL/MariaDB instance reachable from this machine (or set ``DB_HOST`` to a host that provides one)
 - **ffmpeg** on PATH — required for multimodal video/audio processing and Discord voice features. Download from https://ffmpeg.org/download.html and add to PATH.
-- Optional: Chrome and ``undetected-chromedriver`` if you plan to use Selenium-based LLM engines
+- Optional: Chrome and ``undetected-chromedriver`` if you plan to use Zen-based LLM engines
 
 Quick start
 -----------
@@ -65,7 +65,7 @@ Notes & Caveats
 ---------------
 - The `webtop/` folder contains container-oriented scripts and an embedded desktop environment that rely on Linux services such as PulseAudio and X server; those are Docker-only conveniences.
 - Some tests/integration may assume a MySQL server or other services; use env variables to point tests to local services or mock them in CI.
-- If you intend to use the Selenium engines, ensure Chrome is installed and `undetected-chromedriver` works in your environment.
+- If you intend to use the Zen engines, ensure Chrome is installed and `undetected-chromedriver` works in your environment.
 
 Maintenance guidance for maintainers
 -----------------------------------

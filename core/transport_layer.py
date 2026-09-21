@@ -40,7 +40,7 @@ AWAIT_RESPONSE_TIMEOUT = config_registry.get_var(
 
 # Dedicated, short timeout for a SINGLE corrector LLM call. The corrector runs
 # inside the single synchronous message-queue consumer, so a slow/uncancellable
-# engine (e.g. the stateful browser-driven selenium engine) hanging for the full
+# engine (e.g. the stateful browser-driven zen engine) hanging for the full
 # AWAIT_RESPONSE_TIMEOUT would starve every chat and beat. Each corrector attempt
 # is bounded by this value so a hung correction fails fast and releases the
 # consumer instead of blocking up to AWAIT_RESPONSE_TIMEOUT per attempt.
@@ -1780,7 +1780,7 @@ async def universal_send(interface_send_func, *args, text: str | None = None, **
                     actions = [json_data]
 
             # Drop leaked Recon-schema entries. A state-retaining browser engine
-            # (e.g. selenium-llm-engine) can echo the separate Recon call's JSON
+            # (e.g. zen-llm-engine) can echo the separate Recon call's JSON
             # keys (tone_hint, agent_intent, language_hint, ...) back into the
             # main-pass ``actions`` array. Those keys are preflight metadata, not
             # executable actions; validating them yields "Unsupported type"
@@ -2482,7 +2482,7 @@ async def run_corrector_middleware(
             # turn used, not the global active engine. Otherwise a vessel turn
             # (scoped to the fast VESSEL_CORTEX) would be corrected against the
             # global BASE_CORTEX (e.g. the slow, stateful, uncancellable
-            # selenium browser engine), which hangs on the single consumer and
+            # zen browser engine), which hangs on the single consumer and
             # deadlocks every chat. Mirror the resolution used by
             # core/plugin_instance.py: derive_cortex_scope(context) ->
             # get_active_cortex_scope(scope) -> cortex registry. Purely

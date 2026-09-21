@@ -82,7 +82,7 @@ try:
             "backend and scraping result pages). This bounds network I/O and does "
             "NOT include the synthesis LLM call, which is left untimed so that "
             "time spent waiting in a serial engine's queue (e.g. "
-            "selenium-llm-engine, one shared Chromium worker) never cancels the "
+            "zen-llm-engine, one shared Chromium worker) never cancels the "
             "task — such queueing can last minutes or hours under load.",
         ),
     ]

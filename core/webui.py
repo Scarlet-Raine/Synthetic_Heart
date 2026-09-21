@@ -858,7 +858,7 @@ class SynthWebUIInterface:
         self.app.post("/api/config")(self.update_config_entry)
         # Cortex-aware endpoints
         self.app.post("/api/components/cortex")(self.set_cortex_engine)
-        # Login control for Selenium-based engines
+        # Login control for Zen-based engines
         self.app.post("/api/components/cortex/login")(self.cortex_login)
         # Model selection for cortex engines
         self.app.post("/api/components/cortex/model")(self.set_cortex_model)
@@ -12904,16 +12904,16 @@ class SynthWebUIInterface:
         )
 
     async def cortex_login(self, request: Request):
-        """Selenium-based login is no longer supported.
+        """Zen-based login is no longer supported.
 
-        The embedded Selenium engine has been removed. Use the external
-        selenium-llm-engine service and configure it as an external endpoint.
+        The embedded Zen engine has been removed. Use the external
+        zen-llm-engine service and configure it as an external endpoint.
         """
         raise HTTPException(
             status_code=422,
             detail=(
-                "Selenium-based login is no longer supported. "
-                "Use the external selenium-llm-engine endpoint."
+                "Zen-based login is no longer supported. "
+                "Use the external zen-llm-engine endpoint."
             ),
         )
 

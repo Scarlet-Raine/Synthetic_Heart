@@ -42,7 +42,7 @@ def _make_entry(
         "interface_path": interface_path,
         "chat_id": "123",
         "thread_id": None,
-        "engine": "selenium-llm-engine",
+        "engine": "zen-llm-engine",
         "model": "gemini",
         "message_id": None,
         "content_preview": content_preview,

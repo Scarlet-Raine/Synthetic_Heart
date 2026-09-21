@@ -625,7 +625,7 @@ class GrilloGrowthPlugin:
 
         parsed = await self._generate_and_parse(engine, prompt)
 
-        # The active cortex (e.g. selenium-llm-engine) is not JSON-constrained,
+        # The active cortex (e.g. zen-llm-engine) is not JSON-constrained,
         # so it sometimes wraps the object in prose, returns a bare array, or
         # omits the JSON entirely. Retry once with an explicit correction prompt
         # before giving up on the whole weekly round.

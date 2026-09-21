@@ -210,7 +210,7 @@ def test_get_active_iris_engine_reflects_pseudo_engine() -> None:
         def refresh_config(self) -> None:  # no-op
             pass
 
-    for engine_name in ("inline", "disabled", "selenium-llm-engine"):
+    for engine_name in ("inline", "disabled", "zen-llm-engine"):
         registry = {"iris_plugin": _FakeIris(engine_name)}
         with patch("core.core_initializer.PLUGIN_REGISTRY", registry):
             assert pi._get_active_iris_engine() == engine_name

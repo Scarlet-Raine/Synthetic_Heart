@@ -1287,7 +1287,7 @@ def _pick_preferred_cortex(candidates: set[str]) -> str | None:
     if not names:
         return None
     return sorted(
-        names, key=lambda name: (0 if "selenium" in name.lower() else 1, name)
+        names, key=lambda name: (0 if "zen" in name.lower() else 1, name)
     )[0]
 
 
@@ -1427,7 +1427,7 @@ async def init_db() -> None:
                 # Insert default config entries if they don't exist (use `config` table)
                 await cur.execute(
                     """
-                    INSERT IGNORE INTO config (`config_key`, `value`) VALUES ('BASE_CORTEX', 'selenium-llm-engine')
+                    INSERT IGNORE INTO config (`config_key`, `value`) VALUES ('BASE_CORTEX', 'zen-llm-engine')
                     """
                 )
                 await cur.execute(

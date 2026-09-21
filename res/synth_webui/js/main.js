@@ -3272,14 +3272,14 @@ function pickAccentDarkFromHex(hex) { return darkenHex(hex, 0.28); }
                                 modelPicker.style.display = 'none';
                             }
                         }
-                        const isSeleniumKind = String(kind || '').toLowerCase().includes('selenium');
+                        const isZenKind = String(kind || '').toLowerCase().includes('zen');
                         if (engineLoginBtn) {
-                            engineLoginBtn.style.display = isSeleniumKind ? '' : 'none';
+                            engineLoginBtn.style.display = isZenKind ? '' : 'none';
                             engineLoginBtn.disabled = !active || !active.loaded;
                             engineLoginBtn.textContent = active && active.logged_in ? 'Logged' : 'Login';
                         }
                         if (engineLoginWarning) {
-                            engineLoginWarning.style.display = isSeleniumKind ? 'block' : 'none';
+                            engineLoginWarning.style.display = isZenKind ? 'block' : 'none';
                         }
                         if (engineLoginWarningUrl) {
                             const loginUrl = active ? (active.login_url || active.service_url || '') : '';
@@ -3287,7 +3287,7 @@ function pickAccentDarkFromHex(hex) { return darkenHex(hex, 0.28); }
                         }
                         if (engineLoginWarningSelkies) {
                             engineLoginWarningSelkies.textContent = 'https://{host}:{port}';
-                            if (isSeleniumKind) {
+                            if (isZenKind) {
                                 resolveSelkiesLoginUrl().then((url) => {
                                     engineLoginWarningSelkies.textContent = url;
                                 }).catch(() => {});
@@ -6909,7 +6909,7 @@ function pickAccentDarkFromHex(hex) { return darkenHex(hex, 0.28); }
                         listEl.innerHTML = '';
                         if (!models.length) {
                             const emptyMsg = sub === 'iris'
-                                ? 'Iris has no locally-managed models — vision runs through external endpoints only (e.g. selenium-llm-engine). Configure it in the External Engines section.'
+                                ? 'Iris has no locally-managed models — vision runs through external endpoints only (e.g. zen-llm-engine). Configure it in the External Engines section.'
                                 : 'No locally-managed models available for this subsystem.';
                             listEl.innerHTML = '<div class="meta">' + emptyMsg + '</div>';
                             return;

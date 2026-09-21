@@ -26,7 +26,7 @@ try:
 except Exception:
 
     def notify_trainer(message: str) -> None:  # pragma: no cover - fallback
-        log_warning("[selenium_ttsfree] notifier not available")
+        log_warning("[zen_ttsfree] notifier not available")
 
 
 # Register exposed variable for WebUI
@@ -40,17 +40,17 @@ register_exposed_var(
     value_type="json",
     ui_type="textarea",
     description=(
-        "Mapping used by the selenium_ttsfree plugin. Format is a JSON object mapping language keys to an array:"
+        "Mapping used by the zen_ttsfree plugin. Format is a JSON object mapping language keys to an array:"
         ' [language, voice_name, pitch?, speed?]. Example: {"italian": ["italian", "Isabella", 10, 20]}'
     ),
     scope="plugin",
-    component="selenium_ttsfree",
+    component="zen_ttsfree",
     tags=["tts", "voice"],
 )
 
 
-class SeleniumTTSFreePlugin:
-    """Generate voice messages using https://ttsfree.com via Selenium and send them to an interface.
+class ZenTTSFreePlugin:
+    """Generate voice messages using https://ttsfree.com via Zen and send them to an interface.
 
     Action: voice_message_ttsfree
 
@@ -65,15 +65,15 @@ class SeleniumTTSFreePlugin:
       - Temporary files are used for download and removed after dispatch.
     """
 
-    display_name = "Selenium TTSFree"
+    display_name = "Zen TTSFree"
 
     def __init__(self) -> None:
-        register_plugin("selenium_ttsfree", self)
-        log_info("[selenium_ttsfree] Plugin initialized")
+        register_plugin("zen_ttsfree", self)
+        log_info("[zen_ttsfree] Plugin initialized")
 
         if uc is None:
             log_warning(
-                "[selenium_ttsfree] undetected_chromedriver unavailable; generation will fail if invoked"
+                "[zen_ttsfree] undetected_chromedriver unavailable; generation will fail if invoked"
             )
 
     # === Action metadata ===
@@ -189,7 +189,7 @@ class SeleniumTTSFreePlugin:
         interface_path = payload.get("interface_path")
 
         log_info(
-            f"[selenium_ttsfree] Executing voice_message_ttsfree for {len(text)} chars, language={language}"
+            f"[zen_ttsfree] Executing voice_message_ttsfree for {len(text)} chars, language={language}"
         )
 
         # Persona per lingua: try to obtain a persona matching the requested language; fallback to default
@@ -206,11 +206,11 @@ class SeleniumTTSFreePlugin:
                     persona_for_lang = None
             if not persona_for_lang:
                 log_warning(
-                    f"[selenium_ttsfree] No persona found for language '{language}', using default persona"
+                    f"[zen_ttsfree] No persona found for language '{language}', using default persona"
                 )
         except Exception:
             log_debug(
-                "[selenium_ttsfree] Unable to verify persona for language (manager unavailable), using default persona"
+                "[zen_ttsfree] Unable to verify persona for language (manager unavailable), using default persona"
             )
 
         # Resolve voice mapping: payload.voice can be a list (direct), a string key
@@ -265,12 +265,12 @@ class SeleniumTTSFreePlugin:
                 if lang_name:
                     resolved_voice = mapping.get(lang_name)
                     log_debug(
-                        f"[selenium_ttsfree] Converted ISO code '{language}' to '{lang_name}'"
+                        f"[zen_ttsfree] Converted ISO code '{language}' to '{lang_name}'"
                     )
 
         if not resolved_voice:
             log_warning(
-                f"[selenium_ttsfree] No voice mapping found for language/key '{voice or language}', using fallback voice"
+                f"[zen_ttsfree] No voice mapping found for language/key '{voice or language}', using fallback voice"
             )
             resolved_voice = [language, "default"]
 
@@ -281,7 +281,7 @@ class SeleniumTTSFreePlugin:
             from core.core_initializer import INTERFACE_REGISTRY
         except Exception:
             log_warning(
-                "[selenium_ttsfree] INTERFACE_REGISTRY unavailable, cannot dispatch audio"
+                "[zen_ttsfree] INTERFACE_REGISTRY unavailable, cannot dispatch audio"
             )
             return
 
@@ -289,7 +289,7 @@ class SeleniumTTSFreePlugin:
         parts = interface_path.split("/") if interface_path else []
         if not parts:
             log_warning(
-                "[selenium_ttsfree] interface_path seems invalid, aborting dispatch"
+                "[zen_ttsfree] interface_path seems invalid, aborting dispatch"
             )
             return
 
@@ -297,7 +297,7 @@ class SeleniumTTSFreePlugin:
         iface = INTERFACE_REGISTRY.get(interface_name)
         if not iface:
             log_warning(
-                f"[selenium_ttsfree] Interface {interface_name} not found in registry"
+                f"[zen_ttsfree] Interface {interface_name} not found in registry"
             )
             return
 
@@ -313,21 +313,21 @@ class SeleniumTTSFreePlugin:
             )
             if not send_fn:
                 log_warning(
-                    f"[selenium_ttsfree] Interface {interface_name} does not expose a send_audio/send_voice method"
+                    f"[zen_ttsfree] Interface {interface_name} does not expose a send_audio/send_voice method"
                 )
                 return
 
             await send_fn(send_payload)
-            log_info(f"[selenium_ttsfree] Audio dispatched to {interface_path}")
+            log_info(f"[zen_ttsfree] Audio dispatched to {interface_path}")
         except Exception as e:
-            log_error(f"[selenium_ttsfree] Failed to send audio to interface: {e}")
+            log_error(f"[zen_ttsfree] Failed to send audio to interface: {e}")
 
     async def _generate_speech(self, text: str, language: str, voice: list) -> str:
         download_dir = tempfile.mkdtemp(prefix="ttsfree_")
 
         def _run() -> Tuple[str, Optional[str]]:
             options = uc.ChromeOptions()
-            if os.getenv("synth_SELENIUM_HEADLESS", "1") == "1":
+            if os.getenv("synth_ZEN_HEADLESS", os.getenv("synth_SELENIUM_HEADLESS", "1")) == "1":
                 options.add_argument("--headless=new")
             prefs = {
                 "download.default_directory": download_dir,
@@ -345,7 +345,7 @@ class SeleniumTTSFreePlugin:
             options.add_argument("--log-level=0")
             options.add_argument(f"--log-file={chromium_log}")
             log_debug(
-                f"[selenium_ttsfree] Chromium log -> {chromium_log}, chromedriver log -> {chromedriver_log}"
+                f"[zen_ttsfree] Chromium log -> {chromium_log}, chromedriver log -> {chromedriver_log}"
             )
 
             chromium_binary = (
@@ -366,7 +366,7 @@ class SeleniumTTSFreePlugin:
             try:
                 driver = uc.Chrome(options=options, service=service)
             except Exception as e:
-                log_error(f"[selenium_ttsfree] Failed to start Chrome driver: {e}")
+                log_error(f"[zen_ttsfree] Failed to start Chrome driver: {e}")
                 raise
 
             wait = WebDriverWait(driver, 60)
@@ -413,13 +413,13 @@ class SeleniumTTSFreePlugin:
                             )
                         except Exception:
                             log_warning(
-                                f"[selenium_ttsfree] Could not reliably select language '{language}' via UI, proceeding with default site language"
+                                f"[zen_ttsfree] Could not reliably select language '{language}' via UI, proceeding with default site language"
                             )
 
                 except Exception:
                     # ignore language take-over failures — TTSFree defaults might still work
                     log_debug(
-                        "[selenium_ttsfree] Language selection failed or not needed"
+                        "[zen_ttsfree] Language selection failed or not needed"
                     )
 
                 # CHOOSE VOICE
@@ -447,10 +447,10 @@ class SeleniumTTSFreePlugin:
                                     pass
                         if not chosen:
                             log_warning(
-                                f"[selenium_ttsfree] Voice '{voice_name}' not found in UI, using default voice"
+                                f"[zen_ttsfree] Voice '{voice_name}' not found in UI, using default voice"
                             )
                     except Exception:
-                        log_debug("[selenium_ttsfree] Error searching for voice labels")
+                        log_debug("[zen_ttsfree] Error searching for voice labels")
 
                 # Optional: set pitch and speed if provided
                 try:
@@ -477,7 +477,7 @@ class SeleniumTTSFreePlugin:
                             )
                         except Exception:
                             log_debug(
-                                "[selenium_ttsfree] Failed to set pitch slider via selector; ignoring"
+                                "[zen_ttsfree] Failed to set pitch slider via selector; ignoring"
                             )
 
                     if speed is not None:
@@ -493,10 +493,10 @@ class SeleniumTTSFreePlugin:
                             )
                         except Exception:
                             log_debug(
-                                "[selenium_ttsfree] Failed to set speed slider via selector; ignoring"
+                                "[zen_ttsfree] Failed to set speed slider via selector; ignoring"
                             )
                 except Exception:
-                    log_debug("[selenium_ttsfree] Skipping pitch/speed adjustments")
+                    log_debug("[zen_ttsfree] Skipping pitch/speed adjustments")
 
                 # Input text
                 try:
@@ -506,7 +506,7 @@ class SeleniumTTSFreePlugin:
                     textarea.clear()
                     textarea.send_keys(text)
                 except Exception:
-                    log_error("[selenium_ttsfree] Could not find input_text textarea")
+                    log_error("[zen_ttsfree] Could not find input_text textarea")
                     raise
 
                 # Click Convert Now - handle ad popup blocking
@@ -523,7 +523,7 @@ class SeleniumTTSFreePlugin:
                         convert_btn.click()
                     except Exception:
                         log_debug(
-                            "[selenium_ttsfree] Normal click blocked, using JavaScript click"
+                            "[zen_ttsfree] Normal click blocked, using JavaScript click"
                         )
                         driver.execute_script("arguments[0].click();", convert_btn)
                 except Exception:
@@ -540,7 +540,7 @@ class SeleniumTTSFreePlugin:
                         except Exception:
                             driver.execute_script("arguments[0].click();", btn)
                     except Exception:
-                        log_error("[selenium_ttsfree] Convert Now button not found")
+                        log_error("[zen_ttsfree] Convert Now button not found")
                         raise
 
                 # Wait for save/download link (#savevoice) to appear and get its href
@@ -564,7 +564,7 @@ class SeleniumTTSFreePlugin:
                         save_href = a.get_attribute("href")
                     except Exception:
                         log_error(
-                            "[selenium_ttsfree] Download link not found after conversion"
+                            "[zen_ttsfree] Download link not found after conversion"
                         )
                         raise
 
@@ -584,11 +584,11 @@ class SeleniumTTSFreePlugin:
                             return fname, None
                         else:
                             log_error(
-                                f"[selenium_ttsfree] Download request returned status {r.status_code}"
+                                f"[zen_ttsfree] Download request returned status {r.status_code}"
                             )
                     except Exception as e:
                         log_error(
-                            f"[selenium_ttsfree] Failed to download mp3 from save link: {e}"
+                            f"[zen_ttsfree] Failed to download mp3 from save link: {e}"
                         )
 
                 # As a fallback wait for browser download to finish
@@ -615,11 +615,11 @@ class SeleniumTTSFreePlugin:
                 except Exception:
                     pass
 
-        # run selenium in thread
+        # run zen in thread
         mp3_path, _credits = await asyncio.to_thread(_run)
 
         # schedule cleanup of temp folder after return of path; keep caller responsible for removal
         return mp3_path
 
 
-PLUGIN_CLASS = SeleniumTTSFreePlugin
+PLUGIN_CLASS = ZenTTSFreePlugin

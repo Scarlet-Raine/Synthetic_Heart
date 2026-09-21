@@ -546,7 +546,7 @@ def _drop_leaked_recon_actions(actions: list) -> list:
 
     The Recon pass ("prompt 0") runs its own LLM call on the *same* engine
     immediately before the main pass. State-retaining external engines (e.g. the
-    browser-driven selenium endpoint, which cannot be reset from our side) can
+    browser-driven zen endpoint, which cannot be reset from our side) can
     carry that priming forward, so the main pass sometimes echoes Recon-schema
     keys (``tone_hint``, ``agent_intent``, ``memory_search`` …) back inside its
     ``actions`` array. Those keys are *never* real actions — validation would
@@ -611,7 +611,7 @@ def _drop_out_of_scope_leaked_actions(actions: list, ctx: Optional[dict]) -> lis
     on a plain chat turn (e.g. ``ollama_serve``) the ``vessel_*`` / ``agent_*``
     actions are removed from the prompt, so a well-behaved model can only choose
     from the in-scope allowlist. A *state-retaining* external engine (e.g. the
-    browser-driven selenium endpoint, which cannot be reset from our side) keeps
+    browser-driven zen endpoint, which cannot be reset from our side) keeps
     the conversation history across turns, so on a core turn it sometimes echoes
     an action it was offered on an earlier *Vessel* turn — e.g.
     ``vessel_minecraft_collect_block`` — even though the current prompt never

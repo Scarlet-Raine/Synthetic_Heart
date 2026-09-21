@@ -3,7 +3,7 @@
 
 Works with any service exposing the OpenAI Chat Completions API:
 Ollama, LM Studio, OpenRouter, vLLM, Groq, Together AI, Grok/xAI,
-the external Selenium LLM Engine, and OpenAI itself.
+the external Zen LLM Engine, and OpenAI itself.
 
 Uses the ``openai`` SDK (``base_url`` override) so auth headers,
 retry logic, and streaming are all handled by the SDK.

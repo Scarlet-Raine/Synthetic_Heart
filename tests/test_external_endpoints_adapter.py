@@ -63,8 +63,8 @@ class FakeAiohttpSession:
 @pytest.mark.asyncio
 async def test_openai_compat_list_models_from_dict_response(monkeypatch):
     data = [
-        {"id": "chatgpt", "object": "model", "owned_by": "selenium-llm-engine"},
-        {"id": "claude", "object": "model", "owned_by": "selenium-llm-engine"},
+        {"id": "chatgpt", "object": "model", "owned_by": "zen-llm-engine"},
+        {"id": "claude", "object": "model", "owned_by": "zen-llm-engine"},
     ]
     adapter = OpenAICompatAdapter(base_url="http://localhost:14848", api_key="x")
 

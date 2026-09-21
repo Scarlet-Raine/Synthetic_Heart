@@ -24,7 +24,7 @@ Supported endpoint types include:
 - OpenRouter
 - GitHub Models / Copilot
 - OpenAI-compatible local hosts (e.g. Ollama, LM Studio)
-- Selenium LLM Engine
+- Zen LLM Engine
 - Generic OpenAI-compatible services
 - Legacy HTTP TTS services via ``custom`` mode
 
@@ -39,7 +39,7 @@ project.
 Built-in default endpoint
 -------------------------
 
-Selenium LLM Engine is distributed as a default endpoint for new installs.
+Zen LLM Engine is distributed as a default endpoint for new installs.
 It is available automatically, but users may remove it if they do not need it.
 If removed, it can be restored from the provider presets list.
 
@@ -257,8 +257,8 @@ Use cases
 
 - Local development and testing:
 
-  - Start Selenium LLM Engine and add it as an external endpoint using the
-    built-in Selenium preset.
+  - Start Zen LLM Engine and add it as an external endpoint using the
+    built-in Zen preset.
   - Confirm probe success and map the endpoint to ``cortex`` for chat usage.
 
 - Multi-provider setups:

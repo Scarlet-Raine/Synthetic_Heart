@@ -276,7 +276,7 @@ async def load_plugin(
                     )
                 except asyncio.TimeoutError:
                     # Prefer to avoid force-cancelling an in-progress LLM response here;
-                    # rely on the engine's own waiting/recovery logic (Selenium already
+                    # rely on the engine's own waiting/recovery logic (Zen already
                     # implements robust wait/retry). Log and proceed with the hotswap
                     # without cancelling the worker task to prevent premature stop.
                     log_warning(
@@ -878,7 +878,7 @@ async def handle_incoming_message(
             # A delivery turn is enqueued as a JSON string ({system_message,
             # allowed_action_types}) and parsed successfully above, so it BYPASSES
             # build_prompt_request — the prior allowed_action_types allowlist was
-            # therefore never applied to the action catalog the weak selenium model
+            # therefore never applied to the action catalog the weak zen model
             # saw, and it re-emitted the producing action (e.g.
             # search_current_knowledge) in a loop. Here we rebuild the delivery
             # turn as a PromptRequest whose tool_declarations are message_* only;

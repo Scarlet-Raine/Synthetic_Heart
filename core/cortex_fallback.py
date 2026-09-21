@@ -87,7 +87,7 @@ def is_local_engine(name: str) -> bool:
     """Return True when *name* is listed in ``CORTEX_LOCAL_ENGINES`` (case-insensitive)."""
     try:
         raw = str(
-            _get_config_value("CORTEX_LOCAL_ENGINES", "selenium-llm-engine") or ""
+            _get_config_value("CORTEX_LOCAL_ENGINES", "zen-llm-engine") or ""
         )
         local = {token.strip().lower() for token in raw.split(",") if token.strip()}
         return str(name or "").strip().lower() in local

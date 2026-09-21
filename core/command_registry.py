@@ -665,7 +665,7 @@ async def cortex_command(*args) -> str:
 
     # Final step: switch via central helper.
     # use_hot_swap=True calls load_plugin() directly — much lighter than
-    # initialize_all() and avoids leaving selenium polling tasks hanging
+    # initialize_all() and avoids leaving zen polling tasks hanging
     # with driver=None when the old engine is torn down mid-request.
     try:
         from core.config import switch_active_cortex_engine
@@ -1122,10 +1122,15 @@ async def splitprompt_command(*args) -> str:
         # Lazy import to avoid cycles
         from core.config_manager import config_registry
 
-        key = "SELENIUM_DOUBLE_PROMPT"
+        key = "ZEN_DOUBLE_PROMPT"
+        legacy_key = "SELENIUM_DOUBLE_PROMPT"
 
         if not args:
-            val = config_registry.get_value(key, True)
+            val = config_registry.get_value(key)
+            if val is None:
+                val = config_registry.get_value(legacy_key)
+            if val is None:
+                val = True
             state = "enabled ✅" if bool(val) else "disabled ❌"
             return f"🔀 Double-prompt (PART1/PART2) is currently *{state}* (config: `{key}`)."
 

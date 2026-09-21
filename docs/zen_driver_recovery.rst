@@ -1,10 +1,10 @@
-Selenium Driver Freeze Detection and Recovery
+Zen Driver Freeze Detection and Recovery
 =============================================
 
 Overview
 --------
-When controlling a real browser with Selenium, the browser process may freeze, crash, or be closed
-manually by the user. To make the system robust, `selenium_llm_base` now implements driver
+When controlling a real browser with Zen, the browser process may freeze, crash, or be closed
+manually by the user. To make the system robust, `zen_llm_base` now implements driver
 responsiveness detection and automatic recovery:
 
 - Quick health checks (window handles + current_url) with a configurable timeout.
@@ -15,10 +15,10 @@ Configuration
 -------------
 The following runtime-exposed configuration variables control this behavior:
 
-- ``SELENIUM_DRIVER_RESPONSIVE_TIMEOUT`` (default 10s): How many seconds to wait for a trivial
+- ``ZEN_DRIVER_RESPONSIVE_TIMEOUT`` (default 10s): How many seconds to wait for a trivial
   driver operation (e.g., accessing ``window_handles``) before considering the driver frozen.
 
-- ``SELENIUM_DRIVER_RECOVERY_RETRIES`` (default 2): How many times to attempt restarting the
+- ``ZEN_DRIVER_RECOVERY_RETRIES`` (default 2): How many times to attempt restarting the
   browser and retrying the LLM workflow when the driver is detected to be frozen.
 
 Behavior in the code
@@ -29,7 +29,7 @@ Behavior in the code
 
 - ``generate_response`` (and the double-prompt flow) now run the complete workflow inside a
   driver-recovery retry loop: on driver-related failures the code will attempt to recover the
-  driver and retry the workflow up to ``SELENIUM_DRIVER_RECOVERY_RETRIES`` times.
+  driver and retry the workflow up to ``ZEN_DRIVER_RECOVERY_RETRIES`` times.
 
 Notes
 -----

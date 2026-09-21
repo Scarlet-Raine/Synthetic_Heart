@@ -26,7 +26,7 @@ import core.cortex_fallback as cf
 _DEFAULT_CONFIG: dict[str, Any] = {
     "CORTEX_FALLBACK_ENABLED": True,
     "CORTEX_FALLBACK_ENGINE": "",
-    "CORTEX_LOCAL_ENGINES": "selenium-llm-engine",
+    "CORTEX_LOCAL_ENGINES": "zen-llm-engine",
     "CORTEX_FALLBACK_TIMEOUT_SEC": 60,
     "CORTEX_CACHED_RESPONSE_ENABLED": True,
     "CORTEX_CACHE_TTL_SEC": 3600,
@@ -72,8 +72,8 @@ def test_resolve_fallback_engine_none_on_whitespace(
 def test_resolve_fallback_engine_returns_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "selenium-llm-engine"})
-    assert cf.resolve_fallback_engine() == "selenium-llm-engine"
+    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "zen-llm-engine"})
+    assert cf.resolve_fallback_engine() == "zen-llm-engine"
 
 
 def test_resolve_fallback_engine_degrades_on_error(
@@ -89,8 +89,8 @@ def test_resolve_fallback_engine_degrades_on_error(
 
 
 def test_is_local_engine_case_insensitive(monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch_config(monkeypatch, {"CORTEX_LOCAL_ENGINES": "Selenium-LLM-Engine, Foo"})
-    assert cf.is_local_engine("SELENIUM-LLM-ENGINE") is True
+    _patch_config(monkeypatch, {"CORTEX_LOCAL_ENGINES": "Zen-LLM-Engine, Foo"})
+    assert cf.is_local_engine("ZEN-LLM-ENGINE") is True
     assert cf.is_local_engine("foo") is True
     assert cf.is_local_engine("bar") is False
 
@@ -147,7 +147,7 @@ def test_cached_response_never_raises_on_garbage(
 
 
 async def test_primary_success_short_circuits(monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "selenium-llm-engine"})
+    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "zen-llm-engine"})
     calls: list[str] = []
 
     async def call_engine(name: str) -> str:
@@ -190,7 +190,7 @@ async def test_primary_success_is_cached(monkeypatch: pytest.MonkeyPatch) -> Non
 async def test_empty_primary_uses_local_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "selenium-llm-engine"})
+    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "zen-llm-engine"})
     calls: list[str] = []
 
     async def call_engine(name: str) -> str:
@@ -206,11 +206,11 @@ async def test_empty_primary_uses_local_fallback(
         prompt_signature="sig",
     )
     assert result == "fallback text"
-    assert calls == ["primary", "selenium-llm-engine"]
+    assert calls == ["primary", "zen-llm-engine"]
 
 
 async def test_none_primary_uses_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "selenium-llm-engine"})
+    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "zen-llm-engine"})
     calls: list[str] = []
 
     async def call_engine(name: str) -> str | None:
@@ -226,7 +226,7 @@ async def test_none_primary_uses_fallback(monkeypatch: pytest.MonkeyPatch) -> No
         prompt_signature="sig",
     )
     assert result == "fallback text"
-    assert calls == ["primary", "selenium-llm-engine"]
+    assert calls == ["primary", "zen-llm-engine"]
 
 
 async def test_fallback_skipped_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -234,7 +234,7 @@ async def test_fallback_skipped_when_disabled(monkeypatch: pytest.MonkeyPatch) -
         monkeypatch,
         {
             "CORTEX_FALLBACK_ENABLED": False,
-            "CORTEX_FALLBACK_ENGINE": "selenium-llm-engine",
+            "CORTEX_FALLBACK_ENGINE": "zen-llm-engine",
         },
     )
     calls: list[str] = []
@@ -274,7 +274,7 @@ async def test_fallback_skipped_when_same_as_primary(
 
 
 async def test_timeout_primary_uses_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "selenium-llm-engine"})
+    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "zen-llm-engine"})
     calls: list[str] = []
 
     async def call_engine(name: str) -> str:
@@ -290,7 +290,7 @@ async def test_timeout_primary_uses_fallback(monkeypatch: pytest.MonkeyPatch) ->
         prompt_signature="sig",
     )
     assert result == "recovered"
-    assert calls == ["primary", "selenium-llm-engine"]
+    assert calls == ["primary", "zen-llm-engine"]
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +301,7 @@ async def test_timeout_primary_uses_fallback(monkeypatch: pytest.MonkeyPatch) ->
 async def test_cached_response_returned_when_all_generation_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "selenium-llm-engine"})
+    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "zen-llm-engine"})
     # Key includes the (empty here) interface_path segment - see
     # test_primary_success_is_cached above.
     cf.set_cached_response("primary::sig", "cached text")
@@ -325,7 +325,7 @@ async def test_cached_response_not_shared_across_interface_paths(
     into an unrelated user conversation just because both share an
     engine_name and an identical (possibly truncated) prompt_signature.
     """
-    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "selenium-llm-engine"})
+    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "zen-llm-engine"})
 
     async def call_engine(name: str) -> str:
         return "grillo's internal reply"
@@ -362,7 +362,7 @@ async def test_cached_response_not_shared_across_interface_paths(
 async def test_raising_fallback_degrades_to_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "selenium-llm-engine"})
+    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "zen-llm-engine"})
 
     async def call_engine(name: str) -> str:
         if name == "primary":
@@ -398,7 +398,7 @@ async def test_timeout_primary_reraises_without_fallback(
 async def test_timeout_primary_reraises_after_failed_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "selenium-llm-engine"})
+    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "zen-llm-engine"})
 
     async def call_engine(name: str) -> str:
         if name == "primary":
@@ -417,7 +417,7 @@ async def test_timeout_primary_reraises_after_failed_fallback(
 async def test_primary_non_timeout_exception_propagates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "selenium-llm-engine"})
+    _patch_config(monkeypatch, {"CORTEX_FALLBACK_ENGINE": "zen-llm-engine"})
     calls: list[str] = []
 
     async def call_engine(name: str) -> str:

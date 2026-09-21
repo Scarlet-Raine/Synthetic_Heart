@@ -531,6 +531,64 @@ async def _migrate_llm_failure_log_is_test() -> None:
                 pass
 
 
+async def _migrate_selenium_config_keys() -> None:
+    """Rename legacy ``SELENIUM_*`` config keys to ``ZEN_*``.
+
+    The Zen LLM Engine was formerly named "Selenium". Existing installations
+    have ``SELENIUM_*`` rows in the ``config`` table. This migration renames
+    them to ``ZEN_*`` so the code (which now reads ``ZEN_*`` keys) finds the
+    existing values. Idempotent and best-effort: existing ``ZEN_*`` rows are
+    preserved, and any failure is logged without blocking startup.
+    """
+    from core.db import get_conn_ctx
+
+    renames: list[tuple[str, str]] = [
+        ("SELENIUM_DOUBLE_PROMPT", "ZEN_DOUBLE_PROMPT"),
+        ("SELENIUM_DOUBLE_PROMPT_ENABLED", "ZEN_DOUBLE_PROMPT_ENABLED"),
+        ("SELENIUM_DOUBLE_PROMPT_RETRIES", "ZEN_DOUBLE_PROMPT_RETRIES"),
+        ("SELENIUM_DOUBLE_PROMPT_SAVE_PART1", "ZEN_DOUBLE_PROMPT_SAVE_PART1"),
+        ("SELENIUM_DOUBLE_PROMPT_TIMEOUT_SECONDS", "ZEN_DOUBLE_PROMPT_TIMEOUT_SECONDS"),
+        ("SELENIUM_MAX_RETRIES", "ZEN_MAX_RETRIES"),
+        ("SELENIUM_PART1_PROCESSING_TIMEOUT", "ZEN_PART1_PROCESSING_TIMEOUT"),
+        ("SELENIUM_PART1_RESPONSE_STABLE_GRACE", "ZEN_PART1_RESPONSE_STABLE_GRACE"),
+        ("SELENIUM_POST_SEND_CONFIRM_TIMEOUT", "ZEN_POST_SEND_CONFIRM_TIMEOUT"),
+        ("SELENIUM_RESPONSE_POLL_INTERVAL", "ZEN_RESPONSE_POLL_INTERVAL"),
+        ("SELENIUM_RESPONSE_STABLE_GRACE", "ZEN_RESPONSE_STABLE_GRACE"),
+        ("SELENIUM_SPLIT_PROMPT_PARTS", "ZEN_SPLIT_PROMPT_PARTS"),
+    ]
+
+    async with get_conn_ctx() as conn:
+        async with conn.cursor() as cur:
+            try:
+                await cur.execute("SELECT config_key FROM config")
+                existing = {row["config_key"] if isinstance(row, dict) else row[0] for row in await cur.fetchall()}
+            except Exception as exc:
+                log_warning(f"[migrations] Cannot read config table for SELENIUM→ZEN rename: {exc}")
+                return
+
+            migrated = 0
+            for old_key, new_key in renames:
+                if new_key in existing:
+                    continue
+                if old_key not in existing:
+                    continue
+                try:
+                    await cur.execute(
+                        "UPDATE config SET config_key = %s WHERE config_key = %s",
+                        (new_key, old_key),
+                    )
+                    migrated += 1
+                except Exception as exc:
+                    log_warning(f"[migrations] Failed to rename config key {old_key} → {new_key}: {exc}")
+
+            if migrated:
+                try:
+                    await conn.commit()
+                except Exception:
+                    pass
+                log_info(f"[migrations] Renamed {migrated} SELENIUM_* config key(s) → ZEN_*")
+
+
 # Registry of startup migrations, applied in order. Each entry is
 # (name, coroutine-callable). Add new one-shot migrations here.
 _STARTUP_MIGRATIONS: list[tuple[str, Any]] = [
@@ -539,6 +597,7 @@ _STARTUP_MIGRATIONS: list[tuple[str, Any]] = [
     ("dedup_diary_segments", _dedup_diary_segments),
     ("migrate_goals_table", _migrate_goals_table),
     ("migrate_llm_failure_log_is_test", _migrate_llm_failure_log_is_test),
+    ("migrate_selenium_config_keys", _migrate_selenium_config_keys),
 ]
 
 

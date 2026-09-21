@@ -22,7 +22,7 @@ uv run pytest tests/test_<area_you_touched>.py   # focused by default; see AGENT
 
 Fix failures before moving on.
 
-**Prefer focused tests:** a bare `uv run pytest` takes roughly five minutes and may encounter known order-dependent failures (`config_registry` pollution); `tests/plugins/test_selenium_ttsfree.py` also fails at collection when Selenium is unavailable. Run tests covering the change during development. For broad changes or an explicitly requested full sweep, follow `AGENTS.md` §9 and report unrelated failures; where Selenium is unavailable, add `--ignore=tests/plugins/test_selenium_ttsfree.py`.
+**Prefer focused tests:** a bare `uv run pytest` takes roughly five minutes and may encounter known order-dependent failures (`config_registry` pollution); `tests/plugins/test_zen_ttsfree.py` also fails at collection when Zen is unavailable. Run tests covering the change during development. For broad changes or an explicitly requested full sweep, follow `AGENTS.md` §9 and report unrelated failures; where Zen is unavailable, add `--ignore=tests/plugins/test_zen_ttsfree.py`.
 
 ## Git & Commits
 
