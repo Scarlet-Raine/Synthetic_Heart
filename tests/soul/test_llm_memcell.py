@@ -111,6 +111,25 @@ def test_the_dsp_extract_instructions_carry_the_same_rule() -> None:
     assert DECLARED_IDENTITY not in undeclared._build_extract_instructions()
 
 
+def test_both_extractors_are_told_which_lines_are_the_persona_own() -> None:
+    """Both extractors read the same transcript, so both get the label rule.
+
+    The transcript builder labels the persona's own lines "<name> (the persona)"
+    (the interfaces cache them under the bare label "self"); without that rule
+    the model has to guess which speaker is the human from the other names alone
+    and reads the persona's own lines as the human's.
+    """
+    from core.soul.llm_strategies import LlmDspExtractor
+
+    for instructions in (
+        LlmMemCellExtractor()._build_extract_instructions(),
+        LlmDspExtractor()._build_extract_instructions(),
+    ):
+        assert "'<name> (the persona)'" in instructions
+        assert "never the human's" in instructions
+        assert "only the human's own lines can become" in instructions
+
+
 DISTILLED_RESPONSE = (
     '{"memories": ['
     '{"trace": "Scar corrected the earlier description of Dee: she is an adult '

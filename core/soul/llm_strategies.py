@@ -160,6 +160,36 @@ def _speaker_identity_block(declared: str) -> str:
     return block
 
 
+# The persona's own lines are labelled so a reader never has to guess whose side
+# of the conversation they are on. The interfaces cache them under a canonical
+# "self" label, which `_build_daily_transcript` renders as "<name> (the persona)".
+# Measured live on 2026-09-22: the 2D deployment's transcript carried exactly
+# `self:`, `Scar:` and `2B:`, nothing said who "self" was, the DSP extractor took
+# the persona's own lines for the human's, and the profile it compiled described
+# the PERSONA (a woman) as the person being talked to.
+_PERSONA_LINE_RULE = (
+    "A line labelled '<name> (the persona)' - or with a bare 'self' or "
+    "'assistant' label - is the PERSONA's own speech, never the human's; every "
+    "other name belongs to a separate person. A conversation can hold more than "
+    "two people (another synth, a family member): only the human's own lines can "
+    "become user facts.\n"
+)
+
+# The compiler is the stage that decides which name and gender the standing
+# profile carries, so it needs the same declaration the extractors get: without
+# it, a single day whose extraction swapped the two roles is the newest evidence
+# and wins the contradiction.
+_DECLARATION_PRECEDENCE_RULE = (
+    "WHO IS WHO IS DECLARED, NOT GUESSED: the deployment's declaration of the "
+    "people involved is stated below and is AUTHORITATIVE. Where a supplied fact "
+    "contradicts it - a fact that gives the human the persona's name, gender, "
+    "family, body or android nature is that day's misattribution - follow the "
+    "declaration and drop the contradicting fact instead of carrying it into the "
+    "profile. One day of misattributed facts never outranks a standing "
+    "declaration.\n"
+)
+
+
 class LlmDspBuilder:
     """LLM-compiled DSP builder with a deterministic rule-based fallback.
 
@@ -176,6 +206,7 @@ class LlmDspBuilder:
         fallback: Any | None = None,
         max_words: int = 150,
         resolve_engine: Any | None = None,
+        speaker_identity: str = "",
     ) -> None:
         """Build the LLM DSP builder.
 
@@ -186,6 +217,16 @@ class LlmDspBuilder:
             max_words: word budget capping the LLM biography.
             resolve_engine: injectable async callable ``() -> engine | None``
                 used for tests. ``None`` uses the DSP-scope Cortex resolver.
+            speaker_identity: who the people in the logs are, as declared by the
+                deployment (``SOUL_SPEAKER_IDENTITIES``). The extractors were
+                already told this; the COMPILER needs it too, because it is the
+                only stage that decides which name and gender the biography
+                carries. Measured live on 2026-09-22: one day's extraction
+                attributed the persona's speech and identity to the human, that
+                extraction was the newest evidence, and the compiler resolved the
+                contradiction the wrong way, rewriting the human as the persona
+                (a woman) until the next pass. A declaration the compiler can
+                check the evidence against is what makes that day lose instead.
         """
         if fallback is None:
             from core.soul.compiler import RuleBasedDspBuilder
@@ -194,6 +235,7 @@ class LlmDspBuilder:
         self._fallback: Any = fallback
         self.max_words: int = max_words
         self.resolve_engine: Any | None = resolve_engine
+        self.speaker_identity: str = str(speaker_identity or "").strip()
 
     async def _resolve_engine(self) -> Any | None:
         """Resolve the DSP-scope Cortex engine (fail-safe).
@@ -402,7 +444,8 @@ class LlmDspBuilder:
             "unless the evidence shows the human saying it about himself. When in "
             "doubt about an attribute, drop it: a missing nickname is harmless, a "
             "wrong identity is not. "
-            'Return ONLY a JSON object: {"biography": "<your biography>"}.'
+            + self._declaration_block()
+            + 'Return ONLY a JSON object: {"biography": "<your biography>"}.'
         )
 
     def _build_update_instructions(self) -> str:
@@ -422,8 +465,23 @@ class LlmDspBuilder:
             "unless the evidence shows the human saying it about himself. When in "
             "doubt about an attribute, drop it: a missing nickname is harmless, a "
             "wrong identity is not. "
-            f"(plain prose, no bullet lists, no XML tags). Keep it under {self.max_words} "
+            + self._declaration_block()
+            + f"(plain prose, no bullet lists, no XML tags). Keep it under {self.max_words} "
             'words. Return ONLY a JSON object: {"biography": "<your biography>"}.'
+        )
+
+    def _declaration_block(self) -> str:
+        """Who is who, for the COMPILER — empty when the deployment declared none.
+
+        The extractors always get :func:`_speaker_identity_block` (its general
+        separateness rules stand on their own); the compiler only needs the
+        authority rule when there is a declaration for it to enforce, so an
+        undeclared deployment's prompt is unchanged.
+        """
+        if not self.speaker_identity:
+            return ""
+        return _DECLARATION_PRECEDENCE_RULE + _speaker_identity_block(
+            self.speaker_identity
         )
 
     @classmethod
@@ -685,7 +743,8 @@ class LlmDspExtractor:
             "SPEAKER ATTRIBUTION (critical, the speakers are named in the log): "
             "decide which speaker is the HUMAN (the person this profile is about) "
             "and which is the PERSONA, then attribute each line to its own speaker. "
-            "Only what the human says about himself can become a user fact. "
+            + _PERSONA_LINE_RULE
+            + "Only what the human says about himself can become a user fact. "
             "The human's own name IS a user fact: record the name he goes by (the "
             "label his own lines carry, or a name used for him by others). "
             "A name or nickname the human GIVES the persona ('you are X', 'X is "
@@ -1065,7 +1124,8 @@ class LlmMemCellExtractor:
         return (
             "You are distilling what an AI persona must REMEMBER from one session "
             "of chat. The transcript labels every line with its speaker.\n"
-            "Write DISTILLED KNOWLEDGE, never a quote: each memory's trace is a "
+            + _PERSONA_LINE_RULE
+            + "Write DISTILLED KNOWLEDGE, never a quote: each memory's trace is a "
             "self-contained paraphrase of what happened or was said, so a reader "
             "who never saw the transcript understands it and can tell who did or "
             "said what. Copying a line out of the transcript is a failure.\n"

@@ -144,9 +144,12 @@ register_exposed_var(
     description=(
         "Free text naming each speaker and their pronouns, e.g. "
         "'Scar - he/him, my husband; 2B - she/her, me'. The memory and profile "
-        "extractors are told this outright, so a person the transcript never "
-        "genders is never guessed at (leaving it empty keeps the previous "
-        "behaviour)."
+        "extractors AND the profile compiler are told this outright, so a person "
+        "the transcript never genders is never guessed at and a single day whose "
+        "extraction swapped two roles cannot redefine who the profile is about "
+        "(leaving it empty keeps the previous behaviour). The persona's own lines "
+        "are labelled '<name> (the persona)' in the transcript the extractors "
+        "read, whatever label the interface cached them under."
     ),
     scope="plugins",
     component="soul_plugin",
@@ -585,13 +588,18 @@ class SoulPlugin(PluginBase):
         ``SOUL_DSP_LLM_ENABLED`` defaults on; the LLM builder internally falls
         back to the rule-based builder on any failure (no engine, exception,
         bad JSON), so enabling it can never break the nightly rollup.
+
+        ``SOUL_SPEAKER_IDENTITIES`` reaches the builder as well as the
+        extractors: the builder is the stage that decides which name and gender
+        the standing profile carries, so it needs the declaration to rule a
+        misattributed day out instead of letting it win as the newest evidence.
         """
         if not SoulPlugin._is_dsp_llm_enabled():
             return RuleBasedDspBuilder()
         try:
             from core.soul.llm_strategies import LlmDspBuilder
 
-            return LlmDspBuilder()
+            return LlmDspBuilder(speaker_identity=_soul_speaker_identities())
         except Exception as exc:
             log_warning(
                 f"[soul_plugin] LLM DSP builder unavailable ({exc}); using rule-based"
@@ -1137,7 +1145,9 @@ class SoulPlugin(PluginBase):
                     for row in rows:
                         if not row or not row[2]:
                             continue
-                        speaker = str(row[0] or row[1] or "user").strip() or "user"
+                        speaker = self._transcript_speaker_label(
+                            str(row[0] or row[1] or "user")
+                        )
                         message_text = " ".join(str(row[2]).split())
                         timestamp = row[3]
                         prefix = f"[{timestamp.isoformat()}] " if timestamp else ""
@@ -1162,6 +1172,51 @@ class SoulPlugin(PluginBase):
         for lines in self._buffers.values():
             parts.extend(lines)
         return "\n".join(parts)
+
+    # The interfaces cache the persona's OWN messages under the canonical label
+    # "self" (`sender_name="self"`, the same convention Discord, Telegram and the
+    # Vessel use). Handed to an extractor as-is, "self" is an unnamed third party
+    # in a conversation that may hold several people, and the DSP extractor then
+    # has to GUESS which speaker is the human from the other labels alone.
+    # Measured live on 2026-09-22: the 2D deployment's transcript carried exactly
+    # `self:`, `Scar:` and `2B:`, the model read `self` as the human, and the
+    # profile it compiled said "Dee goes by the name Scar and is a grown woman"
+    # — the persona's name and gender handed to the human. Naming the persona's
+    # lines outright removes the guess.
+    _SELF_SPEAKER_LABELS = frozenset(
+        {"self", "me", "assistant", "synt", "synth", "bot"}
+    )
+
+    @classmethod
+    def _transcript_speaker_label(cls, speaker: str) -> str:
+        """Render one cached sender label so the persona's own lines say so.
+
+        The persona's own lines (its configured ``SYNTH_NAME``, or the canonical
+        "self" label) become ``"<name> (the persona)"``; every other label is
+        left exactly as the interface stored it, because a name is evidence about
+        whoever carries it and rewriting one would be worse than leaving it.
+        """
+        label = " ".join(str(speaker or "").split()) or "user"
+        persona = cls._persona_display_name()
+        folded = label.casefold()
+        is_self = folded in cls._SELF_SPEAKER_LABELS or (
+            bool(persona) and folded == persona.casefold()
+        )
+        if not is_self:
+            return label
+        return f"{persona} (the persona)" if persona else "the persona"
+
+    @staticmethod
+    def _persona_display_name() -> str:
+        """The persona's configured display name (``SYNTH_NAME``), or ``''``."""
+        try:
+            from core.config_manager import config_registry
+
+            return str(
+                config_registry.get_value("SYNTH_NAME", "", value_type=str) or ""
+            ).strip()
+        except Exception:
+            return ""
 
     @staticmethod
     def _buffer_speaker(message: Any) -> str:

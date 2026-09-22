@@ -741,7 +741,11 @@ async def test_build_daily_transcript_uses_parameterized_cutoff(
     assert "WHERE created_at >= %s" in executed_sql
     assert isinstance(params[0], datetime)
     assert '[2026-05-05T11:37:00+00:00] Alice: "first"' in transcript
-    assert '[2026-05-05T11:38:00+00:00] self: "second"' in transcript
+    # The persona's own cached lines are labelled as its own, never left as the
+    # bare "self" the interface stores (a label that says nothing about whose
+    # side of the conversation it is on).
+    assert '(the persona): "second"' in transcript
+    assert 'self: "second"' not in transcript
 
 
 def test_build_emotion_engine_returns_emotional_engine() -> None:
@@ -1332,3 +1336,136 @@ async def test_recall_passes_the_configured_linked_sessions_to_the_repository() 
     with _config(""):
         await _recall_once(plugin)
     assert plugin._repo.recall_memories.await_args.kwargs["linked_session_ids"] is None
+
+
+# ---------------------------------------------------------------------------
+# The persona's own lines say so in the DSP transcript
+# ---------------------------------------------------------------------------
+
+
+def _patch_daily_transcript_rows(
+    monkeypatch: pytest.MonkeyPatch, rows: list[tuple[Any, Any, Any, Any]]
+) -> AsyncMock:
+    """Point `_build_daily_transcript` at a fixed set of cached rows."""
+    mock_cursor = AsyncMock()
+    mock_cursor.fetchall = AsyncMock(return_value=rows)
+    mock_conn = AsyncMock()
+    mock_conn.cursor = MagicMock(
+        return_value=AsyncMock(
+            __aenter__=AsyncMock(return_value=mock_cursor),
+            __aexit__=AsyncMock(return_value=None),
+        )
+    )
+    mock_ctx = MagicMock()
+    mock_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_ctx.__aexit__ = AsyncMock(return_value=None)
+    monkeypatch.setattr("plugins.soul_plugin.get_conn_ctx", lambda: mock_ctx)
+    return mock_cursor
+
+
+@pytest.mark.asyncio
+async def test_build_daily_transcript_names_the_persona_own_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The DSP extractor is told which speaker is the persona (live 2026-09-22).
+
+    The 2D deployment's transcript carried exactly `self:`, `Scar:` and `2B:`;
+    nothing said whose "self" was, the extractor read the persona's own lines as
+    the human's, and the compiled profile described the PERSONA - a woman named
+    Dee - as the person being talked to, which handed the persona's name and
+    gender to the human. Naming the persona's lines removes the guess; every
+    other speaker keeps the label the interface stored.
+    """
+    plugin = SoulPlugin()
+    monkeypatch.setattr(SoulPlugin, "_persona_display_name", staticmethod(lambda: "2D"))
+    _patch_daily_transcript_rows(
+        monkeypatch,
+        [
+            (
+                "self",
+                "self",
+                "mmwah, come back here",
+                datetime(2026, 9, 22, 20, 49, tzinfo=timezone.utc),
+            ),
+            (
+                "Scar",
+                "5208932647",
+                "come here wifey",
+                datetime(2026, 9, 22, 20, 49, 45, tzinfo=timezone.utc),
+            ),
+            (
+                "2D",
+                "2D",
+                "the cookie is mine",
+                datetime(2026, 9, 22, 20, 50, tzinfo=timezone.utc),
+            ),
+            (
+                "2B",
+                "5208932648",
+                "hello you two",
+                datetime(2026, 9, 22, 20, 51, tzinfo=timezone.utc),
+            ),
+        ],
+    )
+
+    transcript = await plugin._build_daily_transcript()
+
+    assert '2D (the persona): "mmwah, come back here"' in transcript
+    # The persona's own name is the same person: relabelled, not duplicated.
+    assert '2D (the persona): "the cookie is mine"' in transcript
+    assert transcript.count("(the persona)") == 2
+    # The human and the other synth keep their own labels verbatim.
+    assert 'Scar: "come here wifey"' in transcript
+    assert '2B: "hello you two"' in transcript
+
+
+@pytest.mark.asyncio
+async def test_build_daily_transcript_labels_the_persona_without_a_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no SYNTH_NAME the label still says whose line it is."""
+    plugin = SoulPlugin()
+    monkeypatch.setattr(SoulPlugin, "_persona_display_name", staticmethod(lambda: ""))
+    _patch_daily_transcript_rows(
+        monkeypatch,
+        [("self", "self", "mmwah", datetime(2026, 9, 22, 20, 49, tzinfo=timezone.utc))],
+    )
+
+    transcript = await plugin._build_daily_transcript()
+
+    assert 'the persona: "mmwah"' in transcript
+    assert "self:" not in transcript
+
+
+def test_speaker_identities_reach_the_dsp_builder() -> None:
+    """SOUL_SPEAKER_IDENTITIES must reach the compiler, not only the extractors.
+
+    The compiler is the stage that decides the name and the gender the standing
+    profile carries. Live 2026-09-22: one pass' extraction swapped the two roles,
+    that pass was the newest evidence, and the profile was rewritten with the
+    persona's name and gender on the human.
+    """
+    declared = "Scar (also called Scarlet) - he/him, the human; 2D (called Dee) - she/her, the persona, me"
+
+    def _get_value(key: str, default: Any = None, **_kwargs: Any) -> Any:
+        if key == "SOUL_SPEAKER_IDENTITIES":
+            return declared
+        return default
+
+    with patch("core.config_manager.config_registry", get_value=_get_value):
+        builder = SoulPlugin._build_dsp_builder()
+
+    assert getattr(builder, "speaker_identity", "") == declared
+
+
+def test_no_speaker_identities_keeps_the_builder_undeclared() -> None:
+    """An empty setting keeps the previous prompts exactly (no declaration)."""
+
+    def _get_value(key: str, default: Any = None, **_kwargs: Any) -> Any:
+        return default
+
+    with patch("core.config_manager.config_registry", get_value=_get_value):
+        builder = SoulPlugin._build_dsp_builder()
+
+    assert getattr(builder, "speaker_identity", "") == ""
+    assert builder._declaration_block() == ""
