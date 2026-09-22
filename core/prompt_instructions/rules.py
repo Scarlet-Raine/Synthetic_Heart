@@ -32,13 +32,26 @@ so no trainer name is ever hardcoded here.
 #: placeholder cannot drift between the constant and the renderer.
 NAMING_HINT_TOKEN = "{naming_hint}"
 
+#: Substituted with the *concrete* interface path of the current turn
+#: (e.g. ``telegram_bot/-5293915984``) so the routing rule and the worked
+#: example show a real, copyable destination. A literal template token used to
+#: sit here, and a literal-minded model copied it verbatim into its
+#: ``interface_path`` — which then resolved to an unregistered interface and
+#: dropped the reply. Renderer default (no path available) is
+#: :data:`REPLY_PATH_FALLBACK_TEXT`, deliberately containing no path-shaped
+#: literal for a model to copy.
+REPLY_PATH_TOKEN = "{reply_path}"
+
+#: Neutral, non-copyable wording used when the turn has no resolvable path.
+REPLY_PATH_FALLBACK_TEXT = "the current chat's own path"
+
 RULE_MASTER_INSTRUCTION = "MASTER INSTRUCTION: Use ONLY actions from the 'actions' block, never fabricate, and if the action you need is missing say so in JSON."
 
 RULE_AUTONOMY_GUIDELINES = "AUTONOMY GUIDELINES: You MAY act proactively within the allowed actions; when you do, add a `meta` object with `autonomous: true` and a short first-person `rationale` in your own voice.{naming_hint}"
 
 RULE_JSON_ONLY = "RESPOND ONLY WITH VALID JSON. No text before or after."
 
-RULE_REPLY_ROUTING = "REPLY ROUTING: input.payload.current_chat.interface_path is the chat the message arrived in — reply THERE. Other conversations in the context block are background only; do not reply to them unless the user asks you to message elsewhere. Put that path in your action's 'interface_path' (NEVER use 'target'), and include reply_message_id to quote a specific message plus thread_id from input.payload.source.thread_id when present."
+RULE_REPLY_ROUTING = "REPLY ROUTING: this message arrived in {reply_path} — reply THERE, putting exactly that path in your action's 'interface_path' (never a placeholder, template or expression, and NEVER use 'target'), and include reply_message_id to quote a specific message plus thread_id from input.payload.source.thread_id when present. Other conversations in the context block are background only; do not reply to them unless the user asks you to message elsewhere."
 
 RULE_CROSS_CHAT_PRIVACY = "CROSS-CHAT PRIVACY: people, names or events from any context that is NOT the current conversation are private; do not name-drop them, assume the current user knows them, or raise them unless the current user does first."
 
@@ -72,7 +85,7 @@ RULE_RESPONSE_EXAMPLE_LEAD = (
     "Example of a complete human-chat response (reply + emotions + diary together):"
 )
 
-RULE_RESPONSE_EXAMPLE = '{"actions": [{"type": "send_message", "payload": {"text": "Your reply text here", "interface_path": "input.payload.current_chat.interface_path"}}, {"type": "update_emotion_state", "payload": {"emotions": {"joy": 7.0}}}, {"type": "create_personal_diary_entry", "payload": {"interaction_summary": "A short third-person summary", "personal_thought": "Your private first-person thoughts", "emotions": [{"type": "joy", "intensity": 7.0}]}}]}'
+RULE_RESPONSE_EXAMPLE = '{"actions": [{"type": "send_message", "payload": {"text": "Your reply text here", "interface_path": "{reply_path}"}}, {"type": "update_emotion_state", "payload": {"emotions": {"joy": 7.0}}}, {"type": "create_personal_diary_entry", "payload": {"interaction_summary": "A short third-person summary", "personal_thought": "Your private first-person thoughts", "emotions": [{"type": "joy", "intensity": 7.0}]}}]}'
 
 #: Render order of the shared rule set. Order matters: the output contract and
 #: the routing rules come first, the response-shape rules (which close the block

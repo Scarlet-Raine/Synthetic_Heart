@@ -41,7 +41,12 @@ from core.prompt_instructions.routes import (
     ROUTE_VESSEL,
     rules_for_route,
 )
-from core.prompt_instructions.rules import NAMING_HINT_TOKEN, RULES
+from core.prompt_instructions.rules import (
+    NAMING_HINT_TOKEN,
+    REPLY_PATH_FALLBACK_TEXT,
+    REPLY_PATH_TOKEN,
+    RULES,
+)
 
 #: Character ceilings for the rendered instruction string, per route. Set from
 #: the measured size of each route plus ~400 characters of headroom, so ordinary
@@ -87,11 +92,22 @@ def _minify(parts: list[str]) -> str:
     return " ".join(part.strip() for part in parts if part and part.strip())
 
 
+def _render_rule(text: str, hint: str, path_text: str) -> str:
+    """Substitute the render-time tokens in one rule's text.
+
+    ``{naming_hint}`` carries the trainer reference, ``{reply_path}`` the
+    concrete interface path of the current turn. Kept in one place so the two
+    render paths (route set and fail-open set) cannot drift.
+    """
+    return text.replace(NAMING_HINT_TOKEN, hint).replace(REPLY_PATH_TOKEN, path_text)
+
+
 def build_instructions(
     route: str = ROUTE_CHAT,
     *,
     naming_hint: str | None = None,
     extra_parts: Mapping[str, Any] | None = None,
+    reply_path: str | None = None,
 ) -> str:
     """Render the shared instruction block for ``route``.
 
@@ -104,11 +120,23 @@ def build_instructions(
         extra_parts: Reserved for route-specific prefixes that must render
             before the rule set (e.g. a route banner). Values are stringified
             and appended in insertion order.
+        reply_path: The *concrete* interface path of the current turn
+            (e.g. ``telegram_bot/-5293915984``), rendered into the reply-routing
+            rule and the worked response example so the model is shown a real
+            destination it can copy. When omitted or blank the routing text
+            falls back to neutral wording that contains no path-shaped literal
+            to copy by mistake.
 
     Returns:
         The minified instruction string: one line, no double spaces, no
         trailing whitespace. Never raises.
     """
+    path_text = REPLY_PATH_FALLBACK_TEXT
+    if reply_path is not None:
+        candidate = str(reply_path).strip()
+        if candidate:
+            path_text = candidate
+
     try:
         hint = resolve_naming_hint() if naming_hint is None else naming_hint
         parts: list[str] = []
@@ -120,7 +148,7 @@ def build_instructions(
         for rule_id in rules_for_route(route):
             text = RULES.get(rule_id, "")
             if text:
-                parts.append(text.replace(NAMING_HINT_TOKEN, hint))
+                parts.append(_render_rule(text, hint, path_text))
         overlay = overlay_for_route(route)
         if overlay.strip():
             parts.append(overlay)
@@ -133,7 +161,7 @@ def build_instructions(
     # instruction string, which would leave a turn with no output contract.
     try:
         hint = resolve_naming_hint() if naming_hint is None else naming_hint
-        return _minify([RULES[r].replace(NAMING_HINT_TOKEN, hint) for r in RULES])
+        return _minify([_render_rule(RULES[r], hint, path_text) for r in RULES])
     except Exception:
         return ""
 

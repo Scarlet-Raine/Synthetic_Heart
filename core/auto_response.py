@@ -114,7 +114,9 @@ class AutoResponseSystem:
             # its own single-action example).
             from core.prompt_instructions import ROUTE_DELIVERY
 
-            json_rules = load_json_instructions(ROUTE_DELIVERY)
+            json_rules = load_json_instructions(
+                ROUTE_DELIVERY, reply_path=interface_path
+            )
             if action_outputs is not None:
                 message_block = json.dumps(
                     {"action_outputs": action_outputs}, ensure_ascii=False

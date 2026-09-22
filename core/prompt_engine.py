@@ -346,10 +346,20 @@ def _action_scopes(action_def: Any) -> set[str]:
     Resolution order (fail-safe, structural — never message text):
     1. an explicit ``scope`` key on the (normalized) action schema, either a
        string or a list/tuple/set of strings;
-    2. otherwise a transitional fallback derived from the action-name prefix
+    2. otherwise ANY declared ``external_effects`` puts the action on the
+       ``agent`` scope: an action with real-world side effects is executed
+       deliberately, by the Agent Lane's tool surface (built from
+       ``tool_registry.all_tools()``), not advertised in the Fast-Lane chat
+       catalog. This is the action's own structural declaration, never a name or
+       keyword match. It is what keeps whole integration suites out of every
+       chat prompt: on one ordinary Telegram turn the catalog carried 64 actions,
+       32 of them the agpeer and Home Assistant suites (60% of the catalog text),
+       all of which declare ``external_effects``. A chat reply
+       (``send_message``) deliberately declares none, so it is unaffected;
+    3. otherwise a transitional fallback derived from the action-name prefix
        (``vessel_*`` => ``vessel``, ``agent_*`` => ``agent``) — this is stable
        structural namespacing, not keyword routing;
-    3. otherwise the default ``{"core"}`` (always visible).
+    4. otherwise the default ``{"core"}`` (always visible).
     """
     if isinstance(action_def, dict):
         declared = action_def.get("scope")
@@ -359,6 +369,13 @@ def _action_scopes(action_def: Any) -> set[str]:
             scopes = {str(s).strip() for s in declared if str(s).strip()}
             if scopes:
                 return scopes
+        effects = action_def.get("external_effects")
+        if isinstance(effects, str) and effects.strip():
+            return {"agent"}
+        if isinstance(effects, (list, tuple, set)) and any(
+            str(e).strip() for e in effects
+        ):
+            return {"agent"}
     return set(_DEFAULT_ACTION_SCOPES)
 
 
@@ -366,7 +383,9 @@ def _action_scopes_by_name(action_name: str, action_def: Any) -> set[str]:
     """``_action_scopes`` with the name-prefix fallback applied.
 
     Kept separate so the prefix fallback only kicks in when no explicit scope is
-    declared, preserving the primacy of the schema-declared value.
+    declared, preserving the primacy of the schema-declared value. When neither a
+    scope nor a namespacing prefix applies, ``_action_scopes`` still has the last
+    word: its ``external_effects`` rule (agent scope) then the core default.
     """
     if isinstance(action_def, dict) and action_def.get("scope"):
         return _action_scopes(action_def)
@@ -374,7 +393,7 @@ def _action_scopes_by_name(action_name: str, action_def: Any) -> set[str]:
     for prefix, scope in _SCOPE_NAME_PREFIXES:
         if name.startswith(prefix):
             return {scope}
-    return set(_DEFAULT_ACTION_SCOPES)
+    return _action_scopes(action_def)
 
 
 # Synthetic interface prefixes used by the outbound-beat plumbing (Grillo
@@ -1766,6 +1785,57 @@ def _truncate_attachment_text(text: str) -> tuple[str | None, bool]:
     return cleaned[:_ATTACHMENT_TEXT_CHAR_LIMIT].rstrip() + "\n[... truncated]", True
 
 
+def _scoped_actions_for_prompt(
+    raw_actions: dict[str, Any],
+    prompt_dict: Any,
+    *,
+    interface_name: str | None,
+    interface_path: str | None,
+    message: Any,
+    allowed_action_types: set[str] | None,
+) -> dict[str, Any]:
+    """Return only the action definitions the prompt actually offers.
+
+    The bridge (``cortex_bridge._inject_actions_into_prompt``) renders these
+    manifests into the ``=== AVAILABLE ACTIONS ===`` text catalog the model
+    reads, so they must be the same set the prompt dict carries. Built from the
+    raw registry they were not: ``build_json_prompt`` scope-filtered the dict's
+    ``actions`` key, and the *text* catalog was rendered from the unfiltered
+    registry, so every Fast-Lane turn advertised the whole catalog. Measured on
+    one ordinary Telegram turn (trace ``eaf4fd28``): 64 actions, of which 18
+    ``agpeer_*``, 14 ``hass_*`` and ``vessel_connect`` — an action the per-turn
+    scope gate exists precisely to hide.
+
+    ``prompt_dict["actions"]`` is the scope-filtered catalog computed by
+    ``build_json_prompt`` (where the full context is available), so its name set
+    is authoritative here; the identical gate is re-run when that key is absent.
+
+    Fail-safe: on any error the unfiltered set is returned, so a failure widens
+    the catalog rather than stripping a capability.
+    """
+    scoped: dict[str, Any] = dict(raw_actions)
+    try:
+        names = prompt_dict.get("actions") if isinstance(prompt_dict, dict) else None
+        if isinstance(names, dict) and names:
+            scoped = {k: v for k, v in scoped.items() if k in names}
+        else:
+            turn_scopes = _resolve_turn_scopes(message, None, interface_path)
+            in_scope = _derive_default_prompt_action_types(
+                scoped,
+                interface_name,
+                turn_scopes=turn_scopes,
+                outbound_target_interfaces=None,
+            )
+            if in_scope and len(in_scope) < len(scoped):
+                scoped = {k: v for k, v in scoped.items() if k in in_scope}
+        if allowed_action_types is not None:
+            scoped = {k: v for k, v in scoped.items() if k in allowed_action_types}
+    except Exception as exc:
+        log_debug(f"[json_prompt] action scope filter skipped: {exc}")
+        return dict(raw_actions)
+    return scoped
+
+
 def _assemble_prompt_request(  # noqa: PLR0913
     prompt_dict: dict[str, Any],
     context_section: dict[str, Any],
@@ -1955,10 +2025,14 @@ def _assemble_prompt_request(  # noqa: PLR0913
         raw_actions: dict[str, Any] = dict(
             core_initializer.actions_block.get("available_actions", {}) or {}
         )
-        if allowed_action_types is not None:
-            raw_actions = {
-                k: v for k, v in raw_actions.items() if k in allowed_action_types
-            }
+        raw_actions = _scoped_actions_for_prompt(
+            raw_actions,
+            prompt_dict,
+            interface_name=interface_name,
+            interface_path=interface_path,
+            message=message,
+            allowed_action_types=allowed_action_types,
+        )
         tool_declarations = LiveToolRegistry.build_manifests_from_actions(raw_actions)
     except Exception as _td_exc:
         log_debug(f"[json_prompt] tool_declarations build skipped: {_td_exc}")
@@ -2837,7 +2911,9 @@ async def build_prompt_request(
         str(_beat_type or ""),
         bool(is_grillo_internal),
     )
-    json_instructions = load_json_instructions(_instruction_route)
+    json_instructions = load_json_instructions(
+        _instruction_route, reply_path=interface_path
+    )
     # INFO, not DEBUG: this is the one line that says which rule set a turn got
     # and how big it is, and the default LOGGING_LEVEL is INFO — so a DEBUG call
     # would be invisible in exactly the deployment it needs to be visible in.
@@ -3601,7 +3677,9 @@ async def build_prompt(
     return messages
 
 
-def load_json_instructions(route: str | None = None) -> str:
+def load_json_instructions(
+    route: str | None = None, reply_path: str | None = None
+) -> str:
     """Return the shared JSON instruction block for the current route.
 
     Thin facade over ``core.prompt_instructions.build_instructions``: the rule
@@ -3618,13 +3696,18 @@ def load_json_instructions(route: str | None = None) -> str:
     Args:
         route: Structural route id (see ``core.prompt_instructions.routes``).
             ``None`` renders the full shared set.
+        reply_path: The interface path the current turn arrived on, rendered
+            into the reply-routing rule and the worked example so the model is
+            shown a concrete destination instead of a template token it might
+            copy verbatim (which dropped a reply: the token resolved to an
+            unregistered interface). Optional and additive.
 
     Returns:
         The minified single-line instruction string. Never raises.
     """
     from core.prompt_instructions import ROUTE_CHAT, build_instructions
 
-    return build_instructions(route or ROUTE_CHAT)
+    return build_instructions(route or ROUTE_CHAT, reply_path=reply_path)
 
 
 async def build_delivery_request(
@@ -3694,7 +3777,9 @@ async def build_delivery_request(
     # delivery task block below supplies its own example.
     from core.prompt_instructions import ROUTE_DELIVERY
 
-    base_instructions = load_json_instructions(ROUTE_DELIVERY)
+    base_instructions = load_json_instructions(
+        ROUTE_DELIVERY, reply_path=interface_path
+    )
     # No-self-introduction rule (2026-08-21): a delivery turn must open with
     # the substance, never with "Ciao, sono <name>". Lazy import keeps this
     # module free of an auto_response dependency at load time; fail-safe.
@@ -3825,9 +3910,18 @@ def reduce_prompt_for_llm_limit(prompt: dict, max_chars: int) -> dict:
     Priority order (STEP BY STEP):
     1. Trim `history_recent` (if present)
     2. Trim `history_current_chat` (if present)
-    3. Remove `memories` entirely if needed
-    4. Remove other context sections (but KEEP any protected fields)
-    5. FINAL EMERGENCY: Remove entire context (but KEEP instructions)
+    3. Slim the `actions` block (drop the per-action `examples`)
+    4. Strip the `actions` block to brief-only
+    5. Remove `memories` entirely if needed
+    6. Remove other context sections (but KEEP any protected fields)
+    7. FINAL EMERGENCY: Remove entire context (but KEEP instructions)
+
+    Steps 3/4 run BEFORE 5/6: the action catalog is the single largest
+    serialized block and its redundant detail is re-supplied on demand by the
+    corrector, whereas the memory/emotion/clock/house/soul/thought blocks are
+    the grounding for the turn being answered and cannot be reconstructed.
+    With the previous order, every oversized turn deleted memories and then
+    ~20 context fields while the catalog kept its redundant `examples`.
 
     Note: attachment base64 data is excluded from size calculations because
     LLM engines extract it and send it as native multimodal parts.  Without
@@ -3875,8 +3969,19 @@ def reduce_prompt_for_llm_limit(prompt: dict, max_chars: int) -> dict:
         )
         return reduced_prompt
 
+    # Report where the size actually sits, so an oversized prompt names its own
+    # culprit instead of only reporting the total. The serialized `actions`
+    # block is by far the largest single contributor and it is reduced first
+    # (steps 3/4) precisely so the context blocks below survive.
+    try:
+        _actions_size = len(json_dumps(reduced_prompt.get("actions") or {}))
+        _context_size = len(json_dumps(reduced_prompt.get("context") or {}))
+    except Exception:
+        _actions_size = -1
+        _context_size = -1
     log_warning(
-        f"[reduce_prompt] Prompt size {current_size} exceeds limit {max_chars}, reducing context..."
+        f"[reduce_prompt] Prompt size {current_size} exceeds limit {max_chars}, reducing "
+        f"(actions block: {_actions_size} chars serialized, context: {_context_size} chars)"
     )
 
     # Get references to sections
@@ -3918,31 +4023,7 @@ def reduce_prompt_for_llm_limit(prompt: dict, max_chars: int) -> dict:
             f"[reduce_prompt] Trimmed history_current_chat, {len(history_current)} remaining, now {current_size} chars"
         )
 
-    # === STEP 3: Remove memories entirely if still needed ===
-    if current_size > max_chars:
-        memories = context.get("memories", [])
-        if memories:
-            log_warning(
-                f"[reduce_prompt] Removing memories section ({len(memories)} entries, ~{len(json_dumps(memories))} chars)"
-            )
-            del context["memories"]
-            current_size = len(json_dumps(reduced_prompt)) - attachment_data_offset
-            log_debug(f"[reduce_prompt] After removing memories: {current_size} chars")
-
-    # === STEP 4: Remove other context sections (but KEEP protected fields) ===
-    if current_size > max_chars:
-        protected = ["persona", "history_current_chat", "history_recent"]
-        removable_keys = [k for k in list(context.keys()) if k not in protected]
-        for key in removable_keys:
-            if current_size <= max_chars:
-                break
-            if key in context:
-                log_warning(f"[reduce_prompt] Removing context field: {key}")
-                del context[key]
-                current_size = len(json_dumps(reduced_prompt)) - attachment_data_offset
-                log_debug(f"[reduce_prompt] After removing {key}: {current_size} chars")
-
-    # === STEP 4.5: Slim the actions block (drop per-action `examples`) ===
+    # === STEP 3: Slim the actions block (drop per-action `examples`) ===
     # The `actions` block carries, for every available action, a redundant
     # `examples`/`instructions` object that duplicates guidance already implied
     # by the schema + brief. It is NOT required for the model to *choose* an
@@ -3952,6 +4033,11 @@ def reduce_prompt_for_llm_limit(prompt: dict, max_chars: int) -> dict:
     # limit (e.g. zen-llm-engine at 32000), causing the engine's multi-part
     # split to garble the request and the model to return empty actions.
     # Trimming it here keeps action *selection* intact while dropping the bulk.
+    #
+    # This runs BEFORE the memories/context removal below, deliberately: the
+    # catalog is the largest serialized block and its redundant detail is
+    # reconstructible, while the context blocks are the grounding for the turn
+    # being answered.
     if current_size > max_chars:
         actions = reduced_prompt.get("actions")
         if isinstance(actions, dict) and actions:
@@ -3970,7 +4056,7 @@ def reduce_prompt_for_llm_limit(prompt: dict, max_chars: int) -> dict:
                     f"[reduce_prompt] After slimming actions block: {current_size} chars"
                 )
 
-    # === STEP 4.6: Aggressively strip the actions block to brief-only ===
+    # === STEP 4: Aggressively strip the actions block to brief-only ===
     # If dropping `examples` was not enough, reduce each action to just its
     # `brief` (no `schema`/`source`), mirroring Prompt Lite Mode. The model can
     # still see *which* actions exist and what they do; the corrector re-adds
@@ -3997,7 +4083,33 @@ def reduce_prompt_for_llm_limit(prompt: dict, max_chars: int) -> dict:
                     f"[reduce_prompt] After stripping actions block: {current_size} chars"
                 )
 
-    # === STEP 5: Emergency - remove entire context (instructions are preserved at top-level) ===
+    # === STEP 5: Remove memories entirely if still needed ===
+    # Only reached when slimming the catalog was not enough: this is real
+    # grounding for the turn, so it goes after the catalog's redundant detail.
+    if current_size > max_chars:
+        memories = context.get("memories", [])
+        if memories:
+            log_warning(
+                f"[reduce_prompt] Removing memories section ({len(memories)} entries, ~{len(json_dumps(memories))} chars)"
+            )
+            del context["memories"]
+            current_size = len(json_dumps(reduced_prompt)) - attachment_data_offset
+            log_debug(f"[reduce_prompt] After removing memories: {current_size} chars")
+
+    # === STEP 6: Remove other context sections (but KEEP protected fields) ===
+    if current_size > max_chars:
+        protected = ["persona", "history_current_chat", "history_recent"]
+        removable_keys = [k for k in list(context.keys()) if k not in protected]
+        for key in removable_keys:
+            if current_size <= max_chars:
+                break
+            if key in context:
+                log_warning(f"[reduce_prompt] Removing context field: {key}")
+                del context[key]
+                current_size = len(json_dumps(reduced_prompt)) - attachment_data_offset
+                log_debug(f"[reduce_prompt] After removing {key}: {current_size} chars")
+
+    # === STEP 7: Emergency - remove entire context (instructions are preserved at top-level) ===
     if current_size > max_chars and "context" in reduced_prompt:
         log_error("[reduce_prompt] 🚨 Emergency: removing entire context")
         del reduced_prompt["context"]

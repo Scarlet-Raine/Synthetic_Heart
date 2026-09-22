@@ -150,7 +150,7 @@ Synth runtime MCP and developer MCP are separate systems:
 
 Never merge their configuration or lifecycle.
 
-Registered actions share the tool/action abstraction and must pass through the same safety gate. External effects determine Agent-Lane routing. Drones are single-level sub-agents and must never spawn other Drones.
+Registered actions share the tool/action abstraction and must pass through the same safety gate. External effects determine Agent-Lane routing, and they also determine prompt scope: an action that declares `external_effects` is **agent-scoped** by default (`core/prompt_engine.py::_action_scopes`), so it is offered through the Agent Lane's tool surface and never advertised in the Fast-Lane chat catalog. Declare an explicit `scope` in the schema to override (e.g. `spawn_drone` is deliberately `core`). Drones are single-level sub-agents and must never spawn other Drones.
 
 ### Rift Vessel
 

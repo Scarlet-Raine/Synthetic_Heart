@@ -133,6 +133,41 @@ Minification rules:
   - Only essential actions remain.
   - Detailed schema objects are replaced with brief summaries.
 
+Action catalog scoping
+----------------------
+
+The catalog is filtered **per turn**, not global. `core/prompt_engine.py`
+resolves each action's prompt scope and drops the ones that are not visible for
+the turn:
+
+1. An explicit `scope` key on the action schema (string or list) wins.
+2. Otherwise any declared `external_effects` puts the action on the `agent`
+   scope. An action with real-world side effects is executed deliberately by the
+   Agent Lane, whose prompt is built from `tool_registry.all_tools()`, rather
+   than advertised in the Fast-Lane chat catalog. This is the action's own
+   structural declaration, never a name or keyword match. It is why the agpeer
+   and Home Assistant suites do not ride chat turns; `send_message` deliberately
+   declares no external effects, so a reply is unaffected.
+3. Otherwise a transitional name-prefix fallback (`vessel_*` => `vessel`,
+   `agent_*` => `agent`).
+4. Otherwise `core`, which is always visible.
+
+`_resolve_turn_scopes()` computes the visible set: `core` always, plus
+`vessel`/`recon`/`wiki` on a Vessel turn. The `agent` scope is deliberately never
+added, so agent-scoped actions stay out of the Fast-Lane catalog by construction.
+
+Two call sites must agree:
+
+- `build_json_prompt()` filters the dict's `actions` key (this is the
+  authoritative, fully-contextual decision).
+- `_assemble_prompt_request()` builds `tool_declarations`, which the bridge
+  (`core/external_endpoints/bridges/cortex_bridge.py::_inject_actions_into_prompt`)
+  renders into the `=== AVAILABLE ACTIONS ===` text catalog that the model
+  actually reads. It filters through `_scoped_actions_for_prompt()`, reusing the
+  dict's already-scoped name set and falling back to the same gate. When the two
+  disagreed, the dict was scoped and the rendered text was not, so every
+  Fast-Lane turn advertised the entire registry.
+
 Prompt reduction
 ----------------
 
@@ -143,9 +178,20 @@ Reduction priority:
 
 1. Trim `context.history_recent`.
 2. Trim `context.history_current_chat`.
-3. Remove `context.memories` entirely.
-4. Remove other non-protected `context` fields.
-5. Emergency: remove the entire `context` section.
+3. Slim the `actions` block: drop the per-action `examples`.
+4. Strip the `actions` block to brief-only (`schema`/`source` removed).
+5. Remove `context.memories` entirely.
+6. Remove other non-protected `context` fields.
+7. Emergency: remove the entire `context` section.
+
+The action catalog is reduced before the context blocks deliberately: it is the
+largest serialized section of the dict and its redundant detail is re-supplied on
+demand by the corrector (`extract_for_corrector`), while the memory, emotion,
+clock, house, soul and thought blocks are the grounding for the turn being
+answered and cannot be reconstructed. The size limit is compared against the
+serialized dict, which is roughly three times the size of the prompt text an
+engine actually receives, so the earlier order (memories and ~20 context fields
+deleted before the catalog was touched) fired on essentially every turn.
 
 Protected data that is never removed:
 

@@ -27,6 +27,14 @@ from .models import (
 
 _WORD_RE = re.compile(r"[a-z0-9']+")
 
+# A scene summary folds the consolidated memory cells of one episode. It is not
+# a prompt block on its own (the DSP compiler reads `dsp_versions`, itself capped
+# around 4.9k), but nothing bounded it either, and one row is on record at
+# 1,195,057 chars while `mem_scenes` totals ~2.1M across 773 rows. Bound it at
+# the storage boundary so no present or future reader can pull a megabyte blob
+# into a prompt.
+MAX_SCENE_SUMMARY_CHARS = 8000
+
 
 def _clamp_score(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
     return max(minimum, min(maximum, float(value)))
@@ -776,6 +784,7 @@ class PostgresSoulRepository:
 
     async def upsert_scene(self, scene: MemScene) -> None:
         pool = await self._get_pool()
+        summary = self._bounded_scene_summary(scene.summary)
         async with pool.acquire() as conn:
             await conn.execute(
                 """
@@ -790,11 +799,28 @@ class PostgresSoulRepository:
                 """,
                 scene.id,
                 scene.title,
-                scene.summary,
+                summary,
                 json.dumps(scene.cell_ids),
                 scene.created_at,
                 scene.updated_at,
             )
+
+    @staticmethod
+    def _bounded_scene_summary(summary: Any) -> Any:
+        """Truncate an oversized scene summary before it is stored.
+
+        Fail-safe: non-string or in-budget values pass through untouched.
+        """
+        try:
+            if isinstance(summary, str) and len(summary) > MAX_SCENE_SUMMARY_CHARS:
+                log_info(
+                    f"[soul] Truncating scene summary {len(summary)} -> "
+                    f"{MAX_SCENE_SUMMARY_CHARS} chars before storing"
+                )
+                return summary[: MAX_SCENE_SUMMARY_CHARS - 1] + "\u2026"
+        except Exception:
+            pass
+        return summary
 
     async def upsert_kg_triple(self, triple: KgTriple) -> None:
         pool = await self._get_pool()

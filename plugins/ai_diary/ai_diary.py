@@ -566,6 +566,78 @@ def _isoformat_timestamp(value: Any) -> Any:
     return value.isoformat() if hasattr(value, "isoformat") else value
 
 
+# Diary fields that may hold a whole day's appended text. A single `ai_diary`
+# row accumulates every write of the day (`---`-separated), and rows of ~168k
+# chars are on record (e.g. content 70,804 + personal_thought 49,532 +
+# interaction_summary 47,459 in one row), so a two-day window can reach ~238k.
+_DIARY_INJECTION_TEXT_FIELDS = (
+    "content",
+    "personal_thought",
+    "interaction_summary",
+    "user_message",
+)
+
+
+def _cap_diary_entries_for_injection(entries: list | None) -> list:
+    """Bound the diary rows handed to the prompt-injection path.
+
+    The history-contribution path already budgets itself
+    (`DIARY_CONTEXT_MAX_CHARS` total, plus a per-field limit); this mirrors that
+    for `get_static_injection`, which returned the whole 2-day window untrimmed.
+    Newest first (the SQL is ordered `created_at DESC`), keeping keys present so
+    callers do not have to handle their absence.
+
+    Fail-safe: any error returns the entries untouched.
+    """
+    if not entries:
+        return entries or []
+    try:
+        from core.config_manager import config_registry
+
+        try:
+            budget = int(
+                config_registry.get_value(
+                    "DIARY_CONTEXT_MAX_CHARS", 8000, value_type=int
+                )
+            )
+        except Exception:
+            budget = 8000
+        if budget <= 0:
+            return entries
+
+        per_field = max(300, budget // 4)
+        remaining = budget
+        capped: list = []
+        truncated = 0
+        for entry in entries:
+            if remaining <= 0 or not isinstance(entry, dict):
+                break
+            row = dict(entry)
+            for field in _DIARY_INJECTION_TEXT_FIELDS:
+                value = row.get(field)
+                if not isinstance(value, str) or not value:
+                    continue
+                limit = min(per_field, remaining)
+                if len(value) > limit:
+                    row[field] = value[: max(0, limit - 1)] + "\u2026"
+                    truncated += 1
+                remaining -= len(row[field])
+                if remaining <= 0:
+                    break
+            capped.append(row)
+
+        if truncated or len(capped) != len(entries):
+            log_info(
+                f"[ai_diary] Capped diary injection: {len(entries)} -> {len(capped)} "
+                f"entries, {truncated} field(s) truncated to fit "
+                f"DIARY_CONTEXT_MAX_CHARS={budget}"
+            )
+        return capped
+    except Exception as e:  # pragma: no cover - defensive
+        log_debug(f"[ai_diary] Diary injection cap skipped: {e}")
+        return entries
+
+
 def _merge_json_list(existing_json: str | None, new_items: list) -> list:
     """Merge a JSON-encoded list with new_items, preserving order and deduplicating strings."""
     try:
@@ -1724,6 +1796,11 @@ class DiaryPlugin:
                 entry["involved_users"] = _parse_json_list(entry.get("involved_users"))
                 entry["emotions"] = _parse_json_list(entry.get("emotions"))
                 entry["created_at"] = _isoformat_timestamp(entry.get("created_at"))
+
+            # Bound what this injection can add to a prompt: diary rows
+            # accumulate a whole day and reach ~168k chars each, so the raw
+            # 2-day window was ~238k in a single context key.
+            recent_entries = _cap_diary_entries_for_injection(recent_entries)
 
             duration = time.time() - start
             if duration > 0.1:

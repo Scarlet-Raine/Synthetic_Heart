@@ -284,8 +284,10 @@ async def test_persona_is_emitted_verbatim_ahead_of_the_instruction_block(
         in (instructions)
     ), "the persona block no longer precedes the instruction block verbatim"
 
-    # And the shared rules really are the ones that landed after it.
-    shared = load_json_instructions()
+    # And the shared rules really are the ones that landed after it — rendered
+    # for this turn's own interface path, which the routing rule and the worked
+    # example now carry instead of a template token.
+    shared = load_json_instructions(reply_path="telegram_bot/123")
     assert shared in instructions, (
         "the assembled prompt does not carry the shared block"
     )
@@ -364,7 +366,10 @@ def test_vessel_turn_is_detected_structurally_on_every_signal() -> None:
     from core.prompt_engine import _derive_instruction_route
 
     # (a) the routing path itself says vessel
-    assert _derive_instruction_route(None, {}, "vessel/minecraft", "", False) == ROUTE_VESSEL
+    assert (
+        _derive_instruction_route(None, {}, "vessel/minecraft", "", False)
+        == ROUTE_VESSEL
+    )
     # (b) only the message's own path says vessel — the None-fallback branch
     on_message = SimpleNamespace(
         interface_path="vessel/minecraft", chat=SimpleNamespace(type="private")
@@ -384,7 +389,10 @@ def test_vessel_turn_is_detected_structurally_on_every_signal() -> None:
     plain = SimpleNamespace(
         interface_path="telegram_bot/123", chat=SimpleNamespace(type="private")
     )
-    assert _derive_instruction_route(plain, {}, "telegram_bot/123", "", False) == ROUTE_CHAT
+    assert (
+        _derive_instruction_route(plain, {}, "telegram_bot/123", "", False)
+        == ROUTE_CHAT
+    )
 
 
 async def test_an_embodiment_turn_receives_the_in_world_speak_clause(
@@ -411,7 +419,9 @@ async def test_an_embodiment_turn_receives_the_in_world_speak_clause(
     )
     instructions = res["instructions"]
 
-    assert "the way to reply in that world is the embodiment speak action" in instructions
+    assert (
+        "the way to reply in that world is the embodiment speak action" in instructions
+    )
     assert "CHAT REPLY REQUIRED" in instructions  # the reply obligation still applies
 
     # And the same turn must NOT be handed the spoken-register rule meant for

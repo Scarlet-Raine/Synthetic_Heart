@@ -1338,6 +1338,23 @@ async def _dispatch_send_message(
                     iface_name = registered
                     break
 
+        # An explicit path that does not resolve to a *registered* interface is
+        # unusable: dispatch below would fail hard and (because an unregistered
+        # name is marked unfixable) drop the reply entirely. This happens in
+        # practice when the model echoes a prompt template token instead of a
+        # concrete path — e.g. "input.payload.current_chat.interface_path",
+        # which parses to a truthy, unregistered name and would otherwise
+        # short-circuit the reply-to-origin fallback. Treat it as "no usable
+        # path" so resolution continues at (b).
+        if iface_name and iface_name not in INTERFACE_REGISTRY:
+            log_warning(
+                f"[action_parser] ⚠️ send_message interface_path "
+                f"{interface_path!r} resolves to unregistered interface "
+                f"'{iface_name}'; ignoring it and using the originating "
+                "interface instead"
+            )
+            iface_name = None
+
     if not iface_name:
         origin_path = getattr(original_message, "interface_path", None)
         if isinstance(origin_path, str) and origin_path.strip():
