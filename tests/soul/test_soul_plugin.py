@@ -1295,3 +1295,40 @@ async def test_recall_cooldown_is_scoped_to_the_conversation() -> None:
     assert "number 0" in elsewhere[0], (
         f"the best match was held back by another conversation's recall: {elsewhere}"
     )
+
+
+@pytest.mark.asyncio
+async def test_recall_passes_the_configured_linked_sessions_to_the_repository() -> None:
+    """SOUL_RECALL_LINKED_SESSIONS reaches the repository as a scope, and only
+    for a turn whose own chat is in the list."""
+
+    cells = [_recall_cell("cell-0", "Alice keeps jasmine tea.", distilled=True)]
+
+    def _config(linked: str) -> Any:
+        def _get_value(key: str, default: Any = None, **_kwargs: Any) -> Any:
+            if key == "SOUL_RECALL_LINKED_SESSIONS":
+                return linked
+            return default
+
+        return patch("core.config_manager.config_registry", get_value=_get_value)
+
+    plugin = _recall_only_plugin(cells, distils=True)
+    with _config("telegram_bot/321,telegram_bot/999"):
+        await _recall_once(plugin)
+    kwargs = plugin._repo.recall_memories.await_args.kwargs
+    assert kwargs["session_id"] == "telegram_bot_321"
+    assert kwargs["linked_session_ids"] == frozenset(
+        {"telegram_bot_321", "telegram_bot_999"}
+    )
+
+    # A turn in a chat the list does not name links nothing.
+    plugin = _recall_only_plugin(cells, distils=True)
+    with _config("telegram_bot/321,telegram_bot/999"):
+        await _recall_once(plugin, interface_path="telegram_bot/777")
+    assert plugin._repo.recall_memories.await_args.kwargs["linked_session_ids"] is None
+
+    # An empty setting keeps the previous behaviour exactly.
+    plugin = _recall_only_plugin(cells, distils=True)
+    with _config(""):
+        await _recall_once(plugin)
+    assert plugin._repo.recall_memories.await_args.kwargs["linked_session_ids"] is None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Protocol, cast
@@ -83,12 +84,38 @@ def _recency_score(timestamp: datetime, now: datetime) -> float:
     return _clamp_score(0.5 ** (age_seconds / half_life_seconds))
 
 
+def _same_recall_scope(
+    cell_session_id: str | None,
+    session_id: str | None,
+    linked_session_ids: Collection[str] | None,
+) -> bool:
+    """Whether a cell belongs to the conversation being answered.
+
+    True for the turn's own session, and for any session the deployment has
+    linked to it (``SOUL_RECALL_LINKED_SESSIONS``). A group and the DM of the
+    same household can then be one memory scope, so a memory written in one is
+    not judged by the stricter cross-chat bar when it is recalled in the other.
+
+    ``linked_session_ids`` is the whole scope, ``session_id`` included. A scope
+    that does not contain the session being answered is ignored, so a set
+    computed for another conversation can never widen this one.
+    """
+    if not session_id:
+        return False
+    if cell_session_id == session_id:
+        return True
+    if not linked_session_ids or session_id not in linked_session_ids:
+        return False
+    return cell_session_id in linked_session_ids
+
+
 def _build_recall_match(
     *,
     cell: MemCell,
     similarity: float,
     lexical_score: float,
     session_id: str | None,
+    linked_session_ids: Collection[str] | None = None,
     now: datetime,
 ) -> MemCellRecall:
     recency = _recency_score(cell.event_timestamp, now)
@@ -101,7 +128,11 @@ def _build_recall_match(
         recency_score=recency,
         explicit_importance=cell.explicit_importance,
     )
-    same_session_boost = 0.08 if session_id and cell.session_id == session_id else 0.0
+    same_session_boost = (
+        0.08
+        if _same_recall_scope(cell.session_id, session_id, linked_session_ids)
+        else 0.0
+    )
     active_foresight = [
         signal for signal in cell.foresight_signals if signal.valid_until >= now.date()
     ]
@@ -125,8 +156,12 @@ def _build_recall_match(
     )
 
 
-def _passes_recall_floor(match: MemCellRecall, session_id: str | None) -> bool:
-    if session_id and match.cell.session_id == session_id:
+def _passes_recall_floor(
+    match: MemCellRecall,
+    session_id: str | None,
+    linked_session_ids: Collection[str] | None = None,
+) -> bool:
+    if _same_recall_scope(match.cell.session_id, session_id, linked_session_ids):
         return match.score >= 0.16 or max(match.similarity, match.lexical_score) >= 0.08
     return match.score >= 0.22 and max(match.similarity, match.lexical_score) >= 0.10
 
@@ -212,6 +247,7 @@ class SoulRepository(Protocol):
         query_text: str,
         query_embedding: list[float],
         session_id: str | None = None,
+        linked_session_ids: Collection[str] | None = None,
         limit: int = 5,
         candidate_limit: int | None = None,
     ) -> list[MemCellRecall]: ...
@@ -387,6 +423,7 @@ class InMemorySoulRepository:
         query_text: str,
         query_embedding: list[float],
         session_id: str | None = None,
+        linked_session_ids: Collection[str] | None = None,
         limit: int = 5,
         candidate_limit: int | None = None,
     ) -> list[MemCellRecall]:
@@ -406,9 +443,10 @@ class InMemorySoulRepository:
                 similarity=similarity,
                 lexical_score=lexical_score,
                 session_id=session_id,
+                linked_session_ids=linked_session_ids,
                 now=now,
             )
-            if _passes_recall_floor(match, session_id):
+            if _passes_recall_floor(match, session_id, linked_session_ids):
                 matches.append(match)
 
         matches.sort(
@@ -1188,6 +1226,7 @@ class PostgresSoulRepository:
         query_text: str,
         query_embedding: list[float],
         session_id: str | None = None,
+        linked_session_ids: Collection[str] | None = None,
         limit: int = 5,
         candidate_limit: int | None = None,
     ) -> list[MemCellRecall]:
@@ -1286,9 +1325,10 @@ class PostgresSoulRepository:
                 similarity=float(row.get("vector_similarity") or 0.0),
                 lexical_score=lexical_score,
                 session_id=session_id,
+                linked_session_ids=linked_session_ids,
                 now=now,
             )
-            if _passes_recall_floor(match, session_id):
+            if _passes_recall_floor(match, session_id, linked_session_ids):
                 matches.append(match)
 
         matches.sort(

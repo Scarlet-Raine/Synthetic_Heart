@@ -283,6 +283,27 @@ register_exposed_var(
     advanced=True,
 )
 
+register_exposed_var(
+    "SOUL_RECALL_LINKED_SESSIONS",
+    label="Chats that share one memory scope",
+    default="",
+    value_type=str,
+    ui_type="text",
+    description=(
+        "Comma-separated chat paths that should count as ONE conversation for "
+        "recall, e.g. 'telegram_bot/-5293915984,telegram_bot/5208932647' for a "
+        "group and the DM of the same household. A cell written in a linked "
+        "chat is then recalled as if it belonged to the current conversation: "
+        "it keeps the same-chat boost and the looser admission floor instead of "
+        "having to clear the stricter cross-chat bar. Only the listed chats are "
+        "linked, and only for a turn that is itself in one of them, so an "
+        "unlisted chat is unaffected. Empty keeps the previous behaviour."
+    ),
+    scope="plugins",
+    component="soul_plugin",
+    advanced=True,
+)
+
 
 @dataclass(slots=True)
 class _SessionState:
@@ -1194,6 +1215,7 @@ class SoulPlugin(PluginBase):
             query_text=normalized_query,
             query_embedding=query_embedding,
             session_id=safe_session_id,
+            linked_session_ids=self._linked_recall_sessions(safe_session_id),
             limit=_SOUL_RECALL_LIMIT,
             candidate_limit=_SOUL_RECALL_CANDIDATE_LIMIT,
         )
@@ -1471,6 +1493,31 @@ class SoulPlugin(PluginBase):
     @staticmethod
     def _normalize_session_id(interface_path: str) -> str:
         return re.sub(r"[^a-zA-Z0-9_:\-]", "_", interface_path)
+
+    @classmethod
+    def _linked_recall_sessions(cls, session_id: str) -> frozenset[str] | None:
+        """Other sessions that share this one's recall scope, or None.
+
+        Read from ``SOUL_RECALL_LINKED_SESSIONS``. The list is honoured only
+        when the session being answered is itself in it, so linking a group and
+        a DM never widens what an unrelated chat is allowed to recall.
+        """
+        from core.config_manager import config_registry
+
+        try:
+            raw = config_registry.get_value(
+                "SOUL_RECALL_LINKED_SESSIONS", "", value_type=str
+            )
+        except Exception:
+            return None
+        entries = {
+            cls._normalize_session_id(part.strip())
+            for part in str(raw or "").replace(";", ",").split(",")
+            if part.strip()
+        }
+        if len(entries) < 2 or session_id not in entries:
+            return None
+        return frozenset(entries)
 
     @staticmethod
     def _normalize_memory_emotion(label: str | None) -> str | None:
