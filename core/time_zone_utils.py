@@ -70,6 +70,27 @@ def format_dual_time(dt_utc: datetime) -> str:
     return f"{dt_local.strftime('%H:%M %Z')} ({dt_utc.strftime('%H:%M UTC')})"
 
 
+# Zones that name no place: their abbreviation IS the absence of a location.
+_NON_PLACE_ZONE_NAMES = frozenset({"utc", "gmt", "zulu", "universal", "ut"})
+
+
+def _zone_names_no_place(tz_name: str) -> bool:
+    """Whether a timezone name carries no place (``UTC``, ``Etc/GMT+2``, ...).
+
+    A zone is not a location: printing ``UTC`` where a place name belongs reads
+    as the household's whereabouts in a prompt and in every block that borrows
+    this helper. Zones that name a city (``Europe/Ljubljana``) are unaffected.
+    """
+    name = tz_name.strip().lower().replace(" ", "_")
+    if not name:
+        return True
+    return (
+        name.startswith("etc/")
+        or name.startswith("etc_")
+        or name in _NON_PLACE_ZONE_NAMES
+    )
+
+
 def get_local_location() -> str:
     """Return a human-readable location using a dedicated configuration variable.
 
@@ -84,6 +105,12 @@ def get_local_location() -> str:
         return location
 
     tz_name = str(_TZ) or "UTC"
+    # A zone is not a place. "UTC" and its family are the ABSENCE of a location,
+    # and printing them where a place name belongs is worse than printing
+    # nothing (it reads as "UTC: Overcast ..." in a weather line and as a
+    # whereabouts in a prompt).
+    if _zone_names_no_place(tz_name):
+        return ""
     # Typically in the form Region/City; use the last part as location
     if "/" in tz_name:
         location = tz_name.split("/")[-1]

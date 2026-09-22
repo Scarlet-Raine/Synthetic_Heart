@@ -57,6 +57,13 @@ Configuration
 
 Privacy & Implementation Notes
 ------------------------------
+- The prompt's clock is the household's own time, as bare ``HH:MM``: the dual local+UTC
+  rendering (``format_dual_time``) belongs to the surfaces where an operator compares two clocks
+  (the WebUI, the event summaries, the scheduled-time display) and never to a prompt, which would
+  hand the model a second clock and a zone name it can quote back. The Reality Anchor renders the
+  bare clock as ``10:52 PM``.
+- A location is never derived from a timezone that names no place: ``UTC`` (and the ``Etc/*``
+  family) yields no location rather than a place called "UTC".
 - No timezone names, offsets, or UTC timestamps are included in prompts by default to avoid leaking location information. If the session sets a timezone in session meta (``session_meta`` key ``timezone``), it is used to compute the local time, otherwise the server TZ configured via the project is used.
 - The mapping of labels is deterministic and test-covered. Service operators can disable the feature via the config var for privacy-sensitive deployments.
 - ``build_json_prompt()`` is now a deprecated alias kept for compatibility.

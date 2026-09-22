@@ -369,6 +369,19 @@ _expose(
         "from Home Assistant."
     ),
 )
+_expose(
+    "HASS_LOCATION_LABEL",
+    "House Location (rough)",
+    "",
+    str,
+    "text",
+    (
+        "A rough place name for the house (a valley, a village, a district). "
+        "While set, the [House] block names it instead of the exact "
+        "coordinates, so the synth knows where the household is without "
+        "carrying the pinpoint. Blank keeps the coordinates."
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1396,7 +1409,7 @@ class HomeAssistantPlugin(PluginBase):
         return line.strip()
 
     def _render_location(self) -> str:
-        """House coordinates and timezone, from HA's own configuration."""
+        """Where the house is and the clock it keeps, from HA's own config."""
         if not self.location_enabled():
             return ""
         core = self._core_config or {}
@@ -1407,7 +1420,13 @@ class HomeAssistantPlugin(PluginBase):
         latitude = core.get("latitude", zone_attributes.get("latitude"))
         longitude = core.get("longitude", zone_attributes.get("longitude"))
         bits: List[str] = []
-        if isinstance(latitude, (int, float)) and isinstance(longitude, (int, float)):
+        label = _cfg_str("HASS_LOCATION_LABEL", "")
+        if label:
+            # A rough place name instead of the pinpoint: the household wants the
+            # synth to know WHERE it is without the model holding coordinates it
+            # could quote back or that a transcript could carry away.
+            bits.append(f"{place} in {label}")
+        elif isinstance(latitude, (int, float)) and isinstance(longitude, (int, float)):
             bits.append(f"{place} at {float(latitude):.4f}, {float(longitude):.4f}")
         else:
             bits.append(place)
@@ -1486,7 +1505,9 @@ class HomeAssistantPlugin(PluginBase):
                         return
                     self._core_config = await response.json()
         except Exception as exc:
-            log_debug(f"{LOG_PREFIX} core config fetch failed: {type(exc).__name__} {exc}")
+            log_debug(
+                f"{LOG_PREFIX} core config fetch failed: {type(exc).__name__} {exc}"
+            )
 
     async def _connect_and_prime(self) -> None:
         """Connect, then cache the pieces the environment blocks need."""
