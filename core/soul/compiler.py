@@ -703,13 +703,24 @@ class SoulCompiler:
                     current_date.day,
                     tzinfo=_tz.utc,
                 )
+                grace_seconds = float(
+                    getattr(
+                        effective_curator,
+                        "min_age_seconds",
+                        _CURATOR_MIN_AGE_SECONDS,
+                    )
+                )
 
-                def _salience(s: MemCellSummary) -> float:
+                def _event_age_seconds(s: MemCellSummary) -> float:
                     ts = s.event_timestamp
                     if ts.tzinfo is None:
                         ts = ts.replace(tzinfo=_tz.utc)
-                    age_s = max(0.0, (now - ts.astimezone(_tz.utc)).total_seconds())
-                    recency = 0.5 ** (age_s / _CURATOR_HALF_LIFE_SECONDS)
+                    return max(0.0, (now - ts.astimezone(_tz.utc)).total_seconds())
+
+                def _salience(s: MemCellSummary) -> float:
+                    recency = 0.5 ** (
+                        _event_age_seconds(s) / _CURATOR_HALF_LIFE_SECONDS
+                    )
                     return compute_memcell_salience(
                         emotional_intensity=s.emotional_intensity,
                         retrieval_count=s.retrieval_count,
@@ -717,7 +728,17 @@ class SoulCompiler:
                         explicit_importance=s.explicit_importance,
                     )
 
-                kept_important.sort(key=lambda t: _salience(t[1]))
+                def _in_grace(s: MemCellSummary) -> bool:
+                    return grace_seconds > 0.0 and _event_age_seconds(s) < grace_seconds
+
+                # The grace window guards the REMOVE branch above; without the
+                # same guard here the CAP deletes those same fresh cells for
+                # being the calmest in the store (recency alone is 0.2 of a 0.4
+                # scale), which is how a whole morning's memories disappear
+                # minutes after they are compiled while the store sits pinned at
+                # the cap. Inside the window a cell is evicted only once nothing
+                # outside it is left to evict.
+                kept_important.sort(key=lambda t: (_in_grace(t[1]), _salience(t[1])))
                 overage = retained_count - max_memories
                 evicted = kept_important[:overage]
                 kept_important = kept_important[overage:]

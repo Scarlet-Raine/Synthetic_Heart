@@ -1180,9 +1180,11 @@ def _recall_cell(cell_id: str, text: str, *, distilled: bool) -> MemCell:
     )
 
 
-async def _recall_once(plugin: SoulPlugin) -> list[str]:
+async def _recall_once(
+    plugin: SoulPlugin, *, interface_path: str = "telegram_bot/321"
+) -> list[str]:
     return await plugin._recall_memories(
-        interface_path="telegram_bot/321",
+        interface_path=interface_path,
         incoming_text="what tea does alice love",
         session=_SessionState(),
     )
@@ -1261,4 +1263,35 @@ async def test_recall_rotates_the_recalled_set_within_a_session() -> None:
     assert len(newly_shown) == 3, (
         "the recalled set did not rotate, every entry had already been injected: "
         f"{second}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_recall_cooldown_is_scoped_to_the_conversation() -> None:
+    """Another conversation's recall must not spend this one's memories.
+
+    The cooldown map was keyed by the cell id alone, so it was global to the
+    process: a Grillo beat (every 30 minutes, same process) or a second chat
+    recalling a cell held it back here for the full 900 s. Measured live on
+    2026-09-22, no assembled prompt carried a memory from that day while the
+    store held 18 of them, and their retrieval counts show other callers had
+    been selecting them.
+    """
+
+    cells = [
+        _recall_cell(
+            f"cell-{i}", f"Alice keeps jasmine tea tin number {i}.", distilled=True
+        )
+        for i in range(8)
+    ]
+    plugin = _recall_only_plugin(cells, distils=True)
+
+    here = await _recall_once(plugin)
+    elsewhere = await _recall_once(plugin, interface_path="telegram_bot/999")
+
+    assert len(here) == 5
+    assert "number 0" in here[0]
+    assert len(elsewhere) == 5
+    assert "number 0" in elsewhere[0], (
+        f"the best match was held back by another conversation's recall: {elsewhere}"
     )

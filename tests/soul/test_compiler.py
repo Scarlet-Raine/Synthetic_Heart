@@ -453,6 +453,103 @@ async def test_run_curator_enforces_max_memories() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_curator_cap_evicts_old_cells_before_the_days_own() -> None:
+    """The over-cap eviction must not spend the newest cells first.
+
+    The grace window guards the low-salience REMOVE branch, but the cap sorted
+    by salience alone, and a calm cell written today scores about 0.2 there
+    (recency is capped at 0.2) against 0.28-0.37 for older emotional cells.
+    Measured live on 2026-09-22: every compile in the morning was followed
+    within minutes by a curator pass that deleted exactly the cells just
+    written, while the store sat pinned at the 500 cap.
+    """
+
+    repo = InMemorySoulRepository()
+    now = datetime.now(timezone.utc)
+
+    def _add(cell_id: str, *, age: timedelta, intensity: float, recalls: int) -> None:
+        repo.memcells[cell_id] = MemCell(
+            id=cell_id,
+            episodic_trace=f"Something happened: {cell_id}.",
+            atomic_facts=[],
+            emotional_tag=EmotionalTag(
+                state_snapshot={"joy": 0.9, "fear": 0.0, "sad": 0.0, "anger": 0.0},
+                dominant_emotion="joy",
+                intensity=intensity,
+                valence=0.9,
+            ),
+            foresight_signals=[],
+            event_timestamp=now - age,
+            session_id="telegram_bot:-5293915984",
+            explicit_importance=0.0,
+            retrieval_count=recalls,
+        )
+
+    for i in range(2):
+        _add(f"old-{i}", age=timedelta(days=60), intensity=0.9, recalls=3)
+    _add("this-morning", age=timedelta(hours=2), intensity=0.0, recalls=0)
+
+    compiler = SoulCompiler(
+        repository=repo,
+        memcell_extractor=FakeMemCellExtractor(),
+        dsp_extractor=FakeDspExtractor(),
+        dsp_builder=RuleBasedDspBuilder(),
+        summary_builder=RuleBasedSummaryBuilder(),
+        embedder=NoopEmbedder(),
+    )
+
+    result = await compiler.run_curator(current_date=now.date(), max_memories=2)
+
+    assert result.removed == 1
+    assert "this-morning" in repo.memcells, (
+        "the cap evicted the day's own memory in place of an older one: "
+        f"{sorted(repo.memcells)}"
+    )
+    assert len(repo.memcells) == 2
+
+
+@pytest.mark.asyncio
+async def test_run_curator_cap_still_evicts_when_everything_is_fresh() -> None:
+    """The grace window orders the eviction, it does not disable the cap."""
+
+    repo = InMemorySoulRepository()
+    now = datetime.now(timezone.utc)
+
+    for i in range(3):
+        repo.memcells[f"fresh-{i}"] = MemCell(
+            id=f"fresh-{i}",
+            episodic_trace=f"A calm thing happened {i}.",
+            atomic_facts=[],
+            emotional_tag=EmotionalTag(
+                state_snapshot={"joy": 0.1, "fear": 0.0, "sad": 0.0, "anger": 0.0},
+                dominant_emotion="joy",
+                intensity=0.1,
+                valence=0.1,
+            ),
+            foresight_signals=[],
+            event_timestamp=now - timedelta(hours=1 + i),
+            session_id="telegram_bot:-5293915984",
+            explicit_importance=0.0,
+            retrieval_count=0,
+        )
+
+    compiler = SoulCompiler(
+        repository=repo,
+        memcell_extractor=FakeMemCellExtractor(),
+        dsp_extractor=FakeDspExtractor(),
+        dsp_builder=RuleBasedDspBuilder(),
+        summary_builder=RuleBasedSummaryBuilder(),
+        embedder=NoopEmbedder(),
+    )
+
+    result = await compiler.run_curator(current_date=now.date(), max_memories=2)
+
+    assert result.removed == 1
+    assert result.retained == 2
+    assert len(repo.memcells) == 2
+
+
+@pytest.mark.asyncio
 async def test_rule_based_curator_classify_future_date_in_trace() -> None:
     curator = RuleBasedMemCellCurator()
     summary = MemCellSummary(

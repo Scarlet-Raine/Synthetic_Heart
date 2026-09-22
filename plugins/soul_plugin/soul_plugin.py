@@ -310,6 +310,14 @@ _SOUL_RETRIEVAL_BUMP_TRACK_MAX = 512
 # to August carried 58%, while 436 neutral cells shared 9%. Stepping a
 # just-recalled cell aside for a while lets the next-most-similar cells through;
 # the store keeps everything, only what is SHOWN rotates.
+#
+# The cooldown is keyed per CONVERSATION, not per cell. Keyed by the cell alone
+# it was global to the process, so a Grillo beat or a second chat recalling a
+# cell held it back in a conversation that had never seen it: on 2026-09-22 no
+# prompt at all carried a cell from that day while the cells sat in the store,
+# because the beats and the other chats kept spending them. What still holds a
+# cell back is its own conversation recalling it inside the window, which is the
+# rotation working as intended.
 _SOUL_RECALL_COOLDOWN_SEC = 900
 _SOUL_RECALL_TRACK_MAX = 512
 
@@ -330,6 +338,17 @@ def _soul_recall_cooldown_seconds() -> float:
     except Exception:
         return float(_SOUL_RECALL_COOLDOWN_SEC)
     return float(max(0, min(seconds, 86_400)))
+
+
+def _recall_cooldown_key(session_id: str, cell_id: object) -> str:
+    """Scope a recall-cooldown entry to the conversation that saw the cell.
+
+    Keyed by the cell alone, one chat's recall held that cell back in every
+    other chat, and Grillo beats share the process, so a beat could spend a
+    conversation's own memories on its behalf.
+    """
+
+    return f"{session_id}\x00{cell_id}"
 
 
 # How many active situational notes may be rendered into ONE prompt. The debrief
@@ -1249,7 +1268,8 @@ class SoulPlugin(PluginBase):
                 continue
             seen_traces.add(key)
             if cooldown_seconds > 0.0:
-                last_recall = self._recall_cooldown_at.get(str(match.cell.id), 0.0)
+                cooldown_key = _recall_cooldown_key(safe_session_id, match.cell.id)
+                last_recall = self._recall_cooldown_at.get(cooldown_key, 0.0)
                 if now_cooldown - last_recall < cooldown_seconds:
                     cooling.append(match)
                     continue
@@ -1266,7 +1286,9 @@ class SoulPlugin(PluginBase):
 
         if cooldown_seconds > 0.0:
             for match in selected:
-                self._recall_cooldown_at[str(match.cell.id)] = now_cooldown
+                self._recall_cooldown_at[
+                    _recall_cooldown_key(safe_session_id, match.cell.id)
+                ] = now_cooldown
             if len(self._recall_cooldown_at) > _SOUL_RECALL_TRACK_MAX:
                 self._recall_cooldown_at = {
                     cell_id: seen_at
