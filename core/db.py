@@ -12,12 +12,26 @@ from typing import Any
 # ``aiomysql`` is an optional dependency.  Import it lazily and provide a
 # minimal stub when it's not installed so modules depending on ``core.db`` can
 # still be imported during tests.
+#
+# The guard catches every exception, not only ImportError, so a driver that is
+# installed but broken, shadowed or otherwise unimportable is reported as
+# absent.  The real cause is therefore kept and printed, and appended to the
+# RuntimeError: a log line saying "aiomysql is not installed" has to be
+# distinguishable from a MariaDB call site reached by mistake in a Postgres
+# deployment, which is exactly what this message was hiding.
 try:  # pragma: no cover - import guard
     import aiomysql
-except Exception:  # pragma: no cover - executed when aiomysql missing
+
+    _AIOMYSQL_IMPORT_ERROR: Any = None
+except Exception as _aiomysql_import_error:  # pragma: no cover - aiomysql missing
+    _AIOMYSQL_IMPORT_ERROR = _aiomysql_import_error
+    print(
+        f"[db] aiomysql import failed: {_aiomysql_import_error!r}",
+        flush=True,
+    )
 
     async def _missing_connect(*args, **kwargs):
-        raise RuntimeError("aiomysql is not installed")
+        raise RuntimeError(f"aiomysql is not installed ({_AIOMYSQL_IMPORT_ERROR!r})")
 
     # Provide a minimal stub exposing the async connect/create_pool API so
     # calling sites receive a clear RuntimeError instead of an AttributeError
@@ -128,6 +142,41 @@ def _get_source_db_type() -> str:
     if normalized in {"postgres", "postgresql"}:
         return "postgres"
     return "mariadb"
+
+
+def _mariadb_fallback_context() -> str:
+    """Describe the inputs that made the code pick the MariaDB backend.
+
+    A Postgres deployment only reaches the MariaDB branch when the target
+    resolved differently than the operator expects, and the environment is the
+    only input: ``SYNTH_PRIMARY_DB`` is read from the process environment, which
+    is populated by ``core.logging_utils``'s ``load_dotenv()`` at import, so a
+    read that happens before that resolves against a different (often stale)
+    target.  Naming the inputs in the log is what turns "aiomysql is not
+    installed" into a diagnosis.
+    """
+    return (
+        f"SYNTH_PRIMARY_DB={os.getenv('SYNTH_PRIMARY_DB')!r}, "
+        f"SYNTH_DB_TYPE={os.getenv('SYNTH_DB_TYPE')!r}, "
+        f"DB_TYPE={os.getenv('DB_TYPE')!r}, "
+        f"SOURCE_DB_TYPE={os.getenv('SOURCE_DB_TYPE')!r}, "
+        f"resolved_target={_get_primary_db_target()!r}"
+    )
+
+
+def _describe_caller() -> str:
+    """Call chain of the frames that reached the fallback, innermost first."""
+    try:
+        import traceback
+
+        stack = traceback.extract_stack(limit=6)
+        # stack[-1] is this function, so [-4:-1] is caller, caller's caller, ...
+        return " <- ".join(
+            f"{Path(frame.filename).name}:{frame.lineno} in {frame.name}()"
+            for frame in stack[-4:-1]
+        )
+    except Exception:
+        return "unknown"
 
 
 def _read_db_config():
@@ -375,6 +424,12 @@ async def connect_source_db() -> Any:
             password=passwd,
             database=dbname,
             dsn=build_source_postgres_dsn() or None,
+        )
+    if _get_primary_db_target() == "soul":
+        log_warning(
+            "[db] Legacy MariaDB source store requested while the primary "
+            f"database is Postgres: {_mariadb_fallback_context()}; "
+            f"caller={_describe_caller()}"
         )
     return await aiomysql.connect(
         host=host,
@@ -637,6 +692,10 @@ async def get_pool():
                         dsn=_get_db_dsn(),
                     )
                 else:
+                    log_warning(
+                        "[db] MariaDB backend selected for the connection pool: "
+                        f"{_mariadb_fallback_context()}; caller={_describe_caller()}"
+                    )
                     new_pool = await aiomysql.create_pool(
                         host=host,
                         port=port,

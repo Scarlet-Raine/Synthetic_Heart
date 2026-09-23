@@ -150,6 +150,33 @@ class ConfigDefinition:
 _LOAD_COALESCE_WINDOW_SEC = 5.0
 _last_full_load_monotonic: Optional[float] = None
 
+# How long to wait before the single re-scan that picks up deferred keys. Long
+# enough for the database to finish coming up, short enough that the first
+# prompt after boot already sees the stored value.
+_DEFERRED_RETRY_DELAY_SEC = 5.0
+
+
+class ConfigStoreUnavailable(RuntimeError):
+    """The config store could not be read, as opposed to "no value stored".
+
+    ``_load_from_db()`` used to return ``None`` both when a key has no row and
+    when the read failed, so a definition whose first read happened before the
+    database was readable was pinned to its code default and marked loaded: the
+    stored value then never reached the process for the rest of the run.
+    Measured live: ``SOUL_SPEAKER_IDENTITIES`` was stored in the config table
+    and absent from every prompt, because the plugin registered the key after
+    the boot sweep and its first read happened inside the running event loop,
+    where the synchronous path cannot block for a query.
+
+    Raising this instead lets the caller keep the default *and* remember the
+    key, so a later sweep still applies the stored value.
+    """
+
+    def __init__(self, key: str, cause: BaseException | str) -> None:
+        self.key = key
+        self.cause = cause
+        super().__init__(f"config store unavailable for '{key}': {cause}")
+
 
 class ConfigRegistry:
     def __init__(self) -> None:
@@ -158,6 +185,13 @@ class ConfigRegistry:
         self._pending_env_persists: Dict[
             str, str
         ] = {}  # Buffer for env overrides to persist when DB is ready
+        # Keys that fell back to their code default because the config store
+        # could not be read yet (boot-time async context, database not up,
+        # circular import).  Kept so the next successful sweep re-applies their
+        # stored value instead of leaving the default in place for the whole run.
+        self._deferred_keys: Dict[str, str] = {}
+        # One-shot background re-scan scheduled when a key is deferred.
+        self._deferred_retry_task: asyncio.Task | None = None
         # Buffer for persona-related updates received before PersonaManager is ready
         self._pending_persona_updates: Dict[str, Any] = {}
         # Background task for retrying pending persona DB persists
@@ -229,7 +263,14 @@ class ConfigRegistry:
         Use this instead of get_value() in that situation.
         """
         definition = self._definitions.get(key)
-        raw_value = await self._load_from_db(key)
+        try:
+            raw_value = await self._load_from_db(key)
+        except ConfigStoreUnavailable as exc:
+            # Bootstrap callers want a usable value, not an exception; remember
+            # the key so a later sweep can still apply the stored one.
+            if definition is not None:
+                self._deferred_keys[key] = str(exc.cause)
+            return default
         if raw_value is None:
             return default
         if definition is None:
@@ -674,21 +715,40 @@ class ConfigRegistry:
             return
 
         raw_value: Optional[str] = None
+        store_unavailable: Optional[ConfigStoreUnavailable] = None
         if "bootstrap" not in definition.tags:
             try:
                 raw_value = self._load_from_db_sync(definition.key)
+            except ConfigStoreUnavailable as exc:
+                store_unavailable = exc
             except Exception as exc:
                 # Use print to avoid circular import with logging_utils during initialization
                 print(
                     f"[config] Failed to load '{definition.key}' from DB: {exc}",
                     flush=True,
                 )
+                store_unavailable = ConfigStoreUnavailable(definition.key, exc)
 
         if raw_value is not None:
             definition.raw_value = raw_value
             definition.value = self._convert_value(definition, raw_value)
             definition.loaded = True
             return
+
+        if store_unavailable is not None:
+            # The value below is a placeholder, not the stored one: remember the
+            # key so the next successful sweep can apply the real value.  Without
+            # this the definition is marked loaded and the stored value is lost
+            # for the whole run.
+            first_time = definition.key not in self._deferred_keys
+            self._deferred_keys[definition.key] = str(store_unavailable.cause)
+            if first_time:
+                print(
+                    f"[config] '{definition.key}' deferred ({store_unavailable.cause}); "
+                    "using the default until the config store is readable",
+                    flush=True,
+                )
+            self._schedule_deferred_retry()
 
         if not definition.warned_default:
             # Use print to avoid circular import with logging_utils during initialization
@@ -717,6 +777,36 @@ class ConfigRegistry:
             # No event loop - safe to persist default now
             self._persist_background(definition.key, definition.raw_value)
 
+    def _schedule_deferred_retry(self) -> None:
+        """Re-scan the config store once, shortly after a deferred read.
+
+        A deferred key only recovers on a sweep, and the sweeps of a boot can
+        finish before the plugin that owns the key is loaded — which is how a
+        stored value stayed invisible for a whole run.  One delayed re-scan
+        closes that gap: it is a single query plus the definitions already in
+        memory, it is skipped while a retry is already pending, and it is a
+        no-op when nothing is deferred.
+        """
+        if (
+            self._deferred_retry_task is not None
+            and not self._deferred_retry_task.done()
+        ):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop to schedule on: the next get_value() retries the read.
+            return
+
+        async def _retry() -> None:
+            await asyncio.sleep(_DEFERRED_RETRY_DELAY_SEC)
+            try:
+                await self.load_all_from_db(force=True)
+            except Exception as exc:
+                log_warning(f"[config] Deferred config retry failed: {exc}")
+
+        self._deferred_retry_task = loop.create_task(_retry())
+
     def _load_from_db_sync(self, key: str) -> Optional[str]:
         try:
             asyncio.get_running_loop()
@@ -724,12 +814,13 @@ class ConfigRegistry:
             # No event loop running - safe to create one
             return asyncio.run(self._load_from_db(key))
         else:
-            # Event loop is running - we cannot block it
-            # Skip DB load during sync import phase
+            # Event loop is running - we cannot block it, so the read is
+            # deferred rather than answered.  Callers must treat this as
+            # "unavailable": the default is a placeholder until a sweep runs.
             log_debug(
-                f"[config] Skipping DB load for '{key}' during async context (will use default)"
+                f"[config] Skipping DB load for '{key}' during async context (deferred)"
             )
-            return None
+            raise ConfigStoreUnavailable(key, "sync read inside a running event loop")
 
     async def _load_from_db(self, key: str) -> Optional[str]:
         try:
@@ -738,12 +829,13 @@ class ConfigRegistry:
 
             log_debug(f"[config] Successfully imported from core.db for key '{key}'")
         except ImportError as e:
-            # Circular import during initialization - skip DB load
+            # Circular import during initialization - the store is not readable
+            # yet, so this is "unavailable", not "no value stored".
             print(
                 f"[config] Skipping DB load for '{key}' during initialization: {e}",
                 flush=True,
             )
-            return None
+            raise ConfigStoreUnavailable(key, e) from e
 
         try:
             log_debug(f"[config] About to ensure_core_tables for key '{key}'")
@@ -796,7 +888,7 @@ class ConfigRegistry:
                         f"[config] Retry after ensure_core_tables() failed for key '{key}': {retry_exc}"
                     )
             log_error(f"[config] Error loading from DB for key '{key}': {e}")
-            return None
+            raise ConfigStoreUnavailable(key, e) from e
 
     def _persist_background(self, key: str, value: str) -> None:
         try:
@@ -1290,6 +1382,7 @@ class ConfigRegistry:
 
         loaded_count = 0
         skipped_count = 0
+        recovered_count = 0
 
         # Batch-load all config values in one DB round-trip.
         # This avoids exhausting the DB pool during startup when many components
@@ -1340,6 +1433,7 @@ class ConfigRegistry:
                 definition.loaded
                 and definition.raw_value is not None
                 and definition.raw_value != ""
+                and definition.key not in self._deferred_keys
             ):
                 # Check if this is actually a default value that needs DB reload
                 default_raw = self._serialize_value(definition, definition.default)
@@ -1358,6 +1452,13 @@ class ConfigRegistry:
             try:
                 raw_value = config_rows.get(definition.key)
                 if raw_value is not None:
+                    if definition.key in self._deferred_keys:
+                        self._deferred_keys.pop(definition.key, None)
+                        recovered_count += 1
+                        log_info(
+                            f"[config] ✓ Recovered '{definition.key}' from DB "
+                            "(was pinned to its default before the store was readable)"
+                        )
                     definition.raw_value = raw_value
                     definition.value = self._convert_value(definition, raw_value)
                     definition.loaded = True
@@ -1383,8 +1484,13 @@ class ConfigRegistry:
                 )
 
         log_info(
-            f"[config] ✓ load_all_from_db completed: loaded={loaded_count}, skipped={skipped_count}, total={len(self._definitions)}"
+            f"[config] ✓ load_all_from_db completed: loaded={loaded_count}, skipped={skipped_count}, recovered={recovered_count}, total={len(self._definitions)}"
         )
+        if self._deferred_keys:
+            log_warning(
+                f"[config] {len(self._deferred_keys)} key(s) still on their default because "
+                f"the config store could not be read: {sorted(self._deferred_keys)[:10]}"
+            )
 
     def notify_all_listeners(self) -> None:
         """
