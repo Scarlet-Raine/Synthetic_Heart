@@ -559,3 +559,113 @@ async def test_a_shorter_subject_retires_the_longer_account(
 
     assert repo.resolved == [("tsc-long", "resolved")]
     assert repo.notes[0].status == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_the_filed_notes_reach_the_extraction_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The extractor must be shown the filed wording it is asked to retire.
+
+    Regression (live, 2026-09-23): the instructions asked for a circumstance
+    "worded exactly as it was filed before" while the prompt never carried the
+    filed notes, so a correction could only be a guess and no stale note could
+    ever be named for retirement.
+    """
+    repo = _RecordingRepository()
+    repo.notes.append(
+        _older_note(
+            "wedding day",
+            "The wedding is tomorrow (2026-09-23); the day is Dee's.",
+        )
+    )
+    calls = _install(monkeypatch, llm_text='{"notes":[]}', repository=repo)
+
+    original_message, context = _turn()
+    await DebriefSituationalNotesPlugin().on_debrief(
+        processed_actions=[],
+        failed_actions=[],
+        results={},
+        context=context,
+        original_message=original_message,
+    )
+
+    user_part = next(m["content"] for m in calls["messages"] if m["role"] == "user")
+    assert "filed notes" in user_part
+    assert "wedding day" in user_part
+    assert "The wedding is tomorrow (2026-09-23); the day is Dee's." in user_part
+    # The window is absolute, so the extractor can see the note is out of date.
+    assert "2026-09-18T12:00:00+00:00 -> 2026-09-19T00:00:00+00:00" in user_part
+
+
+@pytest.mark.asyncio
+async def test_no_filed_notes_leaves_the_prompt_as_it_was(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty store adds no block: the fail-safe path is invisible."""
+    repo = _RecordingRepository()
+    calls = _install(monkeypatch, llm_text='{"notes":[]}', repository=repo)
+
+    original_message, context = _turn()
+    await DebriefSituationalNotesPlugin().on_debrief(
+        processed_actions=[],
+        failed_actions=[],
+        results={},
+        context=context,
+        original_message=original_message,
+    )
+
+    user_part = next(m["content"] for m in calls["messages"] if m["role"] == "user")
+    assert "filed notes" not in user_part
+
+
+@pytest.mark.asyncio
+async def test_a_stale_filed_note_is_retired_by_its_own_subject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A claimed-in-the-future note the turn corrects must stop being injected.
+
+    Live (2026-09-23, the 2D instance): the store held `[TSC EVENT] The wedding
+    is tomorrow (2026-09-23)` active while the human had said, in the same
+    conversation, that the wedding happened two mornings earlier. The note's
+    window had not run out, so nothing retired it; and its subject reduces to a
+    single meaningful token ("wedding tomorrow" -> {"wedding"}), which the
+    containment rule alone can never match. The correction now names the filed
+    subject verbatim and that exact subject is enough.
+    """
+    repo = _RecordingRepository()
+    repo.notes.append(
+        _older_note(
+            "wedding tomorrow",
+            "The wedding is happening tomorrow (2026-09-23).",
+        )
+    )
+    _install(
+        monkeypatch,
+        llm_text='{"notes":[],"ended":["wedding tomorrow"]}',
+        repository=repo,
+    )
+
+    original_message, context = _turn()
+    await DebriefSituationalNotesPlugin().on_debrief(
+        processed_actions=[],
+        failed_actions=[],
+        results={},
+        context=context,
+        original_message=original_message,
+    )
+
+    assert repo.resolved == [("tsc-older-account", "resolved")]
+    assert repo.notes[0].status == "resolved"
+
+
+def test_extract_instructions_require_stale_filed_notes_to_be_reported() -> None:
+    """Two rules the wedding incident turned on must stay in the prompt."""
+    from plugins.debrief.debrief_situational_notes import _EXTRACT_INSTRUCTIONS
+
+    assert "STALE" in _EXTRACT_INSTRUCTIONS
+    assert "filed notes" in _EXTRACT_INSTRUCTIONS
+    assert "character for character" in _EXTRACT_INSTRUCTIONS
+    # A summary is read on later days, so relative day words make it a lie.
+    assert "ABSOLUTE date" in _EXTRACT_INSTRUCTIONS
+    assert "never a bare relative word" in _EXTRACT_INSTRUCTIONS

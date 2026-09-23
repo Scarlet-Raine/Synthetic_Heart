@@ -82,12 +82,25 @@ _EXTRACT_INSTRUCTIONS = (
     "EVERY NOTE MUST BE ABOUT THE HUMAN'S CIRCUMSTANCES (or ones the human shares). Never write a note about the persona's own state, its moods or its plans, and never about a third party's state: those belong to the persona's diary, not to this store. A note whose subject is the persona or another character is wrong even when the exchange mentions them.\n"
     "subject is a SHORT canonical noun phrase (2-4 words) naming the specific circumstance, and it must be written the SAME way every time you describe that circumstance ('gathering at Sandro's', not 'gathering tonight' then 'Human' then 'upcoming outing'): the same situation re-described must reuse the same subject so it reads as one ongoing situation instead of a new one. Never use a bare person's name ('Scar', 'Human', 'Scarlet') as the subject.\n"
     "SEPARATELY, report the circumstances this exchange shows have ENDED or been "
-    "CONTRADICTED. When the human says a standing circumstance is over, has "
-    "passed, or is no longer true ('I'm not sore any more', 'the appointment was "
-    "yesterday', 'that got cancelled'), list that circumstance's subject under "
-    "'ended', worded exactly as it was filed before, so the standing note for it "
-    "can be retired. Report it even when there is nothing new to note for it, and "
-    "do NOT express this by shortening valid_until instead.\n"
+    "CONTRADICTED, and every filed note this exchange shows is now STALE. When "
+    "the human says a standing circumstance is over, has passed, or is no longer "
+    "true ('I'm not sore any more', 'the appointment was yesterday', 'that got "
+    "cancelled'), list that circumstance's subject under 'ended', worded exactly "
+    "as it was filed before, so the standing note for it can be retired. The same "
+    "channel is what drops a note that is simply OUT OF DATE: the notes "
+    "currently filed are listed for you under 'filed notes', and any of them the "
+    "exchange shows is wrong or already past (the event it describes has "
+    "happened, the day it calls 'tomorrow' is over, the human corrects it: 'the "
+    "wedding was two days ago, that note is stale') must be listed under "
+    "'ended' with its subject copied from that list character for character. A "
+    "note whose validity window has not run out yet is retired by NOTHING else, "
+    "so a stale filed note that goes unreported keeps being told to you as "
+    "current fact. Report it even when the turn has no new circumstance to note.\n"
+    "A summary outlives the turn that wrote it and is read again on later days, "
+    "so it must carry the ABSOLUTE date or time it refers to ('the wedding took "
+    "place on 2026-09-21'), and never a bare relative word ('today', 'tomorrow', "
+    "'tonight', 'this morning', 'yesterday'): 'tomorrow' written today is a false "
+    "claim tomorrow.\n"
     'Return ONLY a JSON object: {"notes": [{"note_type": ..., "subject": ..., '
     '"summary": ..., "priority": 0, "confidence": 0.5, '
     '"valid_from": "2026-05-05T00:00:00+00:00", '
@@ -99,6 +112,11 @@ _EXTRACT_INSTRUCTIONS = (
 
 class DebriefSituationalNotesPlugin:
     display_name = display_name
+
+    # How many filed notes the extraction prompt is shown. The list exists so a
+    # correction can name a standing note by its own wording; it is bounded
+    # because it rides on every debrief turn.
+    _FILED_NOTES_IN_PROMPT = 12
 
     def get_supported_actions(self) -> dict:
         return {}
@@ -255,6 +273,66 @@ class DebriefSituationalNotesPlugin:
         except Exception as exc:
             log_warning(f"[debrief_situational_notes] repository lookup failed: {exc}")
             return None
+
+    @staticmethod
+    def _short_summary(summary: Any, limit: int = 200) -> str:
+        """One line, bounded: the filed list is prompt budget, not an archive."""
+        text = " ".join(str(summary or "").split())
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3].rstrip() + "..."
+
+    @staticmethod
+    def _filed_window(note: Any) -> str:
+        """The note's own validity window, absolute, as the extractor reads it."""
+        start = (
+            note.valid_from.isoformat() if getattr(note, "valid_from", None) else "?"
+        )
+        end = (
+            note.valid_until.isoformat()
+            if getattr(note, "valid_until", None)
+            else "open"
+        )
+        return f"{start} -> {end}"
+
+    async def _filed_notes_block(self) -> str:
+        """Render the notes standing for the human, for the extraction prompt.
+
+        The prompt asked the model to report a circumstance that has ended
+        "worded exactly as it was filed before" while never showing it the filed
+        wording, so a correction could only ever be a guess. Live (2026-09-23):
+        the human said the wedding had happened two days earlier, the debrief
+        filed the correction under "wedding ceremony in the kitchen", and the
+        standing rows "wedding day" and "wedding tomorrow" ("The wedding is
+        tomorrow (2026-09-23)") stayed active and were injected on the very day
+        they still called tomorrow, because nothing in the store could connect
+        the correction to them.
+
+        Fail-safe: no repository, or a failing lookup, renders no block and the
+        extraction carries on exactly as it did before.
+        """
+        repository = self._get_soul_repository()
+        if repository is None:
+            return ""
+        from core.soul.models import now_utc
+
+        try:
+            active = await repository.list_active_situational_notes(now=now_utc())
+        except Exception as exc:
+            log_debug(f"[debrief_situational_notes] filed-note lookup failed: {exc}")
+            return ""
+        if not active:
+            return ""
+        lines = [
+            f"- {note.subject} | {self._filed_window(note)} | "
+            f"{self._short_summary(note.summary)}"
+            for note in active[: self._FILED_NOTES_IN_PROMPT]
+        ]
+        return (
+            "filed notes (what is currently standing for the human; a note this "
+            "exchange shows is out of date must be retired by copying its subject "
+            "exactly into 'ended'):\n" + "\n".join(lines)
+        )
 
     async def _store_notes(
         self, candidates: List[Dict[str, Any]], session_id: str | None
@@ -440,6 +518,7 @@ class DebriefSituationalNotesPlugin:
             return None
 
         now = datetime.now(timezone.utc)
+        filed_block = await self._filed_notes_block()
         # Plain labelled text, deliberately not a JSON blob. An OpenAI-compatible
         # backend may try to read a JSON string as structured content and keep
         # only the keys it recognises (text/content/parts), silently dropping
@@ -451,6 +530,8 @@ class DebriefSituationalNotesPlugin:
             f"The human said:\n{user_message.strip()}\n\n"
             f"The persona replied:\n{llm_response}"
         )
+        if filed_block:
+            user_prompt = f"{user_prompt}\n\n{filed_block}"
 
         try:
             from core.config import derive_cortex_scope, get_active_cortex_engine

@@ -67,11 +67,21 @@ def subject_tokens(subject: Any) -> set[str]:
 def is_same_circumstance(left: set[str], right: set[str]) -> bool:
     """True when two subject token sets name the same circumstance.
 
-    Containment, not equality: "Gathering at Sandro's" and "Gathering at
-    Sandro's place" are the same circumstance, one described with more detail.
-    Subjects below ``MIN_MEANINGFUL_TOKENS`` never match anything, so a bare
-    person's name cannot absorb or replace a real circumstance.
+    Identical token sets always match, whatever their size. A subject that
+    reduces to one meaningful token because its other words are time words
+    ("wedding tomorrow" -> {"wedding"}) is a filed claim the correcting turn can
+    only ever name by copying it verbatim, so the minimum-token rule below must
+    not make it unreachable: it would leave the claim standing forever (live,
+    2026-09-23). The one direction that stays blocked is a thin subject ABSORBING
+    a richer one.
+
+    Beyond that, containment, not equality: "Gathering at Sandro's" and
+    "Gathering at Sandro's place" are the same circumstance, one described with
+    more detail. Subjects below ``MIN_MEANINGFUL_TOKENS`` never match anything
+    else, so a bare person's name cannot absorb or replace a real circumstance.
     """
+    if left and left == right:
+        return True
     if len(left) < MIN_MEANINGFUL_TOKENS or len(right) < MIN_MEANINGFUL_TOKENS:
         return False
     return left <= right or right <= left

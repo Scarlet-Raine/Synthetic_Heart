@@ -1152,6 +1152,42 @@ def _unrendered_injection_keys(keys: Any) -> list[str]:
     return sorted(key for key in candidates if key not in _RENDERED_CONTEXT_KEYS)
 
 
+def _temporal_short_stamp(value: Any) -> str:
+    """Trim a note's ISO bound to the minute, for the temporal block."""
+    text = ""
+    if isinstance(value, str):
+        text = value.strip()
+    elif hasattr(value, "isoformat"):
+        text = value.isoformat()
+    if not text:
+        return ""
+    return text[:16].replace("T", " ")
+
+
+def _temporal_note_window(entry: Any) -> str:
+    """Render a situational note's own validity window into the block.
+
+    A note's summary is prose written on the day the note was filed, so it can
+    still say "the wedding is tomorrow" days after the fact (live, 2026-09-23:
+    the block asserted `[TSC EVENT] The wedding is tomorrow (2026-09-23)` on the
+    day the human had already told the persona the wedding was two mornings
+    earlier). The window the note was filed FOR is printed next to the summary
+    so the claim can be read against the Reality Anchor's current date. A note
+    whose producer supplies no bounds renders exactly as it did before.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    start = _temporal_short_stamp(entry.get("valid_from"))
+    end = _temporal_short_stamp(entry.get("valid_until"))
+    if start and end:
+        return f" [{start} -> {end}]"
+    if end:
+        return f" [until {end}]"
+    if start:
+        return f" [from {start}]"
+    return ""
+
+
 def _build_context_summary(
     context_section: dict[str, Any],
     is_grillo_internal: bool = False,
@@ -1207,9 +1243,10 @@ def _build_context_summary(
     temporal_context = context_section.get("soul_temporal_context")
     if temporal_context:
         tc_lines = [
-            "- [TSC %s] %s"
+            "- [TSC %s]%s %s"
             % (
                 entry.get("note_type", "?"),
+                _temporal_note_window(entry),
                 entry.get("summary", entry.get("subject", "")),
             )
             for entry in temporal_context[:8]

@@ -826,6 +826,16 @@ class SoulPlugin(PluginBase):
                         "valid_until_relative": renderer.render_relative(
                             note.valid_until
                         ),
+                        # Absolute bounds as well: the summary is prose written on
+                        # the day the note was filed and can still say "tomorrow"
+                        # days later, so the renderer prints the window the note
+                        # was filed for next to it.
+                        "valid_from": note.valid_from.isoformat()
+                        if note.valid_from
+                        else None,
+                        "valid_until": note.valid_until.isoformat()
+                        if note.valid_until
+                        else None,
                         "source": note.source,
                     }
                 )
