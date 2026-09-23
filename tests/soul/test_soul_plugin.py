@@ -1469,3 +1469,176 @@ def test_no_speaker_identities_keeps_the_builder_undeclared() -> None:
 
     assert getattr(builder, "speaker_identity", "") == ""
     assert builder._declaration_block() == ""
+
+
+# ---------------------------------------------------------------------------
+# A compile distils BOTH sides of the conversation
+# ---------------------------------------------------------------------------
+
+
+def _capture_compiled_transcript(
+    monkeypatch: pytest.MonkeyPatch, plugin: SoulPlugin
+) -> dict[str, Any]:
+    """Capture the transcript handed to the memcell extractor.
+
+    ``SoulCompiler`` is a slots dataclass, so its method cannot be patched on the
+    instance; the extractor it calls with the transcript can.
+    """
+    captured: dict[str, Any] = {}
+    extractor = plugin._compiler.memcell_extractor
+
+    async def fake_extract(
+        _self: Any, *, transcript: str, current_date: Any
+    ) -> list[Any]:
+        captured["transcript"] = transcript
+        captured["current_date"] = current_date
+        return []
+
+    monkeypatch.setattr(type(extractor), "extract_memcells", fake_extract)
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_compile_transcript_carries_both_sides_of_the_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The buffer holds only incoming lines, so the compile must take both sides.
+
+    Live 2026-09-23: the 12:12 compile distilled three ``Scar:`` lines while the
+    persona's own 12:07/12:05/12:02 replies sat in ``chat_history_cache``. The
+    extractor is asked to state who did or said what, and the cells that come out
+    of a one-sided transcript file the persona's own acts as the user's.
+    """
+    plugin = SoulPlugin()
+    interface_path = "telegram_bot/777"
+    monkeypatch.setattr(SoulPlugin, "_persona_display_name", staticmethod(lambda: "2D"))
+    plugin._buffers[interface_path] = ["Scar: are you awake"]
+    plugin._buffer_started[interface_path] = datetime(
+        2026, 9, 23, 10, 4, tzinfo=timezone.utc
+    )
+    _patch_daily_transcript_rows(
+        monkeypatch,
+        [
+            # Present in the cache, but from BEFORE this buffer: already compiled.
+            (
+                "Scar",
+                "5208932647",
+                "did you sleep at all",
+                datetime(2026, 9, 23, 10, 0, tzinfo=timezone.utc),
+            ),
+            (
+                "Scar",
+                "5208932647",
+                "are you awake",
+                datetime(2026, 9, 23, 10, 4, 30, tzinfo=timezone.utc),
+            ),
+            (
+                "self",
+                "self",
+                "mmh, awake now",
+                datetime(2026, 9, 23, 10, 5, tzinfo=timezone.utc),
+            ),
+            (
+                "Scar",
+                "5208932647",
+                "there is tea on the counter",
+                datetime(2026, 9, 23, 10, 6, tzinfo=timezone.utc),
+            ),
+        ],
+    )
+    captured = _capture_compiled_transcript(monkeypatch, plugin)
+
+    assert await plugin._compile_interface(interface_path) == 0
+
+    transcript = captured["transcript"]
+    # Both sides, the persona's own line named as the persona's.
+    assert "Scar: are you awake" in transcript
+    assert "2D (the persona): mmh, awake now" in transcript
+    assert "Scar: there is tea on the counter" in transcript
+    # In order, and nothing from the previous compile window.
+    assert (
+        transcript.index("are you awake")
+        < transcript.index("awake now")
+        < transcript.index("tea on the counter")
+    )
+    assert "did you sleep at all" not in transcript
+    # The buffer is cleared together with its window anchor.
+    assert plugin._buffers[interface_path] == []
+    assert interface_path not in plugin._buffer_started
+
+
+@pytest.mark.asyncio
+async def test_compile_transcript_keeps_the_buffer_when_the_cache_misses_a_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cache that does not hold the buffered lines must not replace them."""
+    plugin = SoulPlugin()
+    interface_path = "telegram_bot/778"
+    monkeypatch.setattr(SoulPlugin, "_persona_display_name", staticmethod(lambda: "2D"))
+    plugin._buffers[interface_path] = [
+        "Scar: are you awake",
+        "Scar: I made tea",
+    ]
+    plugin._buffer_started[interface_path] = datetime(
+        2026, 9, 23, 10, 4, tzinfo=timezone.utc
+    )
+    # The cache holds a DIFFERENT conversation on the same interface (a stale or
+    # partially written window): the buffered lines are the authority.
+    _patch_daily_transcript_rows(
+        monkeypatch,
+        [
+            (
+                "self",
+                "self",
+                "some older line nobody buffered",
+                datetime(2026, 9, 23, 10, 5, tzinfo=timezone.utc),
+            )
+        ],
+    )
+    captured = _capture_compiled_transcript(monkeypatch, plugin)
+
+    await plugin._compile_interface(interface_path)
+
+    assert captured["transcript"] == "Scar: are you awake\nScar: I made tea"
+
+
+@pytest.mark.asyncio
+async def test_compile_transcript_falls_back_when_the_cache_read_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cache read that raises must not cost the session its compile."""
+    plugin = SoulPlugin()
+    interface_path = "telegram_bot/779"
+    plugin._buffers[interface_path] = ["Scar: are you awake"]
+    plugin._buffer_started[interface_path] = datetime(
+        2026, 9, 23, 10, 4, tzinfo=timezone.utc
+    )
+
+    def _boom() -> Any:
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr("plugins.soul_plugin.get_conn_ctx", _boom)
+    captured = _capture_compiled_transcript(monkeypatch, plugin)
+
+    assert await plugin._compile_interface(interface_path) == 0
+
+    assert captured["transcript"] == "Scar: are you awake"
+
+
+def test_cache_covers_buffer_requires_every_buffered_line() -> None:
+    """Coverage is what licenses the cached transcript over the buffer."""
+    cached = ["Scar: are you awake", "2D (the persona): mmh, awake now"]
+
+    assert SoulPlugin._cache_covers_buffer(cached, ["Scar: are you awake"]) is True
+    assert (
+        SoulPlugin._cache_covers_buffer(
+            cached, ["Scar: are you awake", "2D (the persona): mmh, awake now"]
+        )
+        is True
+    )
+    assert (
+        SoulPlugin._cache_covers_buffer(
+            cached, ["Scar: are you awake", "Scar: I made tea"]
+        )
+        is False
+    )

@@ -419,7 +419,7 @@ async def search_memories(
                     if chat_where:
                         order_sql, order_params = _chat_history_order(chat_tokens)
                         chat_query = (
-                            "SELECT 'chat_history' AS source, id, created_at, message_text, NULL AS context_tags, interface_path "
+                            "SELECT 'chat_history' AS source, id, created_at, message_text, NULL AS context_tags, interface_path, sender_name "
                             "FROM chat_history_cache WHERE "
                             + chat_where
                             + " ORDER BY "
@@ -431,7 +431,18 @@ async def search_memories(
                             await cur.execute(chat_query, chat_params)
                             rows = await cur.fetchall()
                             for r in rows:
-                                src, _id, ts, content, _, chat_path = r
+                                src, _id, ts, content, _, chat_path = r[:6]
+                                # WHOSE line this was. A raw chat line carries
+                                # the speaker that the interface stored (the
+                                # human's name, another participant's name, or
+                                # the persona's own canonical "self"), and the
+                                # prompt renders it: recalled without it, the
+                                # human's own act arrived as the synth's
+                                # recollection of having done it (see
+                                # core/prompt_engine._label_stored_memory).
+                                speaker = (
+                                    r[6] if len(r) > 6 and r[6] is not None else ""
+                                )
                                 snippet = (
                                     content
                                     if isinstance(content, str)
@@ -454,10 +465,14 @@ async def search_memories(
                                         "timestamp": ts_iso,
                                         "snippet": snippet,
                                         "tags": [],
-                                        # A raw chat line names no speaker, so the
-                                        # conversation it came from is the only
-                                        # provenance available for the prompt.
+                                        # Provenance for the prompt: the
+                                        # conversation it came from AND who said
+                                        # it. Recalled without the speaker, the
+                                        # human's own line read as the synth's
+                                        # own recollection (rendered by
+                                        # core/prompt_engine._label_stored_memory).
                                         "interface_path": chat_path,
+                                        "speaker": str(speaker).strip(),
                                     }
                                 )
                         except Exception as e:

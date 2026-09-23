@@ -747,6 +747,13 @@ _MEMORY_SOURCE_LABELS = {
 }
 
 
+# The interfaces cache the persona's OWN messages under the canonical label
+# "self" (Telegram, Discord and the Vessel all do), so a recalled raw line that
+# carries one of these labels is the synth's own words and must never render as
+# a third party's.
+_SELF_SPEAKER_LABELS = frozenset({"self", "me", "assistant", "synt", "synth", "bot"})
+
+
 def _short_iso_date(value: Any) -> str:
     """Return the ``YYYY-MM-DD`` part of an ISO timestamp, or ""."""
 
@@ -757,14 +764,22 @@ def _short_iso_date(value: Any) -> str:
 
 
 def _label_stored_memory(entry: dict, body: str) -> str:
-    """Prefix a stored-memory hit with where and when it came from.
+    """Prefix a stored-memory hit with where, when and WHO it came from.
 
     Hits from the ``memories`` / ``ai_diary`` / ``chat_history`` tiers arrive as
-    dicts, and rendering only their text dropped the source and the timestamp, so
-    a raw line lifted from another conversation reached the prompt looking exactly
-    like a remembered fact: no date, no provenance, and nothing to say it was not
-    the model's own recollection. SOUL recall entries carry their own wrapper,
-    which is what made the unwrapped ones stand out.
+    dicts, and rendering only their text dropped the source, the timestamp and
+    the speaker, so a raw line lifted from another conversation reached the prompt
+    looking exactly like a remembered fact: no date, no provenance, and nothing to
+    say it was not the model's own recollection. SOUL recall entries carry their own
+    wrapper, which is what made the unwrapped ones stand out.
+
+    The speaker matters most on the chat-history tier, which replays raw lines
+    from any conversation: "picks the little wifey up like a princess" is the
+    human's own act, and handed over WITHOUT a speaker it reads as the synth's
+    memory of having done it. Measured live (2026-09-23, trace 11b67827): two of
+    the three raw chat lines in one turn's block were the human's and 2B's words
+    rendered as the synth's own recollections, and the reply that turn addressed
+    the human as "wife" — the role those lines put in its own voice.
     """
 
     source = str(entry.get("source") or "").strip()
@@ -775,6 +790,13 @@ def _label_stored_memory(entry: dict, body: str) -> str:
     chat = str(entry.get("interface_path") or "").strip()
     if chat:
         qualifiers.insert(0, chat)
+    speaker = " ".join(str(entry.get("speaker") or "").split())
+    if speaker:
+        qualifiers.append(
+            "your own line"
+            if speaker.casefold() in _SELF_SPEAKER_LABELS
+            else f"said by {speaker}"
+        )
 
     prefix = "Recalled memory"
     when = _short_iso_date(entry.get("timestamp"))
@@ -914,6 +936,35 @@ def _build_soul_user_profile_prefix(context_section: dict[str, Any]) -> str:
     if any(marker in text for marker in _DSP_EMPTY_MARKERS):
         return ""
     return "[About the person you're talking to]\n" + text + "\n"
+
+
+def _build_speaker_declaration_prefix() -> str:
+    """Build the who-is-who block for an autonomous (Grillo beat) turn.
+
+    A beat's standing profile is suppressed on purpose (see ``build_json_prompt``:
+    a stale profile fact was once answered as the current ask), which left NOTHING
+    in the prompt saying who the human is — while the beat's chat snippets carry
+    only the human's own first-person lines (the persona's own lines are dropped
+    from the snippet pool so a small model cannot talk to itself). Measured live
+    (trace 3499288d, 2026-09-23 10:37Z): the observer beat's outgoing message to
+    the DM was written in the HUMAN's voice and addressed him as "wife", while the
+    same turn's diary (internal) referred to him as "him" — the role flip the user
+    reported. The deployment's own speaker declaration
+    (``SOUL_SPEAKER_IDENTITIES``, the same text the DSP/memcell extractors get) is
+    authoritative and identity-only: it names people and never asks for anything,
+    so it is safe exactly where the standing profile is not. Emits nothing when
+    the deployment declared nobody, keeping the previous behaviour.
+    """
+    try:
+        declared = str(
+            config_registry.get_value("SOUL_SPEAKER_IDENTITIES", "", value_type=str)
+            or ""
+        ).strip()
+    except Exception:
+        return ""
+    if not declared:
+        return ""
+    return "[Who is who]\n" + declared + "\n"
 
 
 def _build_soul_turn_delta_prefix(context_section: dict[str, Any]) -> str:
@@ -2142,24 +2193,27 @@ def _assemble_prompt_request(  # noqa: PLR0913
     # DSP extractor turns roleplay/status speech into a "user profile", which
     # pollutes every turn on small models. Re-enable only when a clean,
     # LLM-compiled profile is available.
+    # A Grillo beat — internal OR outbound (observer/reminder) — is an
+    # autonomous turn, not a human addressing Synth: routing metadata decides
+    # (beat_type, grillo_beat flag, grillo* interface_path), never message text.
+    # Computed here rather than inside the DSP gate below, because the
+    # who-is-who block for autonomous turns must not depend on that toggle.
+    _is_grillo_beat_turn = (
+        is_outbound_beat(beat_type)
+        or bool(getattr(message, "grillo_beat", False))
+        or (interface_path and str(interface_path).startswith("grillo"))
+    )
+
     _soul_dsp_prefix = ""
     if config_registry.get_value("SOUL_DSP_INJECT_ENABLED", 0, value_type=int):
         try:
-            # A Grillo beat — internal OR outbound (observer/reminder) — is an
-            # autonomous turn, not a human addressing Synth. There is no "person
-            # you're talking to" in that moment, so injecting the standing DSP
-            # makes the model treat a stale profile line as the current user's
-            # ask (observed live: an observer beat answered "User wants to try
-            # setting a minecraft goal from here" — a 3-day-old profile fact —
-            # as if the trainer had just requested it, sending an unsolicited
-            # outreach + goal_set). Suppress it structurally via routing metadata
-            # (beat_type, grillo_beat flag, grillo* interface_path), never
-            # message text.
-            _is_grillo_beat_turn = (
-                is_outbound_beat(beat_type)
-                or bool(getattr(message, "grillo_beat", False))
-                or (interface_path and str(interface_path).startswith("grillo"))
-            )
+            # A beat is an autonomous turn, not a human addressing Synth. There
+            # is no "person you're talking to" in that moment, so injecting the
+            # standing DSP makes the model treat a stale profile line as the
+            # current user's ask (observed live: an observer beat answered "User
+            # wants to try setting a minecraft goal from here" — a 3-day-old
+            # profile fact — as if the trainer had just requested it, sending an
+            # unsolicited outreach + goal_set). Suppress it structurally.
             if not _is_grillo_beat_turn:
                 # On Rift Vessel turns the standing "About the person you're
                 # talking to" profile is compiled from non-world chats and never
@@ -2179,10 +2233,20 @@ def _assemble_prompt_request(  # noqa: PLR0913
         except Exception:
             _soul_dsp_prefix = ""
 
+    # ── Who-is-who on autonomous turns ───────────────────────────────────────
+    # A beat carries no "person you're talking to" (suppressed above), and its
+    # chat snippets hold only the human's own lines, so without the deployment's
+    # speaker declaration the beat has nothing telling it who the people in the
+    # conversation are — and writes its outreach in the human's voice (trace
+    # 3499288d: the observer beat addressed the human as "wife").
+    _soul_identity_prefix = (
+        _build_speaker_declaration_prefix() if _is_grillo_beat_turn else ""
+    )
+
     # ── Determine mode ───────────────────────────────────────────────────────
     mode: str = "grillo" if is_grillo_internal else "chat"
 
-    _soul_user_prefix = f"{_soul_dsp_prefix}{_soul_delta}"
+    _soul_user_prefix = f"{_soul_identity_prefix}{_soul_dsp_prefix}{_soul_delta}"
 
     _combined_prefix = _soul_user_prefix + _reply_quote_prefix
 

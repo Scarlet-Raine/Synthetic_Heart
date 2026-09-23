@@ -320,6 +320,12 @@ class _SessionState:
 _SOUL_RECALL_LIMIT = 5
 _SOUL_RECALL_CANDIDATE_LIMIT = 24
 _SOUL_CONSOLIDATE_COOLDOWN_SECONDS = 900
+# How far before a buffer's first line a compile looks in `chat_history_cache`.
+# The transcript is trimmed to that line's own row, so the slack only has to
+# cover the moment between a message arriving and the injection that buffers it
+# (the two can land on either side of a clock tick, and the row is written by
+# the interface, not by us).
+_SOUL_COMPILE_TRANSCRIPT_LOOKBACK_SECONDS = 1800
 # A cell's retrieval count is evidence of usefulness, so it must not be inflated
 # by the several prompt builds a single turn performs (recon, main reply,
 # situational extractor, Grillo beats): live cells reached counts of 70 and 164
@@ -473,6 +479,10 @@ class SoulPlugin(PluginBase):
             curator=self._build_memcell_curator(),
         )
         self._buffers: dict[str, list[str]] = {}
+        # When the current (not yet compiled) buffer of an interface started.
+        # A compile reads the cached conversation from this moment on, so the
+        # window holds exactly what the buffer holds — plus the other side.
+        self._buffer_started: dict[str, datetime] = {}
         self._sessions: dict[str, _SessionState] = {}
         self._retrieval_bump_at: dict[str, float] = {}
         # When each cell was last injected into a prompt, used to rotate the
@@ -1025,9 +1035,12 @@ class SoulPlugin(PluginBase):
         # memcells — in-character fiction is not a durable event record.
         from core.soul.roleplay import strip_roleplay_lines
 
-        transcript = strip_roleplay_lines("\n".join(lines))
+        transcript = strip_roleplay_lines(
+            await self._compile_transcript(interface_path, lines)
+        )
         if not transcript.strip():
             self._buffers[interface_path] = []
+            self._buffer_started.pop(interface_path, None)
             return 0
 
         safe_session_id = self._normalize_session_id(interface_path)
@@ -1040,11 +1053,106 @@ class SoulPlugin(PluginBase):
         consolidated = await self._maybe_consolidate(force=force_consolidate)
 
         self._buffers[interface_path] = []
+        self._buffer_started.pop(interface_path, None)
         log_info(
             f"[soul_plugin] Compiled {len(created)} memcells for {interface_path} "
             f"(consolidated {consolidated} scene(s))"
         )
         return len(created)
+
+    async def _compile_transcript(self, interface_path: str, lines: list[str]) -> str:
+        """Both sides of the conversation, or the buffered lines when they are all
+        the cache has.
+
+        ``self._buffers`` is fed by the INCOMING path only (``get_static_injection``
+        is its sole writer), so a compile distilled from it alone saw the human
+        talking into a void: measured live 2026-09-23, the 12:12 compile extracted
+        three ``Scar:`` lines while the persona's own 12:07/12:05/12:02 replies sat
+        in ``chat_history_cache``, and the cells it produced filed the persona's own
+        act as the user's ("The user shared a message from a woman they call their
+        mother"). The extractor is asked to say who did or said what, which a
+        one-sided transcript cannot answer.
+
+        So the cached conversation from the moment the buffer STARTED is preferred:
+        it holds the same lines the buffer holds, plus the persona's own lines,
+        ordered by time and labelled by the same speaker rule the DSP transcript
+        uses. The buffer remains the fallback for an interface that does not write
+        the cache (or a cache read that fails), and the cache is only trusted when
+        it actually covers every buffered line — a partial window must not silently
+        drop what the buffer holds.
+        """
+        cached = await self._cached_compile_lines(interface_path, lines)
+        if cached and self._cache_covers_buffer(cached, lines):
+            return "\n".join(cached)
+        return "\n".join(lines)
+
+    async def _cached_compile_lines(
+        self, interface_path: str, lines: list[str]
+    ) -> list[str]:
+        """The cached conversation for this interface, from the first buffered line.
+
+        The window is anchored at the buffer start with a short backward grace (a
+        cache row can be written a moment before the injection that buffers the
+        line), and then TRIMMED to the first buffered line's own row: everything
+        before it belongs to a compile that already ran, and re-feeding it would
+        duplicate cells.
+        """
+        started = self._buffer_started.get(interface_path)
+        if started is None:
+            return []
+        cutoff = started - timedelta(seconds=_SOUL_COMPILE_TRANSCRIPT_LOOKBACK_SECONDS)
+        try:
+            async with get_conn_ctx() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        SELECT sender_name, sender_id, message_text, created_at
+                        FROM chat_history_cache
+                        WHERE created_at >= %s AND interface_path = %s
+                        ORDER BY created_at ASC
+                        LIMIT 500
+                        """,
+                        (cutoff, interface_path),
+                    )
+                    rows = await cur.fetchall()
+        except Exception as exc:
+            log_debug(
+                f"[soul_plugin] Compile transcript fell back to the buffer: {exc}"
+            )
+            return []
+
+        parts: list[str] = []
+        for row in rows:
+            if not row or not row[2]:
+                continue
+            speaker = self._transcript_speaker_label(str(row[0] or row[1] or "user"))
+            parts.append(f"{speaker}: {' '.join(str(row[2]).split())}")
+
+        if lines:
+            first = self._buffer_body(lines[0])
+            if first:
+                for index, part in enumerate(parts):
+                    if first in " ".join(part.split()).casefold():
+                        return parts[index:]
+        return parts
+
+    @staticmethod
+    def _buffer_body(line: str) -> str:
+        """One buffered line's message text, without its speaker label."""
+        head, sep, tail = str(line or "").partition(": ")
+        return " ".join((tail if sep else head).split()).casefold()
+
+    @classmethod
+    def _cache_covers_buffer(cls, cached: list[str], lines: list[str]) -> bool:
+        """Whether every buffered line is present in the cached transcript."""
+        bodies = [" ".join(line.split()).casefold() for line in cached]
+        for line in lines:
+            wanted = cls._buffer_body(line)
+            if not wanted:
+                continue
+            if not any(wanted in body or body.endswith(wanted) for body in bodies):
+                return False
+        return True
 
     async def _maybe_consolidate(self, *, force: bool = False) -> int:
         now = datetime.now(timezone.utc)
@@ -1259,6 +1367,11 @@ class SoulPlugin(PluginBase):
 
     def _append_buffer(self, interface_path: str, text: str) -> None:
         self._buffers.setdefault(interface_path, []).append(text.strip())
+        # Anchor the compile window at the FIRST line of this buffer: the cached
+        # conversation from here on is what a compile distils (see
+        # `_compile_transcript`), and the previous window has already been both
+        # compiled and cleared.
+        self._buffer_started.setdefault(interface_path, datetime.now(timezone.utc))
         # Keep bounded memory per interface.
         if len(self._buffers[interface_path]) > 200:
             self._buffers[interface_path] = self._buffers[interface_path][-200:]

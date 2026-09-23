@@ -1246,7 +1246,11 @@ def test_prompt_request_attaches_for_grillo_observer_with_string_message_id(
 
     assert "__prompt_request" in result
     pr = result["__prompt_request"]
-    assert pr.current_text == "[G.R.I.L.L.O. CHAT OBSERVER] check in"
+    # The observer's own text is the LAST thing in the user turn. The route may
+    # prepend the deployment's who-is-who declaration ahead of it (this checkout
+    # has one configured), so the block itself is asserted in
+    # test_grillo_beat_carries_the_who_is_who_declaration, not by exact match here.
+    assert pr.current_text.endswith("[G.R.I.L.L.O. CHAT OBSERVER] check in")
     assert pr.runtime_ctx.interface_path == "telegram_bot/123456"
     assert pr.runtime_ctx.message_id is None
 
@@ -1646,3 +1650,123 @@ class TestHistoryToTurns:
         assert turns[0].role == "user"
         assert turns[0].content == "First part"
         assert turns[1].content == "Second part"
+
+
+def test_grillo_beat_carries_the_who_is_who_declaration(monkeypatch) -> None:
+    """An autonomous beat must be told who the people in the chat are.
+
+    A beat's standing profile is suppressed on purpose (a stale profile fact was
+    once answered as the current ask) and its snippet pool keeps only the human's
+    own lines, so nothing in the prompt said who the human was. Live trace
+    3499288d (2026-09-23 10:37Z): the observer beat's outgoing message to the DM
+    was written in the HUMAN's voice and addressed him as "wife", while the same
+    turn's diary referred to him as "him". The deployment's speaker declaration
+    is identity-only, so it is safe where the standing profile is not.
+    """
+
+    async def dummy_gather(message, ctx):
+        return {}
+
+    monkeypatch.setattr("core.action_parser.gather_static_injections", dummy_gather)
+
+    declared = (
+        "Scar (also called Scarlet) - he/him, the human, my husband, his lines "
+        "are labelled 'Scar'; 2D (called Dee) - she/her, the persona, me, my own "
+        "lines are labelled 'self'"
+    )
+
+    class _FakeRegistry:
+        def get_value(self, key, default=None, **kwargs):
+            if key == "SOUL_SPEAKER_IDENTITIES":
+                return declared
+            return default
+
+    monkeypatch.setattr("core.prompt_engine.config_registry", _FakeRegistry())
+
+    base = dict(
+        chat_id=-1,
+        text="[G.R.I.L.L.O. CHAT OBSERVER] snippets...",
+        message_id=0,
+        from_user=SimpleNamespace(id=-1, username="grillo", full_name="G.R.I.L.L.O."),
+        date=datetime.now(timezone.utc),
+    )
+    observer_msg = SimpleNamespace(
+        **base,
+        interface_path="grillo/-1",
+        chat=SimpleNamespace(id=-1, type="internal", title="t"),
+        grillo_beat=True,
+        beat_type="observer",
+    )
+
+    result = asyncio.run(
+        build_json_prompt(
+            observer_msg,
+            {"grillo_beat": True, "beat_type": "observer"},
+            interface_name="grillo",
+        )
+    )
+
+    pr = result.get("__prompt_request")
+    current = getattr(pr, "current_text", "")
+    assert current.startswith("[Who is who]\n" + declared + "\n")
+
+    # A human turn needs no decoration: it carries the standing profile instead.
+    chat_msg = SimpleNamespace(
+        chat_id=1,
+        text="hello",
+        message_id=1,
+        from_user=SimpleNamespace(full_name="user", username="user"),
+        date=datetime.now(timezone.utc),
+        interface_path="telegram/chat/12345",
+        chat=SimpleNamespace(
+            id="telegram/chat/12345",
+            type="telegram",
+            title="t",
+            username=None,
+            first_name=None,
+            human_count=1,
+        ),
+    )
+    chat_result = asyncio.run(
+        build_json_prompt(chat_msg, {}, interface_name="telegram_bot")
+    )
+    chat_pr = chat_result.get("__prompt_request")
+    assert "[Who is who]" not in getattr(chat_pr, "current_text", "")
+
+
+def test_grillo_beat_without_a_declaration_is_unchanged(monkeypatch) -> None:
+    """No declaration, no block: a deployment that declared nobody sees no change."""
+
+    async def dummy_gather(message, ctx):
+        return {}
+
+    monkeypatch.setattr("core.action_parser.gather_static_injections", dummy_gather)
+
+    class _FakeRegistry:
+        def get_value(self, key, default=None, **kwargs):
+            return default
+
+    monkeypatch.setattr("core.prompt_engine.config_registry", _FakeRegistry())
+
+    observer_msg = SimpleNamespace(
+        chat_id=-1,
+        text="[G.R.I.L.L.O. CHAT OBSERVER] snippets...",
+        message_id=0,
+        from_user=SimpleNamespace(id=-1, username="grillo", full_name="G.R.I.L.L.O."),
+        date=datetime.now(timezone.utc),
+        interface_path="grillo/-1",
+        chat=SimpleNamespace(id=-1, type="internal", title="t"),
+        grillo_beat=True,
+        beat_type="observer",
+    )
+
+    result = asyncio.run(
+        build_json_prompt(
+            observer_msg,
+            {"grillo_beat": True, "beat_type": "observer"},
+            interface_name="grillo",
+        )
+    )
+
+    pr = result.get("__prompt_request")
+    assert "[Who is who]" not in getattr(pr, "current_text", "")

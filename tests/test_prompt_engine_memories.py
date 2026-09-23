@@ -820,6 +820,208 @@ def test_stored_memory_label_survives_a_missing_date_and_unknown_source() -> Non
     )
 
 
+def test_stored_chat_memory_names_the_speaker_of_the_line() -> None:
+    """WHOSE words a recalled raw line holds is part of its provenance.
+
+    Live (2026-09-23, trace 11b67827): the human's own line "picks the little
+    wifey up like a princess ..." came back under ``[Relevant memories]`` with no
+    speaker, so it read as the synth's memory of having done it, and that turn's
+    reply addressed the human as "wife". The line is his; the block must say so.
+    """
+    entry = {
+        "source": "chat_history",
+        "id": 5856,
+        "timestamp": "2026-09-22T12:27:00+00:00",
+        "snippet": "picks the little wifey up like a princess and walks up to 2b",
+        "tags": [],
+        "interface_path": "telegram_bot/-5293915984",
+        "speaker": "Scar",
+    }
+
+    assert pe._humanize_context_entry(entry, kind="memories") == (
+        "Recalled memory from 2026-09-22 "
+        "(telegram_bot/-5293915984, chat history, said by Scar): "
+        "picks the little wifey up like a princess and walks up to 2b"
+    )
+
+
+def test_stored_chat_memory_marks_the_persona_own_line() -> None:
+    """The canonical "self" label is the persona talking, never a third party."""
+    entry = {
+        "source": "chat_history",
+        "id": 5985,
+        "timestamp": "2026-09-22T20:03:00+00:00",
+        "snippet": "*The screen lights up my face one last time in the dark.*",
+        "tags": [],
+        "interface_path": "telegram_bot/-5293915984",
+        "speaker": "self",
+    }
+
+    rendered = pe._humanize_context_entry(entry, kind="memories")
+
+    assert rendered == (
+        "Recalled memory from 2026-09-22 "
+        "(telegram_bot/-5293915984, chat history, your own line): "
+        "*The screen lights up my face one last time in the dark.*"
+    )
+    assert "said by self" not in rendered
+
+
+def test_stored_chat_memory_without_a_speaker_renders_as_before() -> None:
+    """A store that cannot name the speaker must not gain an invented one."""
+    rendered = pe._humanize_context_entry(
+        {
+            "source": "chat_history",
+            "timestamp": "2026-09-22T12:27:00+00:00",
+            "snippet": "a line with no speaker column",
+            "interface_path": "telegram_bot/-5293915984",
+        },
+        kind="memories",
+    )
+
+    assert rendered == (
+        "Recalled memory from 2026-09-22 "
+        "(telegram_bot/-5293915984, chat history): a line with no speaker column"
+    )
+
+
+@pytest.mark.asyncio
+async def test_chat_history_hits_carry_the_speaker_of_the_line(monkeypatch) -> None:
+    """The chat tier must ASK for the speaker; the label is useless without it."""
+    ts = datetime(2026, 9, 22, 12, 27, tzinfo=timezone.utc)
+
+    class DummyCursor:
+        def __init__(self) -> None:
+            self.queries: list[tuple[str, list[object] | None]] = []
+
+        async def execute(self, sql: str, params=None) -> None:
+            self.queries.append((sql, list(params) if params is not None else None))
+
+        async def fetchall(self):
+            sql = self.queries[-1][0]
+            if "FROM chat_history_cache WHERE" in sql:
+                return [
+                    (
+                        "chat_history",
+                        5856,
+                        ts,
+                        "picks the little wifey up like a princess",
+                        None,
+                        "telegram_bot/-5293915984",
+                        "Scar",
+                    ),
+                    (
+                        "chat_history",
+                        5985,
+                        ts,
+                        "*The screen lights up my face one last time in the dark.*",
+                        None,
+                        "telegram_bot/-5293915984",
+                        "self",
+                    ),
+                ]
+            return []
+
+        async def __aenter__(self) -> "DummyCursor":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+    class DummyConn:
+        def __init__(self) -> None:
+            self.cursor_obj = DummyCursor()
+
+        async def __aenter__(self) -> "DummyConn":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        def cursor(self) -> DummyCursor:
+            return self.cursor_obj
+
+    conn_instance = DummyConn()
+    monkeypatch.setattr(scm, "get_conn_ctx", lambda: conn_instance)
+    monkeypatch.setattr(scm, "_get_db_type", lambda: "postgres")
+
+    hits = await scm.search_memories(keywords=["wifey"], include_chat=True, limit=5)
+
+    chat_selects = [
+        sql
+        for sql, _ in conn_instance.cursor_obj.queries
+        if "FROM chat_history_cache WHERE" in sql
+    ]
+    assert chat_selects, "the raw-chat tier did not run; the test proves nothing"
+    assert all("sender_name" in sql for sql in chat_selects), (
+        "the chat tier must SELECT the speaker, or the label has nothing to render"
+    )
+
+    assert [h["speaker"] for h in hits] == ["Scar", "self"]
+    rendered = [pe._humanize_context_entry(h, kind="memories") for h in hits]
+    assert "said by Scar" in rendered[0]
+    assert "your own line" in rendered[1]
+
+
+@pytest.mark.asyncio
+async def test_chat_history_rows_without_a_speaker_column_still_render(
+    monkeypatch,
+) -> None:
+    """A deployment whose cache predates the column must not lose the tier."""
+    ts = datetime(2026, 9, 22, 12, 27, tzinfo=timezone.utc)
+
+    class DummyCursor:
+        def __init__(self) -> None:
+            self.queries: list[tuple[str, list[object] | None]] = []
+
+        async def execute(self, sql: str, params=None) -> None:
+            self.queries.append((sql, list(params) if params is not None else None))
+
+        async def fetchall(self):
+            sql = self.queries[-1][0]
+            if "FROM chat_history_cache WHERE" in sql:
+                return [
+                    (
+                        "chat_history",
+                        5856,
+                        ts,
+                        "a six-column row from an older query",
+                        None,
+                        "telegram_bot/-5293915984",
+                    )
+                ]
+            return []
+
+        async def __aenter__(self) -> "DummyCursor":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+    class DummyConn:
+        def __init__(self) -> None:
+            self.cursor_obj = DummyCursor()
+
+        async def __aenter__(self) -> "DummyConn":
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        def cursor(self) -> DummyCursor:
+            return self.cursor_obj
+
+    conn_instance = DummyConn()
+    monkeypatch.setattr(scm, "get_conn_ctx", lambda: conn_instance)
+    monkeypatch.setattr(scm, "_get_db_type", lambda: "postgres")
+
+    hits = await scm.search_memories(keywords=["wifey"], include_chat=True, limit=5)
+
+    assert len(hits) == 1
+    assert hits[0]["speaker"] == ""
+    assert "said by" not in pe._humanize_context_entry(hits[0], kind="memories")
+
+
 def test_memory_merge_key_ignores_the_row_id() -> None:
     """Two rows holding the same sentence are one memory, whatever their ids.
 
