@@ -99,8 +99,9 @@ configuration (`time_zone`) drives the clock while this plugin is connected. It 
 is unreachable - so a deployment whose `TZ` row was never moved off its `UTC` default still reads the
 family's local time. This is the same substitution idea as the weather and location blocks, applied to the
 clock itself: the anchor's time, its time-of-day label, the date, the weekday and the season are all
-computed in the house's timezone, while the `(... UTC)` half of the time string keeps showing the UTC
-equivalent.
+computed in the house's timezone. The prompt shows that time as bare `HH:MM` with no zone name and no
+UTC half (the dual local+UTC form is kept for the operator surfaces: the WebUI, the event summaries and
+the scheduled-time displays).
 
 The log names it once, when the value changes:
 
