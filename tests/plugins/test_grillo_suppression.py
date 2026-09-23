@@ -166,7 +166,7 @@ async def test_observer_no_longer_suppresses_snippets_by_last_speaker(monkeypatc
         "core.chat_history_cache.load_chat_history", fake_load_chat_history
     )
 
-    snippets = await obs._collect_recent_snippets(3)
+    snippets, own_lines = await obs._collect_recent_snippets(3)
 
     assert len(snippets) == 1
     assert "are you around?" in snippets[0]

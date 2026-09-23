@@ -16,11 +16,14 @@ async def test_observer_builds_prompt_and_collects(monkeypatch):
     monkeypatch.setattr("core.chat_update_checker.check_for_updates_once", fake_check)
 
     # Mock collect_recent_snippets to return predictable data
-    async def fake_collect(limit: int) -> list[str]:
-        return [
-            "(chat:telegram_bot/1) Hello world",
-            "(chat:telegram_bot/2) Another message",
-        ]
+    async def fake_collect(limit: int) -> tuple[list[str], list[str]]:
+        return (
+            [
+                "(chat:telegram_bot/1) Hello world",
+                "(chat:telegram_bot/2) Another message",
+            ],
+            [],
+        )
 
     monkeypatch.setattr(plugin, "_collect_recent_snippets", fake_collect)
 
@@ -69,8 +72,8 @@ async def _run_observer_with_freshness_row(monkeypatch, plugin, cnt, max_ts):
 
     monkeypatch.setattr("core.db.execute_query", fake_execute_query)
 
-    async def fake_collect(limit: int) -> list[str]:
-        return ["(chat:telegram_bot/1) a line from hours ago"]
+    async def fake_collect(limit: int) -> tuple[list[str], list[str]]:
+        return (["(chat:telegram_bot/1) a line from hours ago"], [])
 
     monkeypatch.setattr(plugin, "_collect_recent_snippets", fake_collect)
 
@@ -208,8 +211,9 @@ async def test_collect_recent_snippets_includes_sender_and_timestamp(monkeypatch
 
     monkeypatch.setattr(chat_history_cache, "load_chat_history", mock_load_chat_history)
 
-    snippets = await plugin._collect_recent_snippets(2)
+    snippets, own_lines = await plugin._collect_recent_snippets(2)
     assert isinstance(snippets, list)
+    assert isinstance(own_lines, list)
     assert len(snippets) >= 1
     # Ensure sender and (relative) age metadata are included
     assert "sender:" in snippets[0]
@@ -217,6 +221,156 @@ async def test_collect_recent_snippets_includes_sender_and_timestamp(monkeypatch
     # instead of the raw ISO timestamp (staleness must be model-visible).
     assert "|" in snippets[0]
     assert any(tok in snippets[0] for tok in ("d", "h", "m", "?"))
+    # Neither fixture line is the synth's, so nothing is offered as its own.
+    assert own_lines == []
+
+
+def _patch_history(monkeypatch, messages: list[dict]) -> None:
+    """Point the snippet collector at one chat holding ``messages``."""
+
+    async def mock_get_recent_interface_paths(n):
+        return [{"interface_path": "telegram_bot/1", "last_used": None}]
+
+    async def mock_load_chat_history(interface_path):
+        from collections import deque
+
+        return deque(messages)
+
+    import core.interface_paths as interface_paths
+    import core.chat_history_cache as chat_history_cache
+
+    monkeypatch.setattr(
+        interface_paths, "get_recent_interface_paths", mock_get_recent_interface_paths
+    )
+    monkeypatch.setattr(chat_history_cache, "load_chat_history", mock_load_chat_history)
+
+
+@pytest.mark.asyncio
+async def test_collect_recent_snippets_keeps_the_synth_own_line_as_context(
+    monkeypatch,
+):
+    """The synth's own line is context, tagged as its own and as no target.
+
+    Live 2026-09-23 (trace 3499288d): the chat-observer beat was shown only the
+    human's first-person lines, so it wrote its outreach in the HUMAN's voice and
+    addressed him as "wife" while the same turn's diary wrote "him". Its own side
+    of the conversation is now visible — labelled as its own — without ever
+    becoming something to reply to.
+    """
+    plugin = gco.GrilloChatObserverPlugin()
+    _patch_history(
+        monkeypatch,
+        [
+            {
+                "text": "ready for your dicking down my slutty wifey?",
+                "sender_name": "Scar",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+            {
+                "text": "you did not just call your wife a whore",
+                "sender_name": "self",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        ],
+    )
+
+    snippets, own_lines = await plugin._collect_recent_snippets(4)
+
+    assert any("slutty wifey" in s for s in snippets)
+    assert len(own_lines) == 1
+    own = own_lines[0]
+    assert "you did not just call your wife a whore" in own
+    # Tagged: whose line it is, and that it is not a reply target.
+    assert "sender:self" in own
+    assert "your own line" in own and "not a reply target" in own
+    # The replyable list never carries the synth's own words.
+    assert all("sender:self" not in s for s in snippets)
+
+
+@pytest.mark.asyncio
+async def test_collect_recent_snippets_reports_a_chat_where_only_the_synth_spoke(
+    monkeypatch,
+):
+    """A chat with no human line yields context and nothing to answer."""
+    plugin = gco.GrilloChatObserverPlugin()
+    _patch_history(
+        monkeypatch,
+        [
+            {
+                "text": "good night, husband",
+                "sender_name": "self",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        ],
+    )
+
+    snippets, own_lines = await plugin._collect_recent_snippets(4)
+
+    assert snippets == []
+    assert len(own_lines) == 1
+    assert "sender:self" in own_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_observer_prompt_marks_own_lines_and_keeps_them_out_of_routing(
+    monkeypatch,
+):
+    """The prompt carries the synth's own line; grillo_snippets (the routing
+    channel the guard turns into reachable paths) does not."""
+    plugin = gco.GrilloChatObserverPlugin()
+    _patch_history(
+        monkeypatch,
+        [
+            {
+                "text": "are you awake",
+                "sender_name": "Scar",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+            {
+                "text": "mmh, awake now",
+                "sender_name": "self",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        ],
+    )
+    called: dict = {}
+
+    async def fake_enqueue(
+        bot,
+        message,
+        context_memory=None,
+        interface_id=None,
+        original_message=None,
+        priority=None,
+    ):
+        called["ctx"] = context_memory
+        called["text"] = getattr(message, "text", None)
+
+    class FakeGrillo:
+        @staticmethod
+        async def create_activity_log(beat_type, prompt_text=None):
+            return 1
+
+    async def fake_check(consume=True):
+        return {"updated": True, "new_messages": [], "last_checked": ""}
+
+    monkeypatch.setattr("core.chat_update_checker.check_for_updates_once", fake_check)
+    monkeypatch.setattr("plugins.grillo.grillo_impl.GrilloPlugin", FakeGrillo)
+    monkeypatch.setattr(message_queue, "enqueue_low_priority", fake_enqueue)
+    plugin._last_run_ts = 1.0
+
+    await plugin._run_observer()
+
+    prompt = called["text"]
+    assert "mmh, awake now" in prompt
+    assert "sender:self" in prompt
+    assert "never a message to reply to" in prompt
+    assert "you never write that person's lines for them" in prompt
+    # Routing stays built from other people's lines only.
+    routing = called["ctx"]["grillo_snippets"]
+    assert routing, "the run produced no replyable snippet to check"
+    assert any("are you awake" in s for s in routing)
+    assert all("sender:self" not in s for s in routing)
 
 
 def test_relative_age_label(monkeypatch):
@@ -257,7 +411,7 @@ async def test_collect_recent_snippets_excludes_vessel_paths(monkeypatch):
         "core.chat_history_cache.load_chat_history", fake_load_chat_history
     )
 
-    snippets = await plugin._collect_recent_snippets(5)
+    snippets, own_lines = await plugin._collect_recent_snippets(5)
 
     assert loaded_paths == ["telegram_bot/123"]
     assert all("vessel/" not in snippet for snippet in snippets)
@@ -267,14 +421,15 @@ async def test_collect_recent_snippets_excludes_vessel_paths(monkeypatch):
 async def test_collect_recent_snippets_keeps_human_lines_when_synth_spoke_last(
     monkeypatch,
 ):
-    """A chat the synth has just replied to still contributes the human's line
-    as context, and the synth's own line is never surfaced.
+    """A chat the synth has just replied to still contributes the human's line,
+    and the synth's own line is offered as context rather than as a reply target.
 
     There is no chat-level "the synth spoke last, so skip the whole chat" rule
     any more: for a synth that answers everything it matched every
     conversation, which left the observer with no live context to reason
-    about. Self-reply spam stays impossible because self-authored lines are
-    filtered per message.
+    about. The synth's own line is kept (tagged as its own — a beat shown only
+    the human's side writes in the human's voice, live 2026-09-23) but never as
+    something to reply to, so self-reply spam stays impossible.
     """
     plugin = gco.GrilloChatObserverPlugin()
     now = datetime.now(timezone.utc)
@@ -307,13 +462,14 @@ async def test_collect_recent_snippets_keeps_human_lines_when_synth_spoke_last(
 
     monkeypatch.setattr(chat_history_cache, "load_chat_history", fake_load_chat_history)
 
-    snippets = await plugin._collect_recent_snippets(5)
+    snippets, own_lines = await plugin._collect_recent_snippets(5)
 
     assert len(snippets) == 1
     assert "I'm home, heading to bed" in snippets[0]
     assert "Sleep well" not in snippets[0]
 
-    # A chat holding nothing but the synth's own lines contributes no snippet.
+    # A chat holding nothing but the synth's own lines contributes no snippet to
+    # reply to — its own line is offered as context only.
     async def fake_only_self(path):
         return [
             {
@@ -324,7 +480,11 @@ async def test_collect_recent_snippets_keeps_human_lines_when_synth_spoke_last(
         ]
 
     monkeypatch.setattr(chat_history_cache, "load_chat_history", fake_only_self)
-    assert await plugin._collect_recent_snippets(5) == []
+    snippets, own_lines = await plugin._collect_recent_snippets(5)
+    assert snippets == []
+    assert len(own_lines) == 1
+    assert "Sleep well" in own_lines[0]
+    assert "sender:self" in own_lines[0]
 
 
 @pytest.mark.asyncio
@@ -339,8 +499,8 @@ async def test_observer_propose_only_flag_in_prompt(monkeypatch):
     monkeypatch.setattr("core.chat_update_checker.check_for_updates_once", fake_check)
 
     # minimal snippet
-    async def fake_collect(limit: int) -> list[str]:
-        return ["test"]
+    async def fake_collect(limit: int) -> tuple[list[str], list[str]]:
+        return (["test"], [])
 
     monkeypatch.setattr(plugin, "_collect_recent_snippets", fake_collect)
 
@@ -394,9 +554,9 @@ async def test_observer_runs_when_updates_present(monkeypatch):
     # Spy on collect and enqueue to ensure both are executed
     called = {}
 
-    async def fake_collect(limit: int) -> list[str]:
+    async def fake_collect(limit: int) -> tuple[list[str], list[str]]:
         called["collected"] = True
-        return ["test snippet"]
+        return (["test snippet"], [])
 
     monkeypatch.setattr(plugin, "_collect_recent_snippets", fake_collect)
 
@@ -458,9 +618,9 @@ async def test_observer_db_check_updates_and_advances_last_run_ts(monkeypatch):
 
     monkeypatch.setattr("core.config_manager.config_registry.set_value", fake_set_value)
 
-    async def fake_collect(limit: int) -> list[str]:
+    async def fake_collect(limit: int) -> tuple[list[str], list[str]]:
         called["collected"] = True
-        return ["(chat:telegram_bot/1) Hello"]
+        return (["(chat:telegram_bot/1) Hello"], [])
 
     monkeypatch.setattr(plugin, "_collect_recent_snippets", fake_collect)
 
@@ -530,9 +690,9 @@ async def test_observer_is_decay_driven_when_no_updates(monkeypatch):
     # Spy on collect and enqueue to confirm the proactive path runs.
     called = {}
 
-    async def fake_collect(limit: int) -> list[str]:
+    async def fake_collect(limit: int) -> tuple[list[str], list[str]]:
         called["collected"] = True
-        return ["test snippet"]
+        return (["test snippet"], [])
 
     monkeypatch.setattr(plugin, "_collect_recent_snippets", fake_collect)
 
@@ -585,8 +745,8 @@ def _patched_observer_for_decay_run(monkeypatch, plugin, targets):
 
     monkeypatch.setattr("core.chat_update_checker.check_for_updates_once", fake_check)
 
-    async def fake_collect(limit: int) -> list[str]:
-        return ["test snippet"]
+    async def fake_collect(limit: int) -> tuple[list[str], list[str]]:
+        return (["test snippet"], [])
 
     monkeypatch.setattr(plugin, "_collect_recent_snippets", fake_collect)
 
@@ -595,8 +755,9 @@ def _patched_observer_for_decay_run(monkeypatch, plugin, targets):
 
     monkeypatch.setattr(plugin, "_collect_eligible_targets", fake_collect_targets)
 
-    def fake_build(fragments, eligible_targets, decay_driven):
+    def fake_build(fragments, eligible_targets, decay_driven, own_lines=None):
         called["targets"] = eligible_targets
+        called["own_lines"] = own_lines
         return ""
 
     monkeypatch.setattr(plugin, "_build_observer_prompt", fake_build)
@@ -689,6 +850,13 @@ async def test_newest_conversation_idle_still_offers_every_target(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_collect_recent_snippets_excludes_self_senders(monkeypatch):
+    """The synth's own message is not offered as something to reply to.
+
+    It is still collected — as ``own_lines``, tagged ``sender:self`` — because a
+    beat shown only the human's side carries on in the human's voice (live trace
+    3499288d). What must never happen is its own output arriving as a replyable
+    snippet: a small model cannot reliably tell its own line from a human turn.
+    """
     plugin = gco.GrilloChatObserverPlugin()
 
     async def fake_recent_paths(limit):
@@ -715,11 +883,14 @@ async def test_collect_recent_snippets_excludes_self_senders(monkeypatch):
         "core.chat_history_cache.load_chat_history", fake_load_chat_history
     )
 
-    snippets = await plugin._collect_recent_snippets(5)
+    snippets, own_lines = await plugin._collect_recent_snippets(5)
 
     assert len(snippets) == 1
     assert "synth's own message" not in snippets[0]
     assert "human message" in snippets[0]
+    assert len(own_lines) == 1
+    assert "synth's own message" in own_lines[0]
+    assert "not a reply target" in own_lines[0]
 
 
 @pytest.mark.asyncio
@@ -754,7 +925,7 @@ async def test_collect_recent_snippets_excludes_placeholder_paths(monkeypatch):
         "core.chat_history_cache.load_chat_history", fake_load_chat_history
     )
 
-    snippets = await plugin._collect_recent_snippets(5)
+    snippets, own_lines = await plugin._collect_recent_snippets(5)
 
     assert loaded_paths == ["telegram_bot/5208932647/123456"]
     assert len(snippets) == 1
@@ -1050,7 +1221,7 @@ async def test_snippets_skip_chats_dead_past_the_activity_window(monkeypatch):
     monkeypatch.setattr(interface_paths, "get_recent_interface_paths", fake_recent)
     monkeypatch.setattr(chat_history_cache, "load_chat_history", fake_history)
 
-    snippets = await plugin._collect_recent_snippets(9)
+    snippets, own_lines = await plugin._collect_recent_snippets(9)
 
     assert snippets
     assert any("telegram_bot/1" in s for s in snippets), snippets

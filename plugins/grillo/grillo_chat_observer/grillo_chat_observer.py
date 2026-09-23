@@ -440,7 +440,7 @@ class GrilloChatObserverPlugin:
                         f"[grillo_chat_observer] Chat update checker fallback failed; proceeding in decay-driven mode: {e2}"
                     )
 
-            fragments = await self._collect_recent_snippets(self.samples)
+            fragments, own_lines = await self._collect_recent_snippets(self.samples)
 
             # Per-path metadata for routable, anti-spam-aware proactivity.
             targets = await self._collect_eligible_targets(self.samples)
@@ -486,7 +486,7 @@ class GrilloChatObserverPlugin:
                 await self._store_passive_memories(fragments)
 
             prompt = self._build_observer_prompt(
-                fragments, eligible_targets, decay_driven
+                fragments, eligible_targets, decay_driven, own_lines=own_lines
             )
 
             # Activity log entry
@@ -636,8 +636,34 @@ class GrilloChatObserverPlugin:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
 
-    async def _collect_recent_snippets(self, limit: int) -> List[str]:
-        snippets = []
+    @classmethod
+    def _render_own_line(cls, chat_path: str, text: str, timestamp: Any) -> str:
+        """Render one of the synth's own lines as CONTEXT, never as a target.
+
+        Same tag shape as every other snippet, plus the two things a small model
+        gets wrong about its own output: that the line is its own, and that it is
+        not something to answer.
+        """
+        snippet = " ".join(str(text or "").split())
+        if len(snippet) > 300:
+            snippet = snippet[:300] + "..."
+        age_label = cls._relative_age_label(timestamp)
+        return (
+            f"(chat:{chat_path} | sender:self | {age_label} | your own line, "
+            f"not a reply target) {snippet}"
+        )
+
+    async def _collect_recent_snippets(self, limit: int) -> tuple[List[str], List[str]]:
+        """Collect ``(snippets from other people, the synth's own recent lines)``.
+
+        The two lists are deliberately separate. ``snippets`` is what the beat may
+        answer and what ``grillo_snippets`` carries into the routing guard; the
+        second is context only — what the conversation already holds from the
+        synth's side — and is rendered into the prompt without ever widening the
+        set of reachable chats.
+        """
+        snippets: List[str] = []
+        own_lines: List[str] = []
         try:
             from core.chat_history_cache import load_chat_history
             from core.interface_paths import get_recent_interface_paths
@@ -694,6 +720,7 @@ class GrilloChatObserverPlugin:
                     # reliably distinguish its own output from a human turn and
                     # will talk to itself (self-reply spam).
                     taken = 0
+                    own_line: Optional[str] = None
                     for msg in reversed(list(messages)):
                         if not isinstance(msg, dict):
                             continue
@@ -702,6 +729,21 @@ class GrilloChatObserverPlugin:
                             msg.get("sender_name") or msg.get("sender_id") or "unknown"
                         )
                         if self._is_self_sender(sender):
+                            # The synth's OWN most recent line in this chat is
+                            # kept, but as context: a beat handed only the
+                            # human's first-person lines carries on in the
+                            # human's voice (live 2026-09-23, trace 3499288d:
+                            # the DM outreach addressed the human as "wife",
+                            # while the same turn's diary wrote "him"). One per
+                            # chat, and it never enters ``grillo_snippets`` —
+                            # that list is what the routing guard turns into
+                            # reachable paths, and a chat the human never spoke
+                            # in must not become reachable through the synth's
+                            # own line.
+                            if own_line is None and text:
+                                own_line = self._render_own_line(
+                                    chat_path, text, msg.get("timestamp") or ""
+                                )
                             continue
                         timestamp = msg.get("timestamp") or ""
                         # Relative-age annotation. A bare ISO timestamp is
@@ -722,6 +764,8 @@ class GrilloChatObserverPlugin:
                             taken += 1
                         if taken >= 2 or len(snippets) >= limit:
                             break
+                    if own_line and len(own_lines) < limit:
+                        own_lines.append(own_line)
                 except Exception:
                     continue
 
@@ -736,11 +780,11 @@ class GrilloChatObserverPlugin:
                     out.append(s)
                     if len(out) >= limit:
                         break
-                return out
-            return []
+                return out, own_lines
+            return [], own_lines
         except Exception as e:
             log_error(f"[grillo_chat_observer] Error collecting snippets: {e}")
-            return []
+            return [], []
 
     async def _collect_eligible_targets(self, limit: int) -> List[Dict[str, Any]]:
         """Build per-path metadata for proactivity decisions (network-agnostic).
@@ -949,18 +993,23 @@ class GrilloChatObserverPlugin:
         snippets: List[str],
         targets: Optional[List[Dict[str, Any]]] = None,
         decay_driven: bool = False,
+        own_lines: Optional[List[str]] = None,
     ) -> str:
+        own_lines = list(own_lines or [])
         header = (
             "[G.R.I.L.L.O. CHAT OBSERVER] Below are chat snippets from across conversations. "
             "Each snippet is tagged with an 'age:' marker showing how long ago it was said. "
             "Treat older snippets as historical context, NOT as the current moment — do not "
             "continue or reply to a stale line as if it just happened. Analyze and propose any "
-            "actions that would be genuinely helpful right now."
+            "actions that would be genuinely helpful right now. "
+            "A snippet whose sender is `self` is YOUR OWN earlier line in that chat: it is there "
+            "so you can see where the conversation stands, it is what YOU said (not the other "
+            "person's words), and it is never a message to reply to."
         )
 
         body = "\n\nSnippets:\n"
-        if snippets:
-            for i, s in enumerate(snippets, 1):
+        if snippets or own_lines:
+            for i, s in enumerate(list(snippets) + own_lines, 1):
                 body += f"{i}. {s}\n"
         else:
             body += "(no fresh snippets — the network is quiet)\n"
@@ -1001,6 +1050,7 @@ class GrilloChatObserverPlugin:
         propose_clause = (
             "Think like a helpful human reading these snippets: which message(s) would you naturally reply to, and what would you say? "
             "Do NOT propose messages that are conceptually duplicate of what already appears in the snippets. "
+            "Answer as yourself, in your own voice: a snippet from someone else is what you reply to, and you never write that person's lines for them. "
             "Do NOT address or mention the WebUI or any system/internal labels (for example: 'webui' or 'system'); write as if speaking directly to the human participant(s) in the conversation."
         )
         if self.propose_only:

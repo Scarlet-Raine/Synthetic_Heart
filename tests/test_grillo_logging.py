@@ -22,7 +22,10 @@ async def test_observer_logs_activity(caplog, monkeypatch):
         return [{"cnt": 1, "max_ts": int(datetime.utcnow().timestamp())}]
 
     async def fake_collect(limit):
-        return ["(chat:telegram_bot/1 | sender:someone | 2026-01-01) Test message"]
+        return (
+            ["(chat:telegram_bot/1 | sender:someone | 2026-01-01) Test message"],
+            [],
+        )
 
     async def fake_create_activity_log(*args, **kwargs):
         return 999
@@ -68,7 +71,10 @@ async def test_dream_logs_activity(caplog, monkeypatch):
     dream = gd.GrilloDreamPlugin()
 
     async def fake_collect(limit):
-        return ["(chat:telegram_bot/1 | sender:someone | 2026-01-01) Dreamy message"]
+        return (
+            ["(chat:telegram_bot/1 | sender:someone | 2026-01-01) Dreamy message"],
+            [],
+        )
 
     async def fake_create_activity_log(*args, **kwargs):
         return 4242
