@@ -1,7 +1,8 @@
 from zoneinfo import ZoneInfo, available_timezones
 from datetime import datetime
+from typing import Any
 
-from core.logging_utils import log_warning
+from core.logging_utils import log_debug, log_info, log_warning
 from core.config_manager import config_registry
 
 # Get list of available timezones for dropdown
@@ -36,13 +37,66 @@ _PROMPT_LOCATION = config_registry.get_var(
 )
 
 
-def get_local_timezone() -> ZoneInfo:
-    """Return the local timezone defined by the TZ config variable or UTC.
+# The house's own timezone, published by an environment plugin that reads it
+# from the home itself (Home Assistant's core config carries ``time_zone``).
+#
+# While it is set it outranks the ``TZ`` config var: the household's clock is a
+# property of the house, not of this process, so a deployment whose ``TZ`` row
+# was never moved off its ``UTC`` default still reads the family's local time.
+# Empty means "nothing published" and the ``TZ`` config applies exactly as
+# before, which is also the state of any deployment without that plugin.
+_HOUSE_TZ_NAME: str = ""
 
-    Logs a warning and falls back to UTC if the variable is missing or
-    points to an invalid timezone.
+
+def set_house_timezone(name: Any) -> str:
+    """Publish (or clear) the house timezone learned from the home itself.
+
+    Returns the timezone in force afterwards. An unknown name is refused and the
+    previous value kept, so a bad publish can never move the clock.
     """
-    tz_name = str(_TZ) or "UTC"
+    global _HOUSE_TZ_NAME
+    candidate = str(name or "").strip()
+    if candidate:
+        try:
+            ZoneInfo(candidate)
+        except Exception:
+            log_warning(
+                f"Ignoring unknown house timezone '{candidate}'; keeping "
+                f"'{_HOUSE_TZ_NAME or str(_TZ) or 'UTC'}'"
+            )
+            return _HOUSE_TZ_NAME
+    if candidate != _HOUSE_TZ_NAME:
+        _HOUSE_TZ_NAME = candidate
+        if candidate:
+            log_info(
+                f"House timezone '{candidate}' now drives the clock "
+                f"(TZ config '{str(_TZ) or 'UTC'}' is the fallback)"
+            )
+        else:
+            log_info("House timezone cleared; the TZ config drives the clock")
+        # The clock moved, so the reactions registered on the TZ config (the
+        # scheduled-event recompute for events with no timezone of their own)
+        # must run exactly as they would after a TZ edit.
+        try:
+            config_registry.notify_listeners("TZ")
+        except Exception as exc:  # pragma: no cover - defensive
+            log_debug(f"House timezone listener notify skipped: {exc}")
+    return _HOUSE_TZ_NAME
+
+
+def get_house_timezone() -> str:
+    """Return the published house timezone, or ``""`` when none is known."""
+    return _HOUSE_TZ_NAME
+
+
+def get_local_timezone() -> ZoneInfo:
+    """Return the timezone the clock is read in.
+
+    Precedence: the house timezone published by an environment plugin (the home
+    itself, when it knows it), then the ``TZ`` config variable, then UTC. Logs a
+    warning and falls back to UTC when the chosen name is not a real zone.
+    """
+    tz_name = get_house_timezone() or str(_TZ) or "UTC"
     try:
         return ZoneInfo(tz_name)
     except Exception:

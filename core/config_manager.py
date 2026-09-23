@@ -1492,6 +1492,30 @@ class ConfigRegistry:
                 f"the config store could not be read: {sorted(self._deferred_keys)[:10]}"
             )
 
+    def notify_listeners(self, key: str) -> int:
+        """Notify the listeners of ONE configuration key with its current value.
+
+        Needed when a value is superseded outside the config store: the house
+        timezone published by an environment plugin moves the clock exactly like
+        a ``TZ`` edit does, and the reactions registered on ``TZ`` (the
+        scheduled-event recompute) have to run for it too. Returns how many
+        listeners were notified; an unknown key or one without listeners
+        notifies nothing.
+        """
+        definition = self._definitions.get(key)
+        if definition is None or not definition.listeners:
+            return 0
+        notified_count = 0
+        for listener in list(definition.listeners):
+            try:
+                listener(definition.value)
+                notified_count += 1
+            except Exception as exc:
+                log_warning(f"[config] Failed to notify listener for '{key}': {exc}")
+        if notified_count > 0:
+            log_debug(f"[config] Notified {notified_count} listener(s) for '{key}'")
+        return notified_count
+
     def notify_all_listeners(self) -> None:
         """
         Notify all registered listeners with current config values.

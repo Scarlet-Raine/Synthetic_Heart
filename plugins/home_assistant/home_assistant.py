@@ -382,6 +382,31 @@ _expose(
         "carrying the pinpoint. Blank keeps the coordinates."
     ),
 )
+_expose(
+    "HASS_TIMEZONE_ENABLED",
+    "House Timezone Drives The Clock",
+    True,
+    bool,
+    "bool",
+    (
+        "While HA is connected, read the clock in the timezone from Home "
+        "Assistant's own configuration. It outranks the core TZ setting, which "
+        "stays the fallback whenever HA has not been read yet or is down."
+    ),
+)
+_expose(
+    "HASS_CORE_CONFIG_TTL_SEC",
+    "House Facts Refresh (seconds)",
+    900,
+    int,
+    "number",
+    (
+        "How long HA's own configuration (house coordinates, elevation, "
+        "timezone) may be reused before it is re-read in the background, so a "
+        "change made in Home Assistant lands without a restart. 0 = only read "
+        "on connect."
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -909,6 +934,9 @@ class HomeAssistantPlugin(PluginBase):
     allow_static_injection_stale_fallback = False
     static_injection_cache_ttl_seconds = 0.0
 
+    # One listener per process for the timezone switch (start() may re-run).
+    _timezone_listener_registered: bool = False
+
     def __init__(self) -> None:
         super().__init__()
         self._client = _HAClient(self)
@@ -919,6 +947,8 @@ class HomeAssistantPlugin(PluginBase):
         self._forecast: List[Dict[str, Any]] = []
         self._forecast_at = 0.0
         self._core_config: Dict[str, Any] = {}
+        self._core_config_at: float = 0.0
+        self._core_config_task: Optional[asyncio.Task] = None
         try:
             from core.core_initializer import register_plugin
 
@@ -1322,6 +1352,36 @@ class HomeAssistantPlugin(PluginBase):
     def location_enabled(self) -> bool:
         return self.is_enabled() and _cfg_bool("HASS_LOCATION_ENABLED", True)
 
+    def timezone_enabled(self) -> bool:
+        return self.is_enabled() and _cfg_bool("HASS_TIMEZONE_ENABLED", True)
+
+    def publish_house_timezone(self) -> None:
+        """Let the house's own timezone drive the clock.
+
+        Called once HA's core config is known — it carries ``time_zone``, the
+        zone the household actually lives in. The core keeps the ``TZ`` config
+        as the fallback, so this replaces a value that is wrong for the house
+        rather than removing the clock, and a turn built before HA was ever read
+        behaves exactly as before.
+        """
+        if not self.timezone_enabled():
+            return
+        try:
+            from core.time_zone_utils import set_house_timezone
+
+            set_house_timezone(self._time_zone())
+        except Exception as exc:  # pragma: no cover - defensive
+            log_debug(f"{LOG_PREFIX} house timezone publish skipped: {exc}")
+
+    def clear_house_timezone(self) -> None:
+        """Give the clock back to the core ``TZ`` config (plugin stopped)."""
+        try:
+            from core.time_zone_utils import set_house_timezone
+
+            set_house_timezone("")
+        except Exception as exc:  # pragma: no cover - defensive
+            log_debug(f"{LOG_PREFIX} house timezone clear skipped: {exc}")
+
     def _weather_entity(self) -> str:
         configured = _cfg_str("HASS_WEATHER_ENTITY", "")
         if configured:
@@ -1384,7 +1444,9 @@ class HomeAssistantPlugin(PluginBase):
         if wind:
             wind_unit = str(attributes.get("wind_speed_unit") or "")
             bearing = _compass(attributes.get("wind_bearing"))
-            bits.append(f"wind {wind}{wind_unit}" + (f" from {bearing}" if bearing else ""))
+            bits.append(
+                f"wind {wind}{wind_unit}" + (f" from {bearing}" if bearing else "")
+            )
         line = ", ".join(bit for bit in bits if bit)
 
         sun_state = self._client.states.get("sun.sun") or {}
@@ -1483,6 +1545,34 @@ class HomeAssistantPlugin(PluginBase):
         except RuntimeError:  # pragma: no cover - no running loop
             self._forecast_task = None
 
+    def _schedule_core_config_refresh(self, force: bool = False) -> None:
+        """Re-read HA's own configuration once the cached copy has aged.
+
+        That config carries the house's coordinates, elevation and timezone, and
+        all three can change on the HA side (a corrected zone, a moved instance).
+        Nothing else re-reads them until the next reconnect, so a change made in
+        HA would otherwise only land after a restart. The read runs in the
+        background: the turn in flight keeps using the last value that landed,
+        and a failed read leaves it untouched. ``force`` skips the age check,
+        which is what the timezone switch uses.
+        """
+        if not self.is_enabled():
+            return
+        ttl = max(0, _cfg_int("HASS_CORE_CONFIG_TTL_SEC", 900))
+        if not force:
+            if ttl <= 0:
+                return
+            if self._core_config and time.monotonic() - self._core_config_at < ttl:
+                return
+        if self._core_config_task is not None and not self._core_config_task.done():
+            return
+        try:
+            self._core_config_task = asyncio.get_running_loop().create_task(
+                self._fetch_core_config()
+            )
+        except RuntimeError:  # pragma: no cover - no running loop
+            self._core_config_task = None
+
     async def _fetch_core_config(self) -> None:
         """One-shot read of HA's own configuration (house location, timezone)."""
         if not self.is_enabled():
@@ -1504,6 +1594,8 @@ class HomeAssistantPlugin(PluginBase):
                         )
                         return
                     self._core_config = await response.json()
+                    self._core_config_at = time.monotonic()
+            self.publish_house_timezone()
         except Exception as exc:
             log_debug(
                 f"{LOG_PREFIX} core config fetch failed: {type(exc).__name__} {exc}"
@@ -1566,6 +1658,10 @@ class HomeAssistantPlugin(PluginBase):
             return {}
         if self._client.states_age_sec > max_age:
             return {}
+        # The house's own facts (coordinates, elevation, timezone) age on the HA
+        # side, so keep them fresh on every live turn, independent of which
+        # blocks render below.
+        self._schedule_core_config_refresh()
 
         blocks: Dict[str, Any] = {}
         if house_allowed:
@@ -2460,9 +2556,36 @@ class HomeAssistantPlugin(PluginBase):
         the first state snapshot exist before the first prompt is built.
         """
         self._ensure_connect_task()
+        self._register_timezone_listener()
+
+    def _register_timezone_listener(self) -> None:
+        """Let *House Timezone Drives The Clock* take effect without a restart."""
+        if HomeAssistantPlugin._timezone_listener_registered:
+            return
+        try:
+            from core.config_manager import config_registry
+
+            config_registry.add_listener(
+                "HASS_TIMEZONE_ENABLED", self._on_timezone_switch
+            )
+            HomeAssistantPlugin._timezone_listener_registered = True
+        except Exception as exc:  # pragma: no cover - defensive
+            log_debug(f"{LOG_PREFIX} timezone switch listener skipped: {exc}")
+
+    def _on_timezone_switch(self, _value: object) -> None:
+        """Off hands the clock back to the TZ config; on re-reads the house's."""
+        if self.timezone_enabled():
+            # Re-read rather than re-publish the cached copy, so flipping the
+            # switch is also how a timezone changed in HA is picked up at once.
+            self._schedule_core_config_refresh(force=True)
+        else:
+            self.clear_house_timezone()
 
     def stop(self) -> None:
         """Best-effort teardown; the connection is rebuilt on demand."""
+        # The clock goes back to the core TZ config when the plugin is stopped:
+        # the house timezone is only authoritative while this plugin runs.
+        self.clear_house_timezone()
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():

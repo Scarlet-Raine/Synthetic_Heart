@@ -5,10 +5,15 @@ only visible to the model if a renderer consumes it, so this file pins: the
 blocks render on the chat and beat routes, a block supersedes the built-in
 provider whose key it replaces, and an injected key nobody renders is named
 instead of dropped silently.
+
+The standing scene note (``SCENE_NOTE``) is pinned here too: it is the one block
+that does not come from a plugin, so it has to be merged by the core and still
+render through the same table, on the same routes, as the ambient blocks.
 """
 
 from pathlib import Path
 
+from core.action_parser import _add_core_injections
 from core.prompt_engine import (
     _PLUGIN_CONTEXT_BLOCKS,
     _apply_plugin_block_supersedes,
@@ -99,3 +104,62 @@ def test_both_renderers_use_the_same_block_table():
         )
         >= 2
     )
+
+
+def test_setting_block_renders_on_chat_and_beat_routes():
+    scene = "Scar and Dee are in the same room, speaking out loud"
+    for is_grillo_internal in (False, True):
+        summary = _build_context_summary(
+            {"scene": scene, "date": "2026-09-22"},
+            is_grillo_internal=is_grillo_internal,
+        )
+        assert "[Setting]" in summary, f"missing heading (grillo={is_grillo_internal})"
+        assert scene in summary, f"missing scene text (grillo={is_grillo_internal})"
+
+
+def test_setting_block_leads_the_ambient_blocks():
+    summary = _build_context_summary(
+        {"scene": "same room", "home": "kitchen on", "home_weather": "cloudy"}
+    )
+    assert summary.index("[Setting]") < summary.index("[Home]")
+    assert summary.index("[Home]") < summary.index("[Weather]")
+
+
+def test_blank_or_missing_setting_block_adds_nothing():
+    assert "[Setting]" not in _build_context_summary({"scene": "   "})
+    assert "[Setting]" not in _build_context_summary({"scene": None})
+    assert "[Setting]" not in _build_context_summary({})
+
+
+def test_setting_block_is_declared_and_considered_rendered():
+    # The drop detector must accept the core-sourced key, so a deployment that
+    # sets SCENE_NOTE never sees it reported as an unrendered injection.
+    assert "scene" in [key for key, _heading, _legacy in _PLUGIN_CONTEXT_BLOCKS]
+    assert _unrendered_injection_keys(["scene"]) == []
+
+
+def test_core_injections_carry_the_scene_note(monkeypatch):
+    monkeypatch.setattr(
+        "core.config_manager.config_registry.get_value",
+        lambda k, d, **kwargs: (
+            "same room, speaking not typing" if k == "SCENE_NOTE" else d
+        ),
+    )
+    injections = _add_core_injections({})
+    assert injections["scene"] == "same room, speaking not typing"
+
+
+def test_core_injections_skip_a_blank_scene_note(monkeypatch):
+    monkeypatch.setattr(
+        "core.config_manager.config_registry.get_value",
+        lambda k, d, **kwargs: "   ",
+    )
+    assert "scene" not in _add_core_injections({})
+
+
+def test_core_injections_keep_the_other_keys_and_never_raise(monkeypatch):
+    def _boom(*args, **kwargs):
+        raise RuntimeError("config unavailable")
+
+    monkeypatch.setattr("core.config_manager.config_registry.get_value", _boom)
+    assert _add_core_injections({"home": "kitchen on"}) == {"home": "kitchen on"}

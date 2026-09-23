@@ -72,6 +72,7 @@ disable this plugin, and the old blocks come back exactly as they were.
 | *Home Assistant Weather Entity* | empty | Which `weather.*` entity to read; empty means the first one HA reports |
 | *Weather Forecast Hours* | 6 | Hours of hourly forecast appended (0 = none) |
 | *Inject House Location From HA* | on | House coordinates, country, timezone and elevation |
+| *House Timezone Drives The Clock* | on | Read the clock in HA's own timezone (outranks the core `TZ` setting) |
 
 The weather line carries the condition, temperature, humidity, cloud cover, wind with direction, pressure
 and UV index, plus today's sunrise/sunset and the forecast. The forecast comes from HA's
@@ -89,6 +90,33 @@ substitution on each turn:
 [action_parser] plugin block 'home_weather' supersedes 'weather' at gather time
 [action_parser] plugin block 'home_location' supersedes 'location' at gather time
 ```
+
+## The clock
+
+The household's clock is a property of the house, so the timezone Home Assistant reports in its own
+configuration (`time_zone`) drives the clock while this plugin is connected. It outranks the core
+**Timezone** (`TZ`) setting, which stays the fallback for the turns before HA has been read and whenever HA
+is unreachable - so a deployment whose `TZ` row was never moved off its `UTC` default still reads the
+family's local time. This is the same substitution idea as the weather and location blocks, applied to the
+clock itself: the anchor's time, its time-of-day label, the date, the weekday and the season are all
+computed in the house's timezone, while the `(... UTC)` half of the time string keeps showing the UTC
+equivalent.
+
+The log names it once, when the value changes:
+
+```
+House timezone 'Europe/Budapest' now drives the clock (TZ config 'UTC' is the fallback)
+```
+
+*House Timezone Drives The Clock* off (or this plugin disabled) hands the clock back to the core `TZ`
+setting, and either change re-runs the same scheduled-event recompute that a `TZ` edit triggers, so events
+with no timezone of their own keep firing at the intended wall-clock time.
+
+HA's own configuration (coordinates, elevation, timezone) is read when the plugin connects and then
+re-read in the background once it is older than *House Facts Refresh (seconds)* (default 900, `0` = read
+only on connect), so a timezone or location corrected in Home Assistant lands on its own without a
+restart. Flipping the timezone switch off and on forces that re-read immediately. Until the new value
+lands, the last one read stays in force.
 
 ## Actions
 

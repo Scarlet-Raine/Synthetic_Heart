@@ -70,6 +70,26 @@ Additional context items may include:
 - plugin-provided injections from `core.action_parser.gather_static_injections`.
 For a deeper developer view of how memory search results are gathered and
 managed, see `docs/memory_search_and_management.rst`.
+
+Standing scene note
+-------------------
+
+The one context block that does not come from a plugin is the **standing scene
+note** (`SCENE_NOTE`). A chat channel says nothing about where the participants
+physically are, so the transcript alone invites the model to invent a medium (a
+phone in hand). The note states the physical setting once, in config, and is
+merged into the injection dict by `core.action_parser._add_core_injections`. It
+renders as the `[Setting]` block, listed first in
+`core.prompt_engine._PLUGIN_CONTEXT_BLOCKS`, so it precedes the ambient blocks
+(`[Home]`, `[Weather]`, `[House]`).
+
+- An unset or blank `SCENE_NOTE` adds nothing, and a failure to read it can never
+  remove the other injections.
+- It rides every route that renders the block table, the same way the emotion
+  state does, because it is not tied to a plugin being enabled.
+- It is deployment configuration: edit it in the WebUI config (the
+  `prompt_engine` component) or with `POST /api/config`.
+
 Persona handling
 ----------------
 

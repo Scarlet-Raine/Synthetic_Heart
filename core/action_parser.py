@@ -2985,6 +2985,29 @@ def get_action_plugin_instructions() -> dict[str, Any]:
     return instructions
 
 
+def _add_core_injections(injections: dict[str, Any]) -> dict[str, Any]:
+    """Add the core-sourced prompt blocks that no plugin owns.
+
+    The standing scene note (``SCENE_NOTE``) is deployment configuration rather
+    than a plugin's data, so it cannot arrive through ``get_static_injection()``
+    and must be merged here. It renders beside the ambient blocks (declared in
+    ``core.prompt_engine._PLUGIN_CONTEXT_BLOCKS``) on every route, which is what
+    makes it carry across turns the way the emotion state does.
+
+    An unset or blank value adds nothing, and any failure is contained so a bad
+    config can never cost the turn the rest of the injection dict.
+    """
+    try:
+        scene = str(
+            config_registry.get_value("SCENE_NOTE", "", value_type=str) or ""
+        ).strip()
+        if scene:
+            injections["scene"] = scene
+    except Exception as exc:  # pragma: no cover - config safety net
+        log_debug(f"[action_parser] core static injection skipped: {exc}")
+    return injections
+
+
 async def gather_static_injections(message=None, context_memory=None):
     """Gathers static contextual data from all plugins that support 'static_inject'.
 
@@ -3103,8 +3126,10 @@ async def gather_static_injections(message=None, context_memory=None):
             log_error(f"[action_parser] Error preparing injection for {plugin}: {e}")
 
     if not tasks:
-        # Return empty dict if no injections
-        return {}
+        # No plugin supplies an injection this turn; the core-sourced blocks
+        # (the standing scene note) still ride, because they do not depend on a
+        # plugin being enabled.
+        return _add_core_injections({})
 
     log_debug(
         f"[action_parser] Running {len(tasks)} injections in parallel: {plugin_names}"
@@ -3139,6 +3164,10 @@ async def gather_static_injections(message=None, context_memory=None):
                 )
     except Exception as _super_exc:  # pragma: no cover - diagnostic only
         log_debug(f"[action_parser] plugin block supersede skipped: {_super_exc}")
+
+    # Core-sourced blocks last, so the logged key list below is the truth about
+    # what this turn carries.
+    injections = _add_core_injections(injections)
 
     log_info(
         f"[action_parser] 📊 gather_static_injections() returning {len(injections)} keys: {list(injections.keys())}"

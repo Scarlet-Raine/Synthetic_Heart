@@ -139,6 +139,26 @@ USE_PERSONA_IN_SYSTEM_PROMPTS = config_registry.get_var(
     value_type=bool,
 )
 
+# Standing scene note — the physical setting of the household stated once and
+# carried into every prompt as the [Setting] block (see _PLUGIN_CONTEXT_BLOCKS).
+# It exists because the transcript alone cannot say where everyone is or how the
+# conversation is physically happening, so the model invents a medium (a phone)
+# when the channel is a chat app. Kept in config so the setting can be restated
+# without a code change. Blank disables the block entirely.
+SCENE_NOTE = config_registry.get_var(
+    "SCENE_NOTE",
+    "",
+    label="Standing scene note",
+    description=(
+        "Persistent statement of where everyone physically is and how the "
+        "conversation is happening (same room, speaking aloud, ...). Rendered "
+        "as the [Setting] block on every ordinary prompt. Blank disables it."
+    ),
+    group="core",
+    component="prompt_engine",
+    value_type=str,
+)
+
 
 def minify_actions_block(
     available_actions: dict,
@@ -1029,7 +1049,15 @@ def _build_current_turn_anchor(context_section: dict[str, Any]) -> str:
 # ``upcoming_events`` (plugins/event_plugin) and ``facial_expression_guidance``.
 # Add a plugin's key here when its block must appear in the ordinary chat and
 # beat prompt, and pin it in tests/test_plugin_context_blocks.py.
+#
+# ``scene`` is not plugin data: it is the deployment's standing scene note
+# (``SCENE_NOTE``), added to the injection dict by
+# ``core.action_parser._add_core_injections`` — the physical setting of a
+# household is configuration, not a sensor reading. It is listed first so the
+# model meets the setting before the ambient blocks, and it renders on every
+# route that consumes this table.
 _PLUGIN_CONTEXT_BLOCKS: tuple[tuple[str, str, str | None], ...] = (
+    ("scene", "[Setting]", None),
     ("home", "[Home]", None),
     ("home_weather", "[Weather]", "weather"),
     ("home_location", "[House]", "location"),

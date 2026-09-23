@@ -55,6 +55,25 @@ Configuration
 -------------
 - ``INCLUDE_LOCAL_TIME_IN_PROMPTS`` (component: ``prompt_engine``) — boolean, default ``True``. When ``False``, the fields above are not included.
 
+Where the clock's timezone comes from
+-------------------------------------
+Precedence, highest first:
+
+1. ``session_meta.timezone`` for the interface the turn belongs to, when set.
+2. The **house timezone** published by an environment plugin that reads it from
+   the home itself: the Home Assistant plugin publishes the ``time_zone`` from
+   its own configuration while it is connected (*House Timezone Drives The
+   Clock*, on by default). A deployment whose ``TZ`` row still holds the default
+   ``UTC`` therefore reads the household's local time, and the house keeps being
+   the source of truth when the machine is moved between timezones.
+3. The ``TZ`` config variable (component: ``core``).
+4. UTC, when nothing valid is available.
+
+A publish — or a change of (2), including handing the clock back when the plugin
+is stopped or its switch is turned off — also notifies the ``TZ`` listeners, so
+the scheduled-event recompute for events with no timezone of their own runs
+exactly as it does after a ``TZ`` edit.
+
 Privacy & Implementation Notes
 ------------------------------
 - The prompt's clock is the household's own time, as bare ``HH:MM``: the dual local+UTC
@@ -64,7 +83,7 @@ Privacy & Implementation Notes
   bare clock as ``10:52 PM``.
 - A location is never derived from a timezone that names no place: ``UTC`` (and the ``Etc/*``
   family) yields no location rather than a place called "UTC".
-- No timezone names, offsets, or UTC timestamps are included in prompts by default to avoid leaking location information. If the session sets a timezone in session meta (``session_meta`` key ``timezone``), it is used to compute the local time, otherwise the server TZ configured via the project is used.
+- No timezone names, offsets, or UTC timestamps are included in prompts by default to avoid leaking location information. If the session sets a timezone in session meta (``session_meta`` key ``timezone``), it is used to compute the local time, otherwise the timezone published by the house (see above) or the server TZ configured via the project is used.
 - The mapping of labels is deterministic and test-covered. Service operators can disable the feature via the config var for privacy-sensitive deployments.
 - ``build_json_prompt()`` is now a deprecated alias kept for compatibility.
 
