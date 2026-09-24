@@ -134,6 +134,66 @@ def test_no_redirect_when_an_endpoint_is_already_configured(
     assert _pending() is False
 
 
+def test_a_local_request_on_a_fresh_install_is_offered_the_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The positive case, which is the entire point of the gate.
+
+    It was never covered: every test here asserted a decline, so a gate that
+    declined in every situation looked fully tested.
+    """
+
+    class _EmptyRegistry:
+        async def list_endpoints(self, enabled_only: bool = False):
+            return []
+
+    monkeypatch.setattr(
+        webui_module.SynthWebUIInterface, "_setup_completed", lambda self: False
+    )
+    monkeypatch.setattr(
+        "core.external_endpoints.registry.get_external_endpoint_registry",
+        lambda: _EmptyRegistry(),
+    )
+    assert _pending() is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("False", False),
+        ("false", False),
+        ("0", False),
+        ("no", False),
+        ("", False),
+        (None, False),
+        (False, False),
+        ("True", True),
+        ("true", True),
+        ("1", True),
+        (True, True),
+    ],
+)
+def test_a_textual_flag_is_read_as_a_boolean(raw: object, expected: bool) -> None:
+    """`bool("False")` is True, which would retire the page forever, silently."""
+    assert webui_module.as_flag(raw) is expected
+
+
+def test_only_a_local_browser_is_ever_redirected() -> None:
+    """A remote browser must not be sent to a page about this machine."""
+    stub = _stub()
+    for host in ("127.0.0.1", "::1", "localhost"):
+        request = types.SimpleNamespace(client=types.SimpleNamespace(host=host))
+        assert webui_module.SynthWebUIInterface._is_local_client(stub, request) is True
+    for host in ("192.168.1.50", "10.0.0.7", ""):
+        request = types.SimpleNamespace(client=types.SimpleNamespace(host=host))
+        assert webui_module.SynthWebUIInterface._is_local_client(stub, request) is False
+    # A request with no client at all must decline rather than raise.
+    assert (
+        webui_module.SynthWebUIInterface._is_local_client(stub, types.SimpleNamespace())
+        is False
+    )
+
+
 def test_no_redirect_when_the_registry_cannot_be_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

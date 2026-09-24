@@ -94,6 +94,24 @@ register_exposed_var(
     advanced=True,
 )
 LOG_PREFIX = "[synth_webui]"
+
+#: Hosts that count as "this machine". The first-run setup page is only ever
+#: offered to a local browser: redirecting a remote one would be confusing, and a
+#: fresh install is configured at the machine it was installed on.
+LOCAL_CLIENT_HOSTS = ("127.0.0.1", "::1", "localhost")
+
+
+def as_flag(raw: object) -> bool:
+    """Read a configuration value as a boolean, whatever type it arrives as.
+
+    The config table can hand back text, and ``bool("False")`` is ``True`` - which
+    would retire the setup page permanently on a brand-new install, silently.
+    """
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return bool(raw)
+
+
 WEBUI_LOG = "webui"  # Log file name for WebUI (logs/webui.log)
 # Internal chat/component identifier used when interacting with the LLM and
 # action state manager. This must remain "webui" for compatibility with
@@ -2313,22 +2331,21 @@ class SynthWebUIInterface:
 </html>
 """
 
+    def _is_local_client(self, request: Request) -> bool:
+        """Whether *request* came from this machine."""
+        try:
+            host = str(getattr(getattr(request, "client", None), "host", "") or "")
+        except Exception:
+            host = ""
+        return host in LOCAL_CLIENT_HOSTS
+
     async def index(self, request: Request):
         log_info(f"{LOG_PREFIX} Index route called")
         try:
             # A brand-new native install lands on the setup page instead of an
             # empty interface. Local requests only: a remote browser must never
             # be redirected, and an install with any endpoint configured never is.
-            try:
-                client_host = str(
-                    getattr(getattr(request, "client", None), "host", "") or ""
-                )
-            except Exception:
-                client_host = ""
-            if (
-                client_host in ("127.0.0.1", "::1", "localhost")
-                and await self._first_run_pending()
-            ):
+            if self._is_local_client(request) and await self._first_run_pending():
                 log_info(f"{LOG_PREFIX} first run detected; redirecting to /setup")
                 return RedirectResponse(url="/setup", status_code=307)
 
@@ -3102,22 +3119,25 @@ class SynthWebUIInterface:
     def _setup_completed(self) -> bool:
         """Whether the first-run page has been dealt with."""
         try:
-            return bool(
-                config_registry.get_var(
-                    "SETUP_COMPLETED",
-                    False,
-                    label="Setup page completed",
-                    description=(
-                        "Set once the first-run setup page has been finished or "
-                        "skipped. While it is false the WebUI root redirects to "
-                        "/setup when no external endpoint is configured yet."
-                    ),
-                    component="synth_webui",
-                    hidden=True,
-                )
+            raw = config_registry.get_var(
+                "SETUP_COMPLETED",
+                False,
+                label="Setup page completed",
+                description=(
+                    "Set once the first-run setup page has been finished or "
+                    "skipped. While it is false the WebUI root redirects to "
+                    "/setup when no external endpoint is configured yet."
+                ),
+                component="synth_webui",
+                hidden=True,
             )
-        except Exception:
+        except Exception as exc:
+            log_info(
+                f"{LOG_PREFIX} could not read SETUP_COMPLETED ({exc}); "
+                "the setup page will not be offered"
+            )
             return True  # never nag when we cannot read the flag
+        return as_flag(raw)
 
     async def _first_run_pending(self) -> bool:
         """True only when this install looks brand new.
@@ -3125,9 +3145,12 @@ class SynthWebUIInterface:
         Any configured external endpoint counts as "already set up": someone who
         has been running SyntH for months must never be pushed at a setup page.
         Any doubt resolves to False, because a wrong redirect is worse than a
-        missing one.
+        missing one. Every decline is logged, because a wrong redirect shows up
+        as a bug report while a missing one looks exactly like a feature nobody
+        built.
         """
         if self._setup_completed():
+            log_info(f"{LOG_PREFIX} setup page not offered: already completed")
             return False
         try:
             from core.external_endpoints.registry import get_external_endpoint_registry
@@ -3135,9 +3158,16 @@ class SynthWebUIInterface:
             endpoints = await get_external_endpoint_registry().list_endpoints(
                 enabled_only=True
             )
-            if endpoints:
-                return False
-        except Exception:
+        except Exception as exc:
+            log_info(
+                f"{LOG_PREFIX} setup page not offered: endpoints unreadable ({exc})"
+            )
+            return False
+        if endpoints:
+            log_info(
+                f"{LOG_PREFIX} setup page not offered: "
+                f"{len(endpoints)} enabled endpoint(s) already configured"
+            )
             return False
         return True
 

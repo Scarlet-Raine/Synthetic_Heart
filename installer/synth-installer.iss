@@ -127,7 +127,9 @@ Name: "{autodesktop}\{#AppShortName}"; Filename: "{app}\.venv\Scripts\pythonw.ex
 
 [Run]
 ; Runs last, from the finish page, after the database and environment exist.
-Filename: "{app}\.venv\Scripts\pythonw.exe"; Parameters: """{app}\scripts\start_synth.py"""; \
+; --setup matters: without it the launcher opens the plain WebUI and a new user
+; meets the avatar scene with nothing telling them what to do next.
+Filename: "{app}\.venv\Scripts\pythonw.exe"; Parameters: """{app}\scripts\start_synth.py"" --setup"; \
   WorkingDir: "{app}"; StatusMsg: "Starting {#AppName}..."; \
   Flags: postinstall nowait skipifsilent; \
   Description: "Start {#AppName} and open the setup page"

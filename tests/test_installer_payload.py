@@ -146,6 +146,16 @@ def test_no_inno_comment_swallows_itself(iss_text: str) -> None:
     assert not offenders, f"a brace inside an Inno comment ends it early: {offenders}"
 
 
+def test_the_finish_page_opens_the_setup_page(iss_text: str) -> None:
+    """The [Run] entry's label promises the setup page, so it must ask for it.
+
+    Without `--setup` the launcher opens the plain WebUI, and a new user meets an
+    avatar scene with nothing telling them what to do next.
+    """
+    run_section = iss_text.split("[Run]", 1)[1].split("[UninstallRun]", 1)[0]
+    assert "--setup" in run_section
+
+
 def test_both_provisioning_steps_leave_a_log(iss_text: str) -> None:
     """Both steps run with their window hidden, so each must write a log.
 
