@@ -344,3 +344,89 @@ jobs:
             done
           
           echo "✅ Cleanup completed"
+
+  windows-installer:
+    # The one-click installer for Windows, built from the same tree the tests
+    # just ran against.
+    #
+    # Not on pull requests: it downloads ~320 MB of PostgreSQL binaries per
+    # architecture and takes several minutes. Installer breakage surfaces on
+    # develop, where a human is looking, instead of on every PR.
+    #
+    # pgvector is built here rather than downloaded from the other workflow so
+    # this job is self-contained: pgvector publishes no prebuilt Windows
+    # binaries, and the DLL must be linked against the exact PostgreSQL build
+    # the installer unpacks. See installer/vendor/README.md.
+    if: github.event_name != 'pull_request'
+    needs: [prepare]
+    runs-on: windows-latest
+    env:
+      PGVECTOR_TAG: v0.8.6
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build pgvector for the bundled PostgreSQL
+        shell: pwsh
+        run: |
+          $matrix = [ordered]@{ '16' = '16.10-1'; '17' = '17.6-1' }
+          $ProgressPreference = 'SilentlyContinue'
+          foreach ($major in $matrix.Keys) {
+            $release = $matrix[$major]
+            $zip = Join-Path $env:RUNNER_TEMP "pg$major.zip"
+            Write-Host "::group::PostgreSQL $release binaries"
+            Invoke-WebRequest -Uri "https://get.enterprisedb.com/postgresql/postgresql-$release-windows-x64-binaries.zip" -OutFile $zip
+            $dest = Join-Path $env:RUNNER_TEMP "pg$major"
+            Expand-Archive -Path $zip -DestinationPath $dest -Force
+            $pgRoot = Join-Path $dest 'pgsql'
+            if (-not (Test-Path (Join-Path $pgRoot 'include\server\postgres.h'))) {
+              throw "the PostgreSQL $major archive has no server headers; pgvector cannot be built against it"
+            }
+
+            $src = Join-Path $env:RUNNER_TEMP "pgvector-$major"
+            git clone --branch $env:PGVECTOR_TAG --depth 1 https://github.com/pgvector/pgvector.git $src
+            Push-Location $src
+            $env:PGROOT = $pgRoot
+            cmd /c "nmake /F Makefile.win"
+            if ($LASTEXITCODE -ne 0) { throw "nmake failed for PostgreSQL $major" }
+            cmd /c "nmake /F Makefile.win install"
+            if ($LASTEXITCODE -ne 0) { throw "nmake install failed for PostgreSQL $major" }
+            Pop-Location
+
+            $vendor = "installer/vendor/pgvector/pg$major"
+            New-Item -ItemType Directory -Force -Path $vendor | Out-Null
+            Copy-Item (Join-Path $pgRoot 'lib\vector.dll') $vendor
+            Copy-Item (Join-Path $pgRoot 'share\extension\vector.control') $vendor
+            Copy-Item (Join-Path $pgRoot 'share\extension\vector--*.sql') $vendor
+            $dll = Get-Item (Join-Path $vendor 'vector.dll')
+            if ($dll.Length -lt 100kb) { throw "vector.dll for PostgreSQL $major is only $($dll.Length) bytes" }
+            Get-ChildItem $vendor | Select-Object Name, Length | Format-Table -AutoSize
+            Write-Host "::endgroup::"
+          }
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build the installer
+        shell: pwsh
+        env:
+          SEMVER: ${{ needs.prepare.outputs.semver }}
+        run: |
+          Write-Host "building SyntH $env:SEMVER"
+          ./installer/build_installer.ps1 -Version $env:SEMVER -SkipVendorWarning
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: SyntH-Setup-${{ needs.prepare.outputs.semver }}-windows-x64
+          path: installer/Output/*.exe
+          if-no-files-found: error
+          retention-days: 30
+          # Attaching this to a GitHub Release (softprops/action-gh-release on a
+          # tag) is the obvious next step; nothing here does that yet.

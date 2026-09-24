@@ -850,7 +850,7 @@ class DiscordInterface:
                 },
                 "media": {
                     "type": "array",
-                    "example": ["/app/data/photo.png"],
+                    "example": ["data/photo.png"],
                     "description": (
                         "Optional list of sandbox file paths to attach (image/"
                         "video/audio/document, auto-detected)."

@@ -3,77 +3,153 @@ Windows (Native) — Running Synthetic Heart on Microsoft Windows
 
 This page documents how to run Synthetic Heart natively on Windows (non-Docker).
 
-Overview
---------
-- The project is Docker-first (turnkey), but it supports native runs on Windows using environment variables to configure services (DB, ports, etc.).
-- Some components (Webtop/X/PulseAudio) are Docker-only conveniences and can be ignored for native installs.
 
-Prerequisites
+Installing it
 -------------
-- Python 3.10+ installed and on PATH
-- `uv <https://docs.astral.sh/uv/>`_ installed (``pip install uv`` or see Astral docs)
-- A running MySQL/MariaDB instance reachable from this machine (or set ``DB_HOST`` to a host that provides one)
-- **ffmpeg** on PATH — required for multimodal video/audio processing and Discord voice features. Download from https://ffmpeg.org/download.html and add to PATH.
-- Optional: Chrome and ``undetected-chromedriver`` if you plan to use Zen-based LLM engines
 
-Quick start
------------
-1. Copy the env example and edit it:
+Run ``SyntH-Setup-<version>.exe`` from the releases page. It needs no
+administrator rights and asks you nothing: there is one option, and it installs
+into ``%LOCALAPPDATA%\Programs\SyntH``.
+
+What it does, in order:
+
+1. ``scripts/install_prereqs.ps1`` provisions ``uv`` (which brings its own
+   Python, so no Python needs to be installed), unpacks the official
+   EnterpriseDB PostgreSQL binaries into ``pgsql\`` inside the install folder,
+   and copies pgvector into place if the release shipped it.
+2. ``scripts/bootstrap.py --portable`` creates a private PostgreSQL cluster in
+   ``data\pgsql`` on a free port, creates the role and the database, writes a
+   technical ``.env``, and runs ``uv sync``.
+3. Shortcuts are created (Start Menu, and Desktop if you asked for one), then
+   SyntH starts and your browser opens the setup page.
+
+Both helper steps run hidden, through ``pythonw.exe`` where possible, so no
+console window ever flashes. If a step fails, the installer says which one and
+where its log is rather than failing silently.
+
+The setup page is where the personal answers go: the persona's name and
+character, your name, timezone, language, location, how you physically talk to
+it, and which AI provider to use with its API key. Nothing about you is asked
+during installation. It is reachable afterwards at ``/setup``, and all of it is
+in Settings.
+
+Files that matter after installation:
+
+===================  =========================================================
+``%LOCALAPPDATA%``   ``\Programs\SyntH`` — the application, its Python, its
+                     PostgreSQL binaries and its database
+``data\``            the database cluster, attachments, and your encrypted
+                     API keys
+``.env``             the technical configuration bootstrap wrote
+``logs\``            ``synth.log`` and rotated logs
+===================  =========================================================
+
+Uninstalling removes the application, its Python and its PostgreSQL, and keeps
+``data\`` and ``.env`` so that reinstalling resumes with the same persona,
+history and keys. Delete those two folders by hand for a clean slate.
+
+.. note::
+
+   Windows SmartScreen will warn about an unrecognised publisher. That is
+   expected for an unsigned installer; choose "More info" then "Run anyway".
+   Code signing is not currently in place.
+
+
+Manual installation
+-------------------
+
+Prerequisites, all of which the installer above handles for you:
+
+- ``uv`` — https://docs.astral.sh/uv/ (it also provides Python; the project
+  pins its version in ``.python-version``)
+- A PostgreSQL server, or the EnterpriseDB binaries for ``--portable``
+- **ffmpeg** on PATH for multimodal video/audio processing and Discord voice.
+  Without it those features are simply unavailable.
+- Node.js only if you want the Minecraft vessel bridge.
+
+Steps:
 
 .. code-block:: powershell
 
-   copy .env.example .env
-
-2. Edit `.env` and set your DB and host service configuration (example values):
-
-.. code-block:: ini
-
-   DB_HOST=127.0.0.1
-   DB_PORT=3306
-   DB_USER=synth
-   DB_PASS=synth
-   DB_NAME=synth
-   WEBVIEW_HOST=localhost
-   WEBVIEW_PORT=3000
-
-3. Install dependencies using **uv**:
-
-.. code-block:: powershell
-
+   # 1. Dependencies
    uv sync
 
-4. (Optional) Initialize the DB schema if you prefer (otherwise the app will attempt to initialize on startup):
+   # 2. Database, .env and free ports (add --portable to unpack a private server)
+   uv run --no-project python scripts\bootstrap.py
+
+   # 3. Start it, then open the WebUI
+   uv run --no-project python scripts\start_synth.py
+
+``scripts\start_synth.py`` runs SyntH through ``pythonw.exe`` so no console
+window appears, waits until the WebUI answers, then opens your browser. It also
+takes ``--status``, ``--stop``, ``--setup`` and ``--no-browser``.
+
+To check a running instance:
 
 .. code-block:: powershell
 
-   mysql -u root -p < init-db.sql
+   uv run --no-project python scripts\healthcheck.py
 
-5. Run a smoke import test:
 
-.. code-block:: powershell
+Notes and caveats
+-----------------
 
-   python -m compileall .
-   python -m pytest tests/test_imports.py -q
+- The ``webtop/`` folder contains container-oriented scripts and an embedded
+  Linux desktop (PulseAudio, X server). Those are Docker-only conveniences and
+  are irrelevant to a native install; the Windows installer does not ship them
+  as anything runnable.
+- PostgreSQL is the only supported database. MariaDB deployments are migrated
+  automatically on first start, or deliberately with
+  ``scripts\migrate_main_db_to_postgres.py``; see :doc:`installation`.
+- Older builds wrote state to the container paths ``/app`` and ``/config``.
+  On Windows those are drive-relative and became real folders (``D:\config``,
+  ``D:\app``), which is where an upgraded install's ``.synth_secret`` and
+  attachments still are. SyntH adopts that state into ``data\`` on startup,
+  once, without deleting the originals. Inspect it with
+  ``uv run --no-project python -m core.legacy_state --dry-run``.
+- Selenium-based engines are being replaced by other engines; if you still use
+  them, install Chrome and ``undetected-chromedriver``.
+- Some tests assume a database or other services; point them at local ones with
+  environment variables or let them skip.
 
-6. Start the app:
-
-.. code-block:: powershell
-
-   python main.py
-
-Notes & Caveats
----------------
-- The `webtop/` folder contains container-oriented scripts and an embedded desktop environment that rely on Linux services such as PulseAudio and X server; those are Docker-only conveniences.
-- Some tests/integration may assume a MySQL server or other services; use env variables to point tests to local services or mock them in CI.
-- If you intend to use the Zen engines, ensure Chrome is installed and `undetected-chromedriver` works in your environment.
 
 Maintenance guidance for maintainers
------------------------------------
-- Keep runtime behaviour controlled by environment variables (the repository already does this).
-- When adding scripts or build steps that are container-specific, document them clearly and add platform-scan checks to CI.
+------------------------------------
+
+- Runtime behaviour is controlled by environment variables and the config
+  registry; keep it that way.
+- Anything that assumes a container path must go through ``core/app_paths.py``.
+  ``scripts/check_dockerisms.py`` fails the build on un-allowlisted ``/app``,
+  ``/config`` and ``host.docker.internal`` occurrences; it runs in CI.
+- When adding container-specific scripts, document them as such and keep the
+  native path working.
+
+
+Building the installer
+----------------------
+
+Inno Setup 6 is required (``winget install JRSoftware.InnoSetup``).
+
+.. code-block:: powershell
+
+   # Builds installer\Output\SyntH-Setup-<version>.exe
+   .\installer\build_installer.ps1
+
+The version comes from GitVersion (``GitVersion.yml``); the script falls back to
+the newest git tag, then to ``0.0.0-dev``. CI passes the release version and
+also builds the pgvector DLLs the installer vendors — see
+``installer/vendor/README.md``. Add ``/DWithExampleSkins=1`` to include the
+example personas (about 80 MB of VRM models that the installer leaves out by
+default):
+
+.. code-block:: powershell
+
+   iscc "/DAppVersion=1.2.3" "/DWithExampleSkins=1" installer\synth-installer.iss
+
 
 Testing branches & automation
 -----------------------------
+
 A convenient helper script to prepare a testing branch and optionally create a Draft PR is available at `tools/push_windows_branch.ps1`.
 
 Example usage (PowerShell):

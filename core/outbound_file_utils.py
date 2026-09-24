@@ -7,8 +7,13 @@ hallucinated action cannot exfiltrate arbitrary host files.
 
 The sandbox roots come from, in order of precedence:
 
-* ``AGENT_FS_ROOTS`` — a colon-separated list of absolute roots, or
-* ``[AGENT_FS_ROOT | "/app", SYNTH_LOG_DIR | "/app/logs"]`` as the default.
+* ``AGENT_FS_ROOTS`` — a platform-path-separated list of absolute roots, or
+* ``AGENT_FS_ROOT`` and ``SYNTH_LOG_DIR``, or
+* the application root and its ``logs`` directory.
+
+Resolution lives in :func:`core.app_paths.agent_fs_roots`, so the container's
+application layout and a native install (where that path does not exist) behave
+the same way.
 
 This mirrors :meth:`plugins.agent_plugin.AgentPlugin._allowed_roots` /
 ``_resolve_safe_path`` but is a standalone module so every interface can share a

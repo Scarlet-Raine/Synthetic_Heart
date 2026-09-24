@@ -37,11 +37,23 @@ from fastapi import (
     Request,
     HTTPException,
 )
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    FileResponse,
+    Response,
+    RedirectResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketState
 
 from core.core_initializer import register_interface
+from core import app_paths as _app_paths
+
+# Deployment-appropriate defaults (container vs native): resolved lazily so an
+# environment change made before the server is constructed still applies.
+_default_bind_host = _app_paths.default_bind_host
+_in_container = _app_paths.in_container
 from core.logging_utils import _LOG_FILE, log_debug, log_error, log_info, log_warning
 from core.config_manager import config_registry
 from core.variables_engine import register_exposed_var
@@ -246,14 +258,18 @@ class SynthWebUIInterface:
         # Runtime/configurable attributes with sensible defaults
         # Autostart can be disabled for tests/dev harnesses.
         self.autostart = bool(autostart)
-        self.host = _clean_env("SYNTH_WEBUI_HOST", "0.0.0.0") or "0.0.0.0"
+        self.host = _default_bind_host()
         self.log_level = os.getenv("SYNTH_WEBUI_LOG_LEVEL", "info")
         # TLS / HTTPS configuration
-        # By default expose the WebUI over HTTPS unless explicitly disabled.
-        # This makes the default developer experience minimal and secure.
+        # The container exposes HTTPS (SECURE_CONNECTION=1); a native install
+        # defaults to plain HTTP on loopback, so the first launch does not greet
+        # the user with a self-signed certificate warning. An explicit
+        # SYNTH_WEBUI_TLS / SECURE_CONNECTION always wins.
         tls_flag = _clean_env("SYNTH_WEBUI_TLS")
         if tls_flag is None:
-            tls_flag = _clean_env("SECURE_CONNECTION", "1")
+            tls_flag = _clean_env("SECURE_CONNECTION")
+        if tls_flag is None:
+            tls_flag = "1" if _in_container() else "0"
         self.tls_enabled = tls_flag == "1"
         self.tls_certfile = os.getenv("SYNTH_WEBUI_CERTFILE", None)
         self.tls_keyfile = os.getenv("SYNTH_WEBUI_KEYFILE", None)
@@ -390,7 +406,7 @@ class SynthWebUIInterface:
                     log_file=WEBUI_LOG,
                 )
             else:
-                self.attachments_dir = Path("/config") / "uploads"
+                self.attachments_dir = _app_paths.data_root() / "uploads"
                 log_info(
                     f"{LOG_PREFIX} Using default attachments directory: {self.attachments_dir}",
                     log_file=WEBUI_LOG,
@@ -775,6 +791,7 @@ class SynthWebUIInterface:
         self.app.get("/stats")(self.stats)
         self.app.get("/logs")(self.logs_page)
         self.app.get("/diary")(self.diary_page)
+        self.app.get("/setup")(self.setup_page)
         self.app.post("/api/log-console")(self.log_console_endpoint)
         self.app.websocket("/ws")(self.websocket_endpoint)
         self.app.websocket("/logs")(self.logs_ws_endpoint)
@@ -2296,9 +2313,25 @@ class SynthWebUIInterface:
 </html>
 """
 
-    async def index(self):
+    async def index(self, request: Request):
         log_info(f"{LOG_PREFIX} Index route called")
         try:
+            # A brand-new native install lands on the setup page instead of an
+            # empty interface. Local requests only: a remote browser must never
+            # be redirected, and an install with any endpoint configured never is.
+            try:
+                client_host = str(
+                    getattr(getattr(request, "client", None), "host", "") or ""
+                )
+            except Exception:
+                client_host = ""
+            if (
+                client_host in ("127.0.0.1", "::1", "localhost")
+                and await self._first_run_pending()
+            ):
+                log_info(f"{LOG_PREFIX} first run detected; redirecting to /setup")
+                return RedirectResponse(url="/setup", status_code=307)
+
             html = self._render_index()
             log_info(f"{LOG_PREFIX} Rendered HTML length: {len(html)}")
             # Return the rendered HTML as an HTMLResponse. Keep this inside
@@ -3052,6 +3085,160 @@ class SynthWebUIInterface:
         html = self._render_diary()
         return HTMLResponse(content=html)
 
+    # ------------------------------------------------------------------
+    # First-run setup page
+    # ------------------------------------------------------------------
+    #
+    # A native install asks nothing at install time: the installer only makes
+    # the machine able to run SyntH. Who the persona is, where and when the
+    # household is, and which engine to think with are asked here, once, in the
+    # browser. It is a plain page over the existing config and endpoint APIs.
+    #
+    # The page is only *offered* (the root redirects to it) while the install
+    # looks untouched: no enabled external endpoint yet and SETUP_COMPLETED
+    # unset. An existing deployment never sees it, and "Skip for now" sets the
+    # flag so it cannot nag.
+
+    def _setup_completed(self) -> bool:
+        """Whether the first-run page has been dealt with."""
+        try:
+            return bool(
+                config_registry.get_var(
+                    "SETUP_COMPLETED",
+                    False,
+                    label="Setup page completed",
+                    description=(
+                        "Set once the first-run setup page has been finished or "
+                        "skipped. While it is false the WebUI root redirects to "
+                        "/setup when no external endpoint is configured yet."
+                    ),
+                    component="synth_webui",
+                    hidden=True,
+                )
+            )
+        except Exception:
+            return True  # never nag when we cannot read the flag
+
+    async def _first_run_pending(self) -> bool:
+        """True only when this install looks brand new.
+
+        Any configured external endpoint counts as "already set up": someone who
+        has been running SyntH for months must never be pushed at a setup page.
+        Any doubt resolves to False, because a wrong redirect is worse than a
+        missing one.
+        """
+        if self._setup_completed():
+            return False
+        try:
+            from core.external_endpoints.registry import get_external_endpoint_registry
+
+            endpoints = await get_external_endpoint_registry().list_endpoints(
+                enabled_only=True
+            )
+            if endpoints:
+                return False
+        except Exception:
+            return False
+        return True
+
+    async def setup_page(self, request: Request):
+        html = self._render_setup()
+        return HTMLResponse(content=html)
+
+    def _render_setup(self) -> str:
+        """Render the first-run page from ``webui_templates/setup.html``."""
+        import html as _html
+        import zoneinfo
+
+        template_path = Path(__file__).parent / "webui_templates" / "setup.html"
+        with open(template_path, "r", encoding="utf-8") as handle:
+            template = handle.read()
+
+        def value(key: str, default: str = "") -> str:
+            try:
+                raw = config_registry.get_value(key, default)
+            except Exception:
+                return default
+            return "" if raw is None else str(raw)
+
+        try:
+            from core.config import get_trainer_name
+
+            trainer = get_trainer_name() or ""
+        except Exception:
+            trainer = value("TRAINER_NAME", "")
+
+        synth_name = value("SYNTH_NAME", "SyntH") or "SyntH"
+        timezone_name = value("TZ", "UTC") or "UTC"
+        language = value("PROJECT_DEFAULT_LANGUAGE", "en") or "en"
+
+        # Timezone dropdown: every IANA zone, current one selected.
+        try:
+            zones = sorted(zoneinfo.available_timezones())
+        except Exception:
+            zones = [timezone_name]
+        tz_options = "".join(
+            f'<option value="{_html.escape(zone)}"'
+            f"{' selected' if zone == timezone_name else ''}>{_html.escape(zone)}</option>"
+            for zone in zones
+        )
+
+        # Language dropdown: the same catalogue the Vox UI uses.
+        try:
+            from core.languages import SUPPORTED_LANGUAGES
+
+            entries = sorted(
+                (
+                    {
+                        "code": str(item.get("code") or ""),
+                        "name": str(item.get("en") or ""),
+                    }
+                    for item in SUPPORTED_LANGUAGES
+                ),
+                key=lambda item: item["name"].lower(),
+            )
+        except Exception:
+            entries = [{"code": "en", "name": "English"}]
+        if not any(entry["code"] == language for entry in entries):
+            entries.insert(0, {"code": language, "name": language})
+        language_options = "".join(
+            f'<option value="{_html.escape(entry["code"])}"'
+            f"{' selected' if entry['code'] == language else ''}>"
+            f"{_html.escape(entry['name'])} ({_html.escape(entry['code'])})</option>"
+            for entry in entries
+            if entry["code"]
+        )
+
+        # Location suggestions, if the deployment has a list to offer.
+        try:
+            from core.time_zone_utils import get_suggested_locations
+
+            locations = [str(item) for item in (get_suggested_locations() or [])]
+        except Exception:
+            locations = []
+        location_options = "".join(
+            f'<option value="{_html.escape(item)}"></option>' for item in locations
+        )
+
+        accent = value("WEBUI_ACCENT_COLOR", "#6bfefe") or "#6bfefe"
+
+        replacements = {
+            "%%BRAND_NAME%%": BRAND_NAME,
+            "%%LOGO_URL%%": str(getattr(self, "logo_url", "/static/synth_logo_bg.png")),
+            "%%ACCENT%%": accent,
+            "%%SYNTH_NAME%%": _html.escape(synth_name),
+            "%%TRAINER_NAME%%": _html.escape(trainer),
+            "%%SYNTH_PROFILE%%": _html.escape(value("SYNTH_PROFILE", "")),
+            "%%LOCATION%%": _html.escape(value("PROMPT_LOCATION", "")),
+            "%%SCENE_NOTE%%": _html.escape(value("SCENE_NOTE", "")),
+            "%%TZ_OPTIONS%%": tz_options,
+            "%%LANGUAGE_OPTIONS%%": language_options,
+            "%%LOCATION_OPTIONS%%": location_options,
+        }
+        for token, replacement in replacements.items():
+            template = template.replace(token, replacement)
+        return template
+
     async def serve_template_section(self, section: str):
         """Serve modular template sections for dynamic loading."""
         try:
@@ -3483,7 +3670,7 @@ class SynthWebUIInterface:
             candidates.append(Path(log_override).expanduser())
         candidates.extend(
             [
-                Path("/app/logs/synth.log"),
+                _app_paths.log_dir() / "synth.log",
                 Path.cwd() / "logs" / "synth.log",
                 Path.cwd() / "logs" / "dev" / "synth.log",
                 Path(_LOG_FILE),
@@ -10115,9 +10302,7 @@ class SynthWebUIInterface:
         """Report on the memory re-distil pass: running, progress, pending cells."""
         try:
             plugin = self._soul_plugin()
-            return JSONResponse(
-                {"success": True, **(await plugin.redistil_status())}
-            )
+            return JSONResponse({"success": True, **(await plugin.redistil_status())})
         except HTTPException:
             raise
         except Exception as exc:
@@ -10143,7 +10328,9 @@ class SynthWebUIInterface:
             except (TypeError, ValueError):
                 raise HTTPException(status_code=400, detail="limit must be an integer")
         try:
-            return JSONResponse({"success": True, **(await plugin.start_redistil(limit=limit))})
+            return JSONResponse(
+                {"success": True, **(await plugin.start_redistil(limit=limit))}
+            )
         except HTTPException:
             raise
         except Exception as exc:
@@ -10925,10 +11112,9 @@ class SynthWebUIInterface:
             if not file or not getattr(file, "filename", None):
                 raise HTTPException(status_code=400, detail="No file uploaded")
 
-            # Storage root is configurable via env var; default to /config/storage
-            storage_root = Path(
-                os.getenv("SYNTH_EXPOSED_STORAGE_ROOT", "/config/storage")
-            )
+            # Storage root is resolved from the environment with a native-safe
+            # fallback (container: /config/storage, native: <app_root>/data/...)
+            storage_root = Path(_app_paths.exposed_storage_root())
             try:
                 storage_root.mkdir(parents=True, exist_ok=True)
             except Exception:
@@ -11016,9 +11202,7 @@ class SynthWebUIInterface:
             if not file_path.exists() or not file_path.is_file():
                 raise HTTPException(status_code=404, detail="Skin file not found")
 
-            storage_root = Path(
-                os.getenv("SYNTH_EXPOSED_STORAGE_ROOT", "/config/storage")
-            ).resolve()
+            storage_root = Path(_app_paths.exposed_storage_root()).resolve()
             file_path_resolved = file_path.resolve()
             try:
                 file_path_resolved.relative_to(storage_root)
@@ -11066,9 +11250,7 @@ class SynthWebUIInterface:
                 )
                 raise HTTPException(status_code=404, detail="Stored file not found")
 
-            storage_root = Path(
-                os.getenv("SYNTH_EXPOSED_STORAGE_ROOT", "/config/storage")
-            ).resolve()
+            storage_root = Path(_app_paths.exposed_storage_root()).resolve()
             try:
                 # Ensure the file is inside the storage root to avoid path escape
                 file_path_resolved = file_path.resolve()
@@ -13484,7 +13666,9 @@ class SynthWebUIInterface:
         if not self.tls_enabled:
             return
 
-        cert_dir = os.getenv("SYNTH_WEBUI_CERT_DIR", "/config/ssl")
+        # Resolved rather than defaulted to the container path: on a native
+        # install "C:\config\ssl" cannot be created, and TLS is on by default.
+        cert_dir = str(_app_paths.cert_dir())
         try:
             Path(cert_dir).mkdir(parents=True, exist_ok=True)
         except Exception as e:

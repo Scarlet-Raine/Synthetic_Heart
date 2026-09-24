@@ -2355,7 +2355,7 @@ class TelegramInterface:
             },
             "media": {
                 "type": "array",
-                "example": ["/app/data/photo.png"],
+                "example": ["data/photo.png"],
                 "description": (
                     "Optional list of file paths to attach (image/video/audio/"
                     "document, auto-detected). Must be inside Synth's filesystem "

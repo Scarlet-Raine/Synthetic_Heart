@@ -846,8 +846,9 @@
                 setModalError(
                     'Saved! But the probe failed: ' + probeErr +
                     '\nThe endpoint is saved but may not be reachable. ' +
-                    'Check that the base URL is accessible from inside the container ' +
-                    '(use host.docker.internal instead of localhost if needed).'
+                    'Check that the base URL is reachable from where SyntH runs: ' +
+                    'localhost when SyntH runs natively, host.docker.internal when ' +
+                    'SyntH runs in Docker (with a host-gateway entry).'
                 );
                 setModalStatus('');
             } else {
