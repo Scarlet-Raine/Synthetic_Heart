@@ -759,6 +759,17 @@ def stop_portable_cluster(reporter: Reporter, *, pg_bin: str | None = None) -> b
     # files the next install needs to overwrite, and the old code returned early
     # here precisely because no cluster existed.
     leftovers = stop_leftover_processes(reporter, bin_dir)
+
+    # The application's own interpreter lives in the venv, and that is the other set
+    # of files Windows refuses to delete while a process holds it: an uninstall with
+    # Synth still running could not remove .venv, and left the whole application
+    # directory behind. protect_ancestors keeps this from killing the process doing
+    # the sweeping, which may itself be the venv's python - that is exactly how the
+    # uninstaller invokes this.
+    app_venv = app_root() / ".venv"
+    if app_venv.is_dir():
+        stop_leftover_processes(reporter, app_venv, protect_ancestors=True)
+
     return not has_cluster or stopped or bool(leftovers)
 
 

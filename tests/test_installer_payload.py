@@ -14,6 +14,7 @@ does that, and the compiler's log is the authoritative payload record.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -154,6 +155,35 @@ def test_the_finish_page_opens_the_setup_page(iss_text: str) -> None:
     """
     run_section = iss_text.split("[Run]", 1)[1].split("[UninstallRun]", 1)[0]
     assert "--setup" in run_section
+
+
+def test_no_local_draft_at_the_root_can_be_shipped(iss_text: str) -> None:
+    """Anything the repository does not track must be named in the exclude list.
+
+    The tree is packed by a hand-written exclude list, and the repository root is
+    where local drafts live. A 55 KB PR description was sitting there untracked and
+    would have been packed into the installer and shipped.
+    """
+    try:
+        tracked = subprocess.run(
+            ["git", "ls-files", "*.md"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+    except Exception:
+        pytest.skip("not a git checkout, so untracked files cannot be identified")
+    tracked_root = {name for name in tracked if "/" not in name}
+
+    for path in sorted(REPO_ROOT.glob("*.md")):
+        if path.name in tracked_root:
+            continue
+        assert path.name in iss_text, (
+            f"{path.name} exists only on this machine and is not in the installer's "
+            "Excludes list, so it would be shipped: add it, or commit it if it is "
+            "meant to be part of the distribution."
+        )
 
 
 def test_both_provisioning_steps_leave_a_log(iss_text: str) -> None:

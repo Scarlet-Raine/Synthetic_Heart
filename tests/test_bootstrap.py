@@ -570,16 +570,48 @@ def test_the_cluster_stop_clears_leftovers_even_with_no_cluster(
     bin_dir.mkdir(parents=True)
     called: list[object] = []
     monkeypatch.setattr(bootstrap, "_cluster_dir", lambda: tmp_path / "pgsql")
+    monkeypatch.setattr(bootstrap, "app_root", lambda: tmp_path)
     monkeypatch.setattr(
         bootstrap,
         "stop_leftover_processes",
-        lambda reporter, directory: (called.append(directory), [4242])[1],
+        lambda reporter, directory, **kwargs: (called.append(directory), [4242])[1],
     )
 
     reporter = bootstrap.Reporter(1, quiet=True)
     assert bootstrap.stop_portable_cluster(reporter, pg_bin=str(bin_dir)) is True
     assert called == [bin_dir], "leftovers must be cleared with no cluster present"
     assert any("no private cluster" in message for message in reporter.messages)
+
+
+def test_the_cluster_stop_also_clears_the_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Uninstalling with Synth still running must not leave the application behind.
+
+    The interpreter lives in the venv, so Windows refuses to remove that directory
+    while a Synth from the previous install is up, and the whole application directory
+    survived the uninstall. The sweep must protect the process doing the sweeping,
+    because the uninstaller runs it from that same venv.
+    """
+    bin_dir = tmp_path / "pgsql" / "bin"
+    bin_dir.mkdir(parents=True)
+    (tmp_path / ".venv").mkdir()
+    calls: list[tuple[Path, bool]] = []
+    monkeypatch.setattr(bootstrap, "_cluster_dir", lambda: tmp_path / "pgsql")
+    monkeypatch.setattr(bootstrap, "app_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        bootstrap,
+        "stop_leftover_processes",
+        lambda reporter, directory, **kwargs: (
+            calls.append((directory, bool(kwargs.get("protect_ancestors")))),
+            [],
+        )[1],
+    )
+
+    reporter = bootstrap.Reporter(1, quiet=True)
+    bootstrap.stop_portable_cluster(reporter, pg_bin=str(bin_dir))
+
+    assert calls == [(bin_dir, False), (tmp_path / ".venv", True)]
 
 
 def test_stop_leftover_processes_declines_an_unknown_directory(

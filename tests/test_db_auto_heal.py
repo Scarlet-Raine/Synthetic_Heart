@@ -1,6 +1,11 @@
+import re
+from pathlib import Path
+
 import pytest
 
 import core.db as db_module
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 class FakeCursor:
@@ -138,3 +143,23 @@ async def test_db_auto_heal_disabled_raises(monkeypatch):
     # ensure_* should not have been invoked when auto-heal is disabled
     assert called["core"] == 0
     assert called["plugin"] == 0
+
+
+def test_no_engine_name_is_seeded_as_the_default_cortex():
+    """A fresh install must not inherit a fixed engine name.
+
+    Seeding BASE_CORTEX is how installs came to point at "selenium-llm-engine", a
+    MariaDB-era engine nobody had configured. The heal that followed then substituted
+    whichever engine sorts first alphabetically ("anthropic"), which is unusable
+    without a key, and that name sat in users' databases across reinstalls for months.
+    Left unseeded it resolves to "not configured", which is true and points at the
+    engine selector.
+    """
+    for source in (REPO_ROOT / "init-db.sql", REPO_ROOT / "core" / "db.py"):
+        text = source.read_text(encoding="utf-8")
+        # Anchored on VALUES so it cannot match the heal's "config_key IN (...)" list.
+        seeded = set(re.findall(r"VALUES\s*\([^)]*'BASE_CORTEX'\s*,\s*'([^']*)'", text))
+        assert seeded <= {""}, (
+            f"{source.name} seeds BASE_CORTEX with {sorted(seeded)}: a fixed engine "
+            "name is what made every fresh install resolve to an unusable engine"
+        )
