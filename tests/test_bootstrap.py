@@ -320,6 +320,104 @@ def test_without_a_log_file_nothing_is_written(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
+def test_a_failed_uv_sync_records_what_uv_actually_said(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hidden console means a streamed failure leaves no trace at all.
+
+    That is how a bare "dependency sync failed" came to replace the real error with a
+    guess about the kittentts wheel while the actual cause went unrecorded. uv's output
+    is captured, its tail is logged, and the step retries once: it is the only real
+    network dependency in the whole install.
+    """
+    log = tmp_path / "bootstrap.log"
+    attempts: list[bool] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        if "sync" in command:
+            attempts.append(bool(kwargs.get("capture")))
+        return bootstrap.CommandResult(
+            1,
+            "",
+            "error: Failed to fetch https://pypi.org/simple/\n  the index is unreachable",
+        )
+
+    monkeypatch.setattr(bootstrap, "run_command", fake_run)
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda name: "uv")
+    reporter = bootstrap.Reporter(1, quiet=True, log_file=str(log))
+
+    assert bootstrap.sync_environment(reporter, extras=[], dry_run=False) is False
+
+    text = log.read_text(encoding="utf-8")
+    assert "the index is unreachable" in text, "uv's own error must reach the log"
+    assert "uv exited with code 1" in text
+    assert attempts == [True, True], "captured, and retried once before giving up"
+
+
+def test_a_successful_uv_sync_does_not_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts: list[int] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> object:
+        if "sync" in command:
+            attempts.append(1)
+        return bootstrap.CommandResult(0, "Resolved 230 packages", "")
+
+    monkeypatch.setattr(bootstrap, "run_command", fake_run)
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda name: "uv")
+    reporter = bootstrap.Reporter(1, quiet=True, log_file=str(tmp_path / "b.log"))
+
+    assert bootstrap.sync_environment(reporter, extras=[], dry_run=False) is True
+    assert len(attempts) == 1
+
+
+def test_the_sync_sweeps_the_venv_it_is_about_to_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Synth left running holds .venv\\Scripts\\python*.exe open, so uv cannot replace it.
+
+    Windows will not overwrite a file that is in use, and the install died with a
+    bare "dependency sync failed" - the same locked-file shape as the PostgreSQL copy
+    and the blocked uninstall, one step later.
+    """
+    swept: list[tuple[Path, dict[str, object]]] = []
+
+    def fake_sweep(reporter: object, directory: object, **kwargs: object) -> list[int]:
+        swept.append((Path(str(directory)), kwargs))
+        return []
+
+    monkeypatch.setattr(bootstrap, "stop_leftover_processes", fake_sweep)
+    monkeypatch.setattr(
+        bootstrap, "run_command", lambda *a, **k: bootstrap.CommandResult(0, "", "")
+    )
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda name: "uv")
+    reporter = bootstrap.Reporter(1, quiet=True, log_file=str(tmp_path / "b.log"))
+
+    assert bootstrap.sync_environment(reporter, extras=[], dry_run=False) is True
+
+    assert swept, "the venv must be swept before uv replaces it"
+    path, kwargs = swept[0]
+    assert path.name == ".venv", f"swept the wrong directory: {path}"
+    assert kwargs.get("protect_ancestors") is True, (
+        "a reinstall runs the bootstrap from the venv it is replacing"
+    )
+
+
+def test_a_dry_run_neither_sweeps_nor_syncs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--dry-run must stay side-effect free, including not killing anything."""
+    monkeypatch.setattr(
+        bootstrap, "stop_leftover_processes", lambda *a, **k: pytest.fail("swept")
+    )
+    monkeypatch.setattr(bootstrap, "run_command", lambda *a, **k: pytest.fail("ran"))
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda name: "uv")
+    reporter = bootstrap.Reporter(1, quiet=True)
+
+    assert bootstrap.sync_environment(reporter, extras=[], dry_run=True) is True
+
+
 def test_main_records_the_invocation_in_the_log(tmp_path: Path) -> None:
     """A log with no header cannot be told from the previous attempt's."""
     log = tmp_path / "run.log"
@@ -522,9 +620,48 @@ def test_the_leftover_sweep_stops_a_real_process(tmp_path: Path) -> None:
         idle = tmp_path / "idle"
         idle.mkdir()
         assert bootstrap.stop_leftover_processes(reporter, idle) == []
+
+        # With the ancestor guard on the sweep must still do its job: the guard is
+        # there to protect our own process tree, not to disable the sweep.
+        proc2 = subprocess.Popen(
+            [str(victim), "-n", "60", "127.0.0.1"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            time.sleep(1.5)
+            guarded = bootstrap.stop_leftover_processes(
+                reporter, tmp_path, protect_ancestors=True
+            )
+            time.sleep(1.0)
+            assert proc2.pid in guarded, "the guard disabled the sweep"
+            assert proc2.poll() is not None
+        finally:
+            if proc2.poll() is None:
+                proc2.kill()
     finally:
         if proc.poll() is None:
             proc.kill()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the sweep is a Windows behaviour")
+def test_the_ancestor_guard_never_kills_its_own_process_tree() -> None:
+    """A reinstall runs the bootstrap from the very venv it is about to replace.
+
+    So the sweep is pointed at the directory holding the interpreter that is running
+    it. Without the guard this test does not fail - the test process is killed and
+    the suite dies, which is exactly what the install would do to itself.
+    """
+    interpreter_dir = Path(sys.executable).parent
+    assert interpreter_dir.is_absolute()
+    reporter = bootstrap.Reporter(1, quiet=True)
+
+    killed = bootstrap.stop_leftover_processes(
+        reporter, interpreter_dir, protect_ancestors=True
+    )
+
+    assert os.getpid() not in killed, "the sweep killed the process running it"
+    assert killed == [] or max(killed) != os.getpid()
 
 
 def test_ensure_extensions_reports_success(monkeypatch: pytest.MonkeyPatch) -> None:

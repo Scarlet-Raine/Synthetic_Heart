@@ -665,7 +665,10 @@ def _powershell_path() -> str | None:
 
 
 def stop_leftover_processes(
-    reporter: Reporter, directory: Path | str | None
+    reporter: Reporter,
+    directory: Path | str | None,
+    *,
+    protect_ancestors: bool = False,
 ) -> list[int]:
     """Stop processes still running out of *directory*. Windows only.
 
@@ -676,6 +679,10 @@ def stop_leftover_processes(
     the next install fails on an unexplained file lock and the uninstall cannot
     remove the directory either. Only processes whose executable lives inside our
     own directory are touched.
+
+    ``protect_ancestors`` keeps this process and everything that started it alive.
+    Without it a reinstall could kill its own interpreter, which happens when the
+    installer runs the bootstrap from the ``.venv`` it is about to replace.
     """
     powershell = _powershell_path()
     if powershell is None or not directory:
@@ -685,10 +692,25 @@ def stop_leftover_processes(
         return []
 
     prefix = str(target).lower().replace("'", "''")
+    guard = ""
+    exclude = ""
+    if protect_ancestors:
+        # Build the ancestor chain by hand: PowerShell exposes a parent id but no
+        # direct "is this me or mine" test, and single-quoted format strings avoid
+        # nested quotes in the command line.
+        guard = (
+            "$mine = @($PID); "
+            "$p = Get-CimInstance Win32_Process -Filter ('ProcessId = {0}' -f $PID) "
+            "-ErrorAction SilentlyContinue; "
+            "while ($p -and $p.ParentProcessId) { $mine += $p.ParentProcessId; "
+            "$p = Get-CimInstance Win32_Process "
+            "-Filter ('ProcessId = {0}' -f $p.ParentProcessId) -ErrorAction SilentlyContinue }; "
+        )
+        exclude = "-and ($mine -notcontains $_.ProcessId)"
     script = (
-        "Get-CimInstance Win32_Process | "
+        guard + "Get-CimInstance Win32_Process | "
         f"Where-Object {{ $_.ExecutablePath -and "
-        f"$_.ExecutablePath.ToLower().StartsWith('{prefix}') }} | "
+        f"$_.ExecutablePath.ToLower().StartsWith('{prefix}') {exclude} }} | "
         "ForEach-Object { Write-Output $_.ProcessId; "
         "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
     )
@@ -962,6 +984,12 @@ def write_env(reporter: Reporter, *, values: dict[str, str], env_path: Path) -> 
     reporter.detail(f"wrote {env_path}")
 
 
+def output_tail(result: CommandResult, limit: int = 15) -> list[str]:
+    """The last few lines a command produced, for a log that must stay readable."""
+    lines = [line.strip() for line in result.output.splitlines() if line.strip()]
+    return lines[-limit:]
+
+
 def sync_environment(reporter: Reporter, *, extras: list[str], dry_run: bool) -> bool:
     """Install the Python environment with uv."""
     uv = shutil.which("uv")
@@ -977,12 +1005,30 @@ def sync_environment(reporter: Reporter, *, extras: list[str], dry_run: bool) ->
     reporter.detail(" ".join(command))
     if dry_run:
         return True
-    result = run_command(command, timeout=3600, capture=False)
+
+    # A Synth still running from a previous install keeps .venv\Scripts\python*.exe
+    # open, and Windows will not let uv replace a file that is in use: the install
+    # dies with a bare "dependency sync failed". That is the same locked-file shape
+    # as the PostgreSQL copy and the blocked uninstall, one step later in the
+    # install. Sweep the venv it is about to replace, protecting our own process
+    # tree, because on a reinstall this script may itself be running from that venv.
+    stop_leftover_processes(reporter, app_root() / ".venv", protect_ancestors=True)
+
+    # Captured, deliberately, and retried once. The installer hides this console, so
+    # streamed output is thrown away and a failure arrives as a bare exit code - which
+    # twice turned a diagnosable error into a guess in the log ("the kittentts wheel is
+    # the usual culprit") while the real cause was never recorded. This is the only
+    # real network dependency in the whole install (PyPI, plus a GitHub wheel when the
+    # optional voice extras are requested), so one retry is worth it.
+    result = run_command(command, timeout=3600, capture=True)
     if not result.ok:
-        reporter.fail(
-            "dependency sync failed. If the network is flaky, re-run; the "
-            "'kittentts' wheel is fetched from GitHub and is the usual culprit."
-        )
+        reporter.detail("first attempt failed; retrying once")
+        result = run_command(command, timeout=3600, capture=True)
+    if not result.ok:
+        reporter.fail("dependency sync failed")
+        reporter.detail(f"uv exited with code {result.returncode}")
+        for line in output_tail(result):
+            reporter.detail(f"uv: {line}")
         return False
     return True
 

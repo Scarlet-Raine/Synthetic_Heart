@@ -15,9 +15,10 @@ that and uploads the three files the extension needs:
 
 ```
 pgvector/pg16/
-    vector.dll            # from the pgvector build's lib/
+    vector.dll            # from the build's lib/ (≈280 KB)
     vector.control        # from share/extension/
-    vector--0.8.6.sql     # from share/extension/ (one per version)
+    vector--*.sql         # from share/extension/ - the whole upgrade chain, exactly
+                          # the set CI stages (41 files for 0.8.6, not just one)
 pgvector/pg17/
     ...
 ```
@@ -45,6 +46,14 @@ nmake /F Makefile.win install
 is exactly where the installer would have copied them. Nothing further is needed
 on that machine; to ship it to other machines, copy those files into
 `pgvector/pg<major>/` with the layout above.
+
+`PGROOT` must be the PostgreSQL the installer ships, not any PostgreSQL: a DLL
+built against a different major will not load. Take the same EDB binary archive
+the prereqs script downloads (`postgresql-16.10-1-windows-x64-binaries.zip`) and
+point `PGROOT` at where you unpacked it - it carries the headers and
+`lib\postgres.lib` that `Makefile.win` needs. Verified against that archive with
+`v0.8.6`: `CREATE EXTENSION vector` reports 0.8.6 and a distance query returns a
+real number.
 
 ### Linux
 
