@@ -198,18 +198,24 @@ DSP_CORTEX = config_registry.get_var(
 )
 
 # Which of an endpoint's models to start on when its default is chosen
-# automatically. Comma or newline separated fnmatch patterns, best first; the
-# first model the endpoint reports that matches wins, and no match means the
-# endpoint's own first model. This exists because an endpoint that lists a hundred
-# models has no meaningful default: the auto-selection took whatever came first and
-# a Venice endpoint came up on a Gemini model that way.
+# automatically. Comma or newline separated fnmatch patterns, best first; the first
+# model the endpoint reports that matches wins, and no match means the endpoint's own
+# first model. This exists because an endpoint that lists a hundred models has no
+# meaningful default: the auto-selection took whatever came first, and a Venice
+# endpoint came up on a Gemini model that way. DeepSeek's *flash* variants are what
+# this project runs, so flash comes first and a bare `deepseek*` follows, which keeps
+# an endpoint that lists no flash model inside the same family.
+ENDPOINT_MODEL_PREFERENCES_DEFAULT = "*deepseek*flash*,deepseek*"
+
 ENDPOINT_MODEL_PREFERENCES = config_registry.get_var(
     "ENDPOINT_MODEL_PREFERENCES",
-    "deepseek*",
+    ENDPOINT_MODEL_PREFERENCES_DEFAULT,
     label="Endpoint Default Model Preference",
     description="Ordered fnmatch patterns (comma separated) used to pick an external "
-    "endpoint's starting model, e.g. 'deepseek*,qwen*'. The first model the endpoint "
-    "lists that matches is chosen; with no match its own first model is used.",
+    "endpoint's starting model, e.g. '*deepseek*flash*,deepseek*'. Earlier patterns "
+    "win; within a pattern the endpoint's own order decides. The first model matching "
+    "the first pattern is chosen, and with no match at all the endpoint's first model "
+    "is used.",
     group="core",
     component="cortex",
     allow_env_override=False,

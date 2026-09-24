@@ -4,6 +4,17 @@
 **Fix:** a non-mapping value is no longer collected as a history candidate, `_is_internal_noise` returns True for a non-mapping instead of raising, and the final candidate filter requires a dict; the swallow is now a WARNING naming the exception type, so a future failure here cannot be silent.
 **Notes:** reproduced against the live DB before touching the code (`HistoryEngine().build_context` with the beat's real context shape returned `history_recent: 0`; with an empty `grillo_snippets` it returned 8 lines; the swallowed line read `[history_engine] Failed building UNIFIED history: 'str' object has no attribute 'get'`). Pinned in `tests/test_history_engine.py::test_cross_chat_history_survives_non_dict_context_values` (the observer-beat shape and the `attachment_paths` shape on an ordinary chat turn); reverting the one-line `continue` makes it fail. 64 passed across the history, current-chat-history, beat-routing and observer suites; the single failure in that set (`test_diary_entry_renders_created_at_timestamp`, a local-TZ render against an asserted UTC hour) fails identically at HEAD. Grillo's *internal* reflection beats (relationship, curiosity, ...) still receive no chat history: they set `skip_history: True` and are scoped `is_grillo_internal` on purpose, and changing that changes what the synth reflects on, so it is left alone here. `core/history_engine.py` is imported at boot, so the fix is not live until the instance is restarted.
 
+### fix(branding): one logo on transparency, and a starting model that is the fast one  <!-- 2026-09-25 -->
+
+**Why:** two small things a real install showed, after the tray icon started working.
+
+**The installer's icons were still on a black tile.** `synth.ico` was built from the rounded-square artwork, so the installer itself, the shortcuts it creates, the Start menu entry and the Add/Remove Programs entry all showed a dark tile, right next to a tray icon that did not. All three outputs now come from the same artwork as the tray icon (`docs/res/synth_logo_wblack.png`) with the same padding, via `installer/make_icons.py`: verified with zero-alpha corners, and rendered at 128/64/48/32/16 px on both a light and a dark surface to confirm there is no tile behind the heart and that it is still legible at 16 px. The rounded-square version remains the brand's logo *with* a background on the website; no icon uses it now.
+
+**The default model preference picked whichever DeepSeek the endpoint listed first.** `deepseek*` matched both the fast and the large variant, and within one pattern the endpoint's own list order decides, so a fresh endpoint could come up on the large one. The default is now `*deepseek*flash*,deepseek*`: the fast variant first, with the bare family pattern second so an endpoint that carries no flash model still starts inside the same family instead of on whatever the API happened to return first. Pinned by a test built from a listing that offers the large variant first, which is the case that used to decide it.
+
+**Validation:** 110 tests across the endpoint-model, launcher, tray, payload, probe and config suites; rebuilt icons checked numerically for transparent corners and rendered at five sizes on two backgrounds; installer rebuilt and its payload audited (no local state).
+
+
 ### fix(tray): the icon never appeared, and a child process could not say why  <!-- 2026-09-25 -->
 
 **Why:** the tray icon added earlier the same day did not appear on a real install. The cause was not the icon: the process that draws it was started and killed before it ran.

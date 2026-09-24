@@ -230,3 +230,50 @@ async def test_a_config_failure_does_not_lose_the_model_change(
 
     # Must not raise.
     await registry._sync_scope_models("Venice", "deepseek-v4-1-flash")
+
+
+# ---------------------------------------------------------------------------
+# The shipped default: flash, never the fat variant
+# ---------------------------------------------------------------------------
+
+# A listing that offers the *pro* variant first. Within one pattern the endpoint's own
+# order decides, so a bare `deepseek*` picks whichever Venice happens to list first.
+_KINDS_OF_DEEPSEEK = [
+    "gemini-3-6-flash",
+    "deepseek-v4-1-pro",
+    "deepseek-v4-1-flash",
+    "qwen-3-5-max",
+]
+
+
+def test_the_shipped_default_takes_flash_even_when_the_pro_variant_is_listed_first() -> (
+    None
+):
+    """This project runs the fast DeepSeek variants, never the large ones."""
+    from core.config import ENDPOINT_MODEL_PREFERENCES_DEFAULT
+
+    picked = select_default_model(
+        _KINDS_OF_DEEPSEEK, ENDPOINT_MODEL_PREFERENCES_DEFAULT
+    )
+    assert picked == "deepseek-v4-1-flash"
+
+
+def test_the_shipped_default_stays_in_the_family_when_no_flash_variant_exists() -> None:
+    from core.config import ENDPOINT_MODEL_PREFERENCES_DEFAULT
+
+    listing = ["gemini-3-6-flash", "deepseek-v4-1-pro"]
+    assert (
+        select_default_model(listing, ENDPOINT_MODEL_PREFERENCES_DEFAULT)
+        == "deepseek-v4-1-pro"
+    )
+
+
+def test_the_shipped_default_leaves_an_endpoint_without_deepseek_alone() -> None:
+    """An endpoint that carries none of the preferred family keeps its first model."""
+    from core.config import ENDPOINT_MODEL_PREFERENCES_DEFAULT
+
+    listing = ["gemini-3-6-flash", "claude-4-5-sonnet"]
+    assert (
+        select_default_model(listing, ENDPOINT_MODEL_PREFERENCES_DEFAULT)
+        == "gemini-3-6-flash"
+    )
