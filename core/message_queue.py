@@ -622,6 +622,67 @@ async def _delayed_put(item: dict, delay: float) -> None:
     await _get_queue().put((_heap_key(priority), _counter, item))
 
 
+async def ensure_active_plugin(reason: str) -> Any:
+    """Return the active engine plugin, loading the configured engine if none is.
+
+    The engine is loaded once during startup, so a machine that chooses its engine
+    afterwards has no engine at all - and that is exactly what the first-run setup
+    page asks the user to do. In that state the queue answered every message with a
+    log line and nothing else: no reply, no error on screen, nothing the user would
+    find. Beats already self-healed this way on a timer; a person talking to Synth
+    is at least as deserving, so the one-time load now happens for any message.
+    """
+    plugin = plugin_instance.get_plugin()
+    if plugin:
+        return plugin
+    try:
+        from core.config import get_active_cortex_engine
+
+        engine_name = await get_active_cortex_engine(scope="base")
+        await plugin_instance.load_plugin(engine_name, ensure_started=True)
+        plugin = plugin_instance.get_plugin()
+        if plugin:
+            log_info(f"[QUEUE] Loaded engine '{engine_name}' on demand ({reason})")
+        else:
+            log_warning(
+                f"[QUEUE] Engine '{engine_name}' was loaded but no plugin is active"
+            )
+        return plugin
+    except Exception as exc:
+        log_warning(f"[QUEUE] Could not load an engine on demand ({reason}): {exc}")
+        return None
+
+
+UNANSWERED_NOTICE = (
+    "I cannot answer yet: no AI engine is loaded. Pick one in the Engines tab (or "
+    "re-run the setup page) and say that again."
+)
+
+
+async def notify_unanswerable(bot, message, interface_id: str | None) -> None:
+    """Say that nothing can answer, instead of leaving the user with silence.
+
+    A dropped message is invisible from the outside: an ERROR in a log nobody reads,
+    and no bubble at all in the WebUI. Best-effort - an interface that cannot deliver
+    this must never break the queue.
+    """
+    if bot is None or not interface_id:
+        return
+    chat_id = getattr(message, "chat_id", None) or getattr(
+        getattr(message, "chat", None), "id", None
+    )
+    if not chat_id:
+        return
+    try:
+        await bot.send_message(
+            {"text": UNANSWERED_NOTICE, "interface_path": f"{interface_id}/{chat_id}"},
+            original_message=message,
+        )
+        log_info(f"[QUEUE] Reported the missing engine to {interface_id}/{chat_id}")
+    except Exception as exc:
+        log_warning(f"[QUEUE] Could not report the missing engine: {exc}")
+
+
 async def enqueue(
     bot,
     message,
@@ -840,9 +901,13 @@ async def enqueue(
         f"[QUEUE] DEBUG: User {user_id} is not blocked or is trainer, continuing processing"
     )
 
-    plugin = plugin_instance.get_plugin()
+    plugin = await ensure_active_plugin("incoming message")
     if not plugin:
-        log_error("[QUEUE] No active plugin")
+        log_error(
+            "[QUEUE] No active plugin: nothing can answer this message. "
+            "No usable engine is configured, or the configured one could not load."
+        )
+        await notify_unanswerable(bot, message, interface_id)
         if response_future is not None and not response_future.done():
             response_future.set_result(None)
         return
@@ -1438,32 +1503,13 @@ async def _consumer_loop() -> None:
                     f"[QUEUE] Processing message from chat {final.get('chat_id')}"
                 )
 
-            plugin = plugin_instance.get_plugin()
+            plugin = await ensure_active_plugin("queued message")
             if not plugin:
-                # For grillo internal beats, attempt a one-time auto-load from config
-                # before giving up — beats fire on a timer and must not be silently dropped.
-                _is_grillo = final.get("interface") == "grillo" or (
-                    isinstance(final.get("context"), dict)
-                    and final["context"].get("grillo_beat")
+                log_error(
+                    "[QUEUE] No active plugin when dispatching: nothing can answer "
+                    "this message, because no usable engine is configured"
                 )
-                if _is_grillo:
-                    try:
-                        from core.config import get_active_cortex_engine as _gace
-
-                        _engine_name = await _gace(scope="base")
-                        await plugin_instance.load_plugin(
-                            _engine_name, ensure_started=True
-                        )
-                        plugin = plugin_instance.get_plugin()
-                        if plugin:
-                            log_info(
-                                f"[QUEUE] Auto-loaded engine '{_engine_name}' for grillo beat"
-                            )
-                    except Exception as _e:
-                        log_warning(f"[QUEUE] Auto-load for grillo beat failed: {_e}")
-                if not plugin:
-                    log_error("[QUEUE] No active plugin when dispatching")
-                    continue
+                continue
 
             try:
                 max_messages, window_seconds, trainer_fraction = plugin.get_rate_limit()

@@ -515,3 +515,98 @@ async def test_in_flight_clearing_silences_the_stall_report(monkeypatch):
 
     message_queue._clear_item_in_flight()
     assert message_queue._stalled_item_report() is None
+
+
+# ---------------------------------------------------------------------------
+# The engine the user chose after startup
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_engine_is_loaded_on_demand_when_none_is_active(monkeypatch):
+    """An install that picks its engine after startup must still be able to answer.
+
+    The engine is loaded once during core init, and the first-run setup page asks the
+    user for one afterwards. Without this the queue dropped every message with a log
+    line: no reply, nothing on screen, and nothing the user would think to grep for.
+    """
+    state = {"plugin": None}
+    loaded: list[str] = []
+
+    def fake_get():
+        return state["plugin"]
+
+    async def fake_load(name, **kwargs):
+        loaded.append(name)
+        state["plugin"] = object()
+
+    async def fake_active(scope=None):
+        return "my-endpoint"
+
+    monkeypatch.setattr(message_queue.plugin_instance, "get_plugin", fake_get)
+    monkeypatch.setattr(message_queue.plugin_instance, "load_plugin", fake_load)
+    monkeypatch.setattr("core.config.get_active_cortex_engine", fake_active)
+
+    plugin = await message_queue.ensure_active_plugin("test")
+
+    assert plugin is state["plugin"], "the loaded plugin must be handed back"
+    assert loaded == ["my-endpoint"], "the configured engine must be loaded once"
+
+
+@pytest.mark.asyncio
+async def test_an_already_active_engine_is_not_reloaded(monkeypatch):
+    existing = object()
+    monkeypatch.setattr(message_queue.plugin_instance, "get_plugin", lambda: existing)
+
+    async def fake_load(name, **kwargs):  # pragma: no cover - must not run
+        raise AssertionError("an active engine was reloaded")
+
+    monkeypatch.setattr(message_queue.plugin_instance, "load_plugin", fake_load)
+
+    assert await message_queue.ensure_active_plugin("test") is existing
+
+
+@pytest.mark.asyncio
+async def test_a_failed_on_demand_load_returns_nothing_instead_of_raising(monkeypatch):
+    """Doubt in this helper must not take the queue down with it.
+
+    'anthropic' is the registry default and is not available on a fresh native
+    install, so this is the real failure this has to survive.
+    """
+    monkeypatch.setattr(message_queue.plugin_instance, "get_plugin", lambda: None)
+
+    async def fake_active(scope=None):
+        raise ValueError("Cortex engine 'anthropic' is not available")
+
+    monkeypatch.setattr("core.config.get_active_cortex_engine", fake_active)
+
+    assert await message_queue.ensure_active_plugin("test") is None
+
+
+@pytest.mark.asyncio
+async def test_an_unanswerable_message_is_reported_to_the_interface():
+    """Silence was the bug: the WebUI drew no bubble and no error at all."""
+    sent = []
+
+    class _Interface:
+        async def send_message(self, payload, original_message=None):
+            sent.append(payload)
+
+    message = SimpleNamespace(chat_id="webui_default")
+    await message_queue.notify_unanswerable(_Interface(), message, "synth_webui")
+
+    assert sent, "the user has to be told something"
+    assert sent[0]["interface_path"] == "synth_webui/webui_default"
+    assert "engine" in sent[0]["text"].lower()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_notice_never_breaks_the_queue():
+    """This runs inside the queue's failure path, so it cannot raise."""
+
+    class _Broken:
+        async def send_message(self, payload, original_message=None):
+            raise RuntimeError("no websocket")
+
+    message = SimpleNamespace(chat_id="webui_default")
+    await message_queue.notify_unanswerable(_Broken(), message, "synth_webui")
