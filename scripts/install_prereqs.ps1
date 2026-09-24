@@ -91,6 +91,37 @@ function Get-Archive([string]$Url, [string]$Destination) {
     try { $client.DownloadFile($Url, $Destination) } finally { $client.Dispose() }
 }
 
+function Expand-Zip([string]$ZipPath, [string]$Destination) {
+    # Expand-Archive in PS 5.1 is slow and memory-hungry on a 300 MB archive: it
+    # pushes every entry through PowerShell objects. The .NET extractor streams
+    # them straight to disk, and when something is wrong with the file its error
+    # says what, instead of just being slow and then failing.
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $Destination)
+}
+
+function Test-UsableArchive([string]$ZipPath) {
+    # A download killed part-way leaves a truncated file behind, and a truncated
+    # archive is only rejected once the unpack is under way - a long silence in a
+    # hidden installer, with the reason swallowed. Much cheaper to notice up front.
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+        try { return ($archive.Entries.Count -gt 0) } finally { $archive.Dispose() }
+    } catch {
+        return $false
+    }
+}
+
+# An unexpected exception would otherwise end this script with exit code 1 and
+# nothing in the log to say why - exactly what a hidden installer must never do.
+# $ErrorActionPreference is 'Stop', so every unhandled error reaches this.
+trap {
+    Write-Log "  ERROR: unexpected failure: $($_.Exception.Message)"
+    Write-Host "  ERROR: unexpected failure: $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
+
 function Ensure-Uv {
     $uvPath = Join-Path $env:USERPROFILE '.local\bin\uv.exe'
     if (Test-Path $uvPath) {
@@ -132,23 +163,49 @@ function Ensure-Postgres {
     New-Item -ItemType Directory -Force -Path $TargetRoot | Out-Null
     if (Test-Path $zipPath) {
         Write-Note "using the already downloaded $zipName"
-    } else {
+        if (-not (Test-UsableArchive $zipPath)) {
+            Write-Warn2 "$zipName is incomplete or unreadable; downloading it again"
+            Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if (-not (Test-Path $zipPath)) {
         Write-Note "downloading $zipName (about 320 MB, one time)"
         try { Get-Archive $url $zipPath }
         catch { Fail "could not download $url - $($_.Exception.Message)" }
+        if (-not (Test-UsableArchive $zipPath)) {
+            Fail "the download of $zipName did not produce a readable archive; check free space on $env:SystemDrive and try again"
+        }
     }
 
-    Write-Note 'unpacking PostgreSQL'
+    # Both halves of this are slow, and both used to be silent, so each one says
+    # what it is doing and reports how long it took.
+    Write-Note 'unpacking PostgreSQL into a temporary folder'
     $staging = Join-Path $env:TEMP ("synth-pg-" + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $staging | Out-Null
-    try {
-        Expand-Archive -Path $zipPath -DestinationPath $staging -Force
-        $inner = Join-Path $staging 'pgsql'
-        if (-not (Test-Path $inner)) { Fail 'the downloaded archive did not contain a pgsql folder' }
-        Copy-Item -Path $inner -Destination $TargetRoot -Recurse -Force
-    } finally {
+    $started = Get-Date
+    $unpackError = $null
+    try { Expand-Zip $zipPath $staging }
+    catch { $unpackError = $_.Exception.Message }
+    if ($unpackError) {
         Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
+        Fail "could not unpack $zipPath - $unpackError"
     }
+    Write-Note ("unpacked in {0:n0}s" -f ((Get-Date) - $started).TotalSeconds)
+
+    $inner = Join-Path $staging 'pgsql'
+    if (-not (Test-Path $inner)) {
+        Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
+        Fail 'the downloaded archive did not contain a pgsql folder'
+    }
+
+    Write-Note "installing into $TargetRoot"
+    $started = Get-Date
+    $copyError = $null
+    try { Copy-Item -Path $inner -Destination $TargetRoot -Recurse -Force }
+    catch { $copyError = $_.Exception.Message }
+    Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
+    if ($copyError) { Fail "could not copy PostgreSQL into $TargetRoot - $copyError" }
+    Write-Note ("installed in {0:n0}s" -f ((Get-Date) - $started).TotalSeconds)
 
     if (-not (Test-Path $psql)) { Fail 'PostgreSQL was unpacked but psql.exe is missing' }
     Write-Ok "PostgreSQL provisioned ($((& $psql --version) -replace '\s+', ' '))"
@@ -221,7 +278,7 @@ function Ensure-Ffmpeg {
     $staging = Join-Path $env:TEMP ("synth-ffmpeg-" + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $staging | Out-Null
     try {
-        Expand-Archive -Path $zipPath -DestinationPath $staging -Force
+        Expand-Zip $zipPath $staging
         $exe = Get-ChildItem -Path $staging -Filter 'ffmpeg.exe' -Recurse -ErrorAction SilentlyContinue |
             Select-Object -First 1
         if (-not $exe) { Write-Warn2 'ffmpeg.exe was not found in the downloaded archive'; return }
@@ -229,6 +286,8 @@ function Ensure-Ffmpeg {
         New-Item -ItemType Directory -Force -Path $target | Out-Null
         Copy-Item (Join-Path $exe.DirectoryName '*') $target -Recurse -Force
         Write-Ok "ffmpeg installed at $target"
+    } catch {
+        Write-Warn2 "could not unpack ffmpeg: $($_.Exception.Message)"
     } finally {
         Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
     }
