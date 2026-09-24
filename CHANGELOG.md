@@ -92,6 +92,21 @@
 
 **Not verified:** `install.sh` has only been dry-run tested under a fake `uname` shim and has never run on a real Linux host (`shellcheck` unavailable, so only `bash -n` passed), and the installer has been compiled but not run end to end — a silent install pulls ~320 MB of PostgreSQL plus ~2 GB of wheels, so that is left as a manual step.
 
+### chore(grillo): the day-unit settings became real settings, and the 14 orphaned summaries are back in `memories`  <!-- 2026-09-25 -->
+
+**Why:** two loose ends from the fix below. The day-unit keys were read through `config_registry.get_value(key, default)`, which registers an unknown key implicitly: they worked, but they sat in the settings panel as untyped strings in the `core` group, where a wrong edit (a stray character in a bool) is silently ignored by the cast that follows. And the 14 summaries the broken write path orphaned were still only in `archived_memories` and `ai_diary_archive`, which nothing reads at prompt time, so the months they cover stayed unreachable.
+
+**What changed:**
+- The seven day-unit keys are registered in the plugin's `__init__` with their real type, a label, and a description saying what the number does and what the old behaviour was. They are read on every run rather than once at boot, so a settings-panel edit takes effect without a restart.
+- `scripts/backfill_compacted_memories.py --apply` ran against the live store: `memories` 0 to 14, source `compaction_backfill`, every row tagged `archived_id:<n>` so a second run writes nothing. `archived_memories` (14), `ai_diary` (18) and `ai_diary_archive` (34) were left exactly as they were. The backfill only inserts: nothing was deleted or updated.
+
+**Measured after the backfill (2026-09-25, live):** for the tokens of a real message to her, the 100-row pool the prompt's memory block is drawn from contained all 14 recovered summaries, from rank 8 down (the newest rows take the top slots). What they contain is the old path's shape, and it shows: 3 mention Minecraft, 2 rain, 2 bed, and 0 mention a roof. Reachable beats unreachable, and the roof comes back with the day-unit pass, whose first live run is the scheduled one at 03:00 UTC.
+
+**Also unblocked by the same line (observed live 2026-09-25 00:38):** `insert_memory` was not the compactor's private path. Every memory writer went through it, so every writer was failing silently. The first evidence after the fix is `source='grillo_observer'`: 7 memories written in one burst at 00:38:41, one per notable line the observer picked out of the last hours of chat across four sessions. `memories` therefore now grows from more than one source, which is why rows carry a `source` and the compactor's own rows stay countable on their own (`source='compaction'`).
+
+**Notes:** `tests/test_grillo_compactor_day_units.py`, `tests/test_memory_write_path.py` and the extended `tests/test_grillo_compactor_persist.py` all pass (27) after the registration change. `docs/grillo_compaction.rst` documents the day-unit pass and every key; `MEMORY_COMPACTION_PLAN.md` sections 4 and 7 carry the live verification scripts.
+
+
 ### fix(memory): compaction wrote nothing for months because insert_memory handed asyncpg a string, and level 1 compacted a week instead of a day  <!-- 2026-09-25 -->
 
 **Symptom (live, measured 2026-09-24):** the nightly compactor ran on cadence and left `memories` empty (`count(*)` = 0 and `n_tup_ins` = 0 in `pg_stat_user_tables`) while `archived_memories` held 14 rows and `ai_diary_archive` 34. The runs at 03:00 on 09-22 and 09-23 therefore summarised 44 diary days into 14 summaries, archived and **deleted** the source rows, and wrote no memory at all. Recall queries `memories`, so none of it was reachable from a prompt: recoverable from the archive table, not reachable by recall.
