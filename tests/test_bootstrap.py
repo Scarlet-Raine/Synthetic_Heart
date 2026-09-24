@@ -8,7 +8,12 @@ what these tests cover: no database, no network, no uv sync.
 from __future__ import annotations
 
 import importlib.util
+import os
+import shutil
 import string
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -407,6 +412,119 @@ def test_initdb_timing_out_names_the_likely_cause(
     assert str(bootstrap.INITDB_TIMEOUT_SEC) in text
     assert "antivirus" in text.lower(), "the usual cause must be named"
     assert "again" in text.lower(), "the user must know a retry is safe"
+
+
+def test_run_command_captures_output_without_using_pipes() -> None:
+    """Output is captured, with the reader no longer being the child's lifeline.
+
+    Pipes are why a killed installer left a child blocked forever on write, holding
+    the DLLs that then locked the install directory. The observable behaviour has
+    to stay the same, though: stdout, stderr and the combined view.
+    """
+    result = bootstrap.run_command(
+        [
+            sys.executable,
+            "-c",
+            "import sys; print('out-line'); sys.stderr.write('err-line')",
+        ],
+        timeout=60,
+    )
+    assert result.ok
+    assert "out-line" in result.stdout
+    assert "err-line" in result.stderr
+    assert "out-line" in result.output and "err-line" in result.output
+
+
+def test_run_command_reports_a_nonzero_exit() -> None:
+    result = bootstrap.run_command([sys.executable, "-c", "import sys; sys.exit(3)"])
+    assert result.returncode == 3
+    assert not result.ok
+
+
+def test_run_command_closes_stdin_so_a_prompt_cannot_hang() -> None:
+    """An unattended install must fail on a prompt, never wait for one."""
+    result = bootstrap.run_command(
+        [sys.executable, "-c", "import sys; sys.stdin.read(); print('eof')"],
+        timeout=60,
+    )
+    assert "eof" in result.stdout, "stdin was not closed, so this would have blocked"
+
+
+def test_run_command_reports_a_timeout_as_a_timeout() -> None:
+    result = bootstrap.run_command(
+        [sys.executable, "-c", "import time; time.sleep(30)"], timeout=2
+    )
+    assert result.returncode == 124
+    assert "timed out" in result.output
+
+
+def test_the_cluster_stop_clears_leftovers_even_with_no_cluster(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The process that locks the directory exists precisely when there is no cluster.
+
+    A run that died during initdb leaves its initdb behind and never creates a
+    cluster, so returning early on "no cluster to stop" skipped the cleanup in
+    exactly the case that needed it: the next install then failed on a locked
+    icudt67.dll with nothing pointing at the holder.
+    """
+    bin_dir = tmp_path / "pgsql" / "bin"
+    bin_dir.mkdir(parents=True)
+    called: list[object] = []
+    monkeypatch.setattr(bootstrap, "_cluster_dir", lambda: tmp_path / "pgsql")
+    monkeypatch.setattr(
+        bootstrap,
+        "stop_leftover_processes",
+        lambda reporter, directory: (called.append(directory), [4242])[1],
+    )
+
+    reporter = bootstrap.Reporter(1, quiet=True)
+    assert bootstrap.stop_portable_cluster(reporter, pg_bin=str(bin_dir)) is True
+    assert called == [bin_dir], "leftovers must be cleared with no cluster present"
+    assert any("no private cluster" in message for message in reporter.messages)
+
+
+def test_stop_leftover_processes_declines_an_unknown_directory(
+    tmp_path: Path,
+) -> None:
+    """Nothing to clear in a directory that does not exist, and no shelling out."""
+    reporter = bootstrap.Reporter(1, quiet=True)
+    assert bootstrap.stop_leftover_processes(reporter, tmp_path / "not-here") == []
+    assert bootstrap.stop_leftover_processes(reporter, None) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="only Windows leaves children running")
+def test_the_leftover_sweep_stops_a_real_process(tmp_path: Path) -> None:
+    """Proved against a real process, because the point is what Windows does.
+
+    A directory whose files a running process holds open is exactly the state the
+    installer failed in, so this spawns a process from a directory we own and
+    requires the sweep to end it - and to leave an idle directory alone.
+    """
+    source = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "ping.exe"
+    if not source.is_file():
+        pytest.skip("ping.exe is not available to use as a victim")
+    victim = tmp_path / "ping.exe"
+    shutil.copy2(source, victim)
+    proc = subprocess.Popen(
+        [str(victim), "-n", "60", "127.0.0.1"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        time.sleep(1.5)
+        reporter = bootstrap.Reporter(1, quiet=True)
+        killed = bootstrap.stop_leftover_processes(reporter, tmp_path)
+        time.sleep(1.0)
+        assert proc.pid in killed, "the running process was not found"
+        assert proc.poll() is not None, "the sweep claimed success but it survived"
+
+        idle = tmp_path / "idle"
+        idle.mkdir()
+        assert bootstrap.stop_leftover_processes(reporter, idle) == []
+    finally:
+        if proc.poll() is None:
+            proc.kill()
 
 
 def test_ensure_extensions_reports_success(monkeypatch: pytest.MonkeyPatch) -> None:

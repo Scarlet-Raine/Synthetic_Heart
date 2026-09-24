@@ -46,6 +46,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -335,11 +336,30 @@ def run_command(
     merged_env = dict(os.environ)
     if env:
         merged_env.update(env)
+
+    # Output goes to temporary FILES, deliberately, rather than to pipes. A pipe
+    # is only readable while its reader lives, so a child whose installer was
+    # closed blocks forever on write - and a blocked child keeps every DLL it
+    # loaded, which then locks the install directory against the next attempt.
+    # A file never blocks: an orphaned child finishes or dies instead of becoming
+    # a permanent lock. It also stops a server that inherited our pipes (pg_ctl
+    # start spawns one) from holding this call open until it times out.
+    # Kept as one value so the "not capturing" case narrows both streams at once:
+    # a pair of separate optionals cannot be narrowed by a check on one of them.
+    captured = (
+        (
+            tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace"),
+            tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace"),
+        )
+        if capture
+        else None
+    )
     try:
         completed = subprocess.run(
             command,
             input=input_text,
-            capture_output=capture,
+            stdout=captured[0] if captured else None,
+            stderr=captured[1] if captured else None,
             text=True,
             env=merged_env,
             timeout=timeout,
@@ -352,11 +372,18 @@ def run_command(
         return CommandResult(
             124, "", f"timed out after {timeout}s: {' '.join(command)}"
         )
-    return CommandResult(
-        completed.returncode,
-        completed.stdout or "",
-        completed.stderr or "",
-    )
+    if captured is None:
+        return CommandResult(completed.returncode, "", "")
+    out_file, err_file = captured
+    try:
+        out_file.seek(0)
+        stdout_text = out_file.read()
+        err_file.seek(0)
+        stderr_text = err_file.read()
+    finally:
+        out_file.close()
+        err_file.close()
+    return CommandResult(completed.returncode, stdout_text, stderr_text)
 
 
 # ---------------------------------------------------------------------------
@@ -624,35 +651,93 @@ def ensure_portable_cluster(
     return None
 
 
+def _powershell_path() -> str | None:
+    """The Windows PowerShell that ships with the OS, if we are on Windows."""
+    if os.name != "nt":
+        return None
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    candidate = (
+        Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    )
+    if candidate.is_file():
+        return str(candidate)
+    return shutil.which("powershell")
+
+
+def stop_leftover_processes(
+    reporter: Reporter, directory: Path | str | None
+) -> list[int]:
+    """Stop processes still running out of *directory*. Windows only.
+
+    A killed installer leaves its children behind, because Windows does not kill a
+    child along with its parent. A surviving initdb or PostgreSQL server keeps
+    every DLL it loaded (icudt67.dll is the one Windows names) locked inside the
+    install directory, and Windows will not delete or overwrite those files - so
+    the next install fails on an unexplained file lock and the uninstall cannot
+    remove the directory either. Only processes whose executable lives inside our
+    own directory are touched.
+    """
+    powershell = _powershell_path()
+    if powershell is None or not directory:
+        return []
+    target = Path(directory)
+    if not target.exists():
+        return []
+
+    prefix = str(target).lower().replace("'", "''")
+    script = (
+        "Get-CimInstance Win32_Process | "
+        f"Where-Object {{ $_.ExecutablePath -and "
+        f"$_.ExecutablePath.ToLower().StartsWith('{prefix}') }} | "
+        "ForEach-Object { Write-Output $_.ProcessId; "
+        "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+    )
+    result = run_command([powershell, "-NoProfile", "-Command", script], timeout=60)
+    pids = [int(line) for line in result.stdout.split() if line.strip().isdigit()]
+    if pids:
+        reporter.detail(f"stopped {len(pids)} process(es) still running from {target}")
+    return pids
+
+
 def stop_portable_cluster(reporter: Reporter, *, pg_bin: str | None = None) -> bool:
-    """Stop the private cluster, if one exists. Used by the uninstaller.
+    """Stop the private cluster and anything else running from its bin directory.
 
     Returns True when there is nothing left running. The uninstaller deletes the
     PostgreSQL binaries, and Windows will not delete files a process holds open,
     so this has to happen before the directory is removed.
     """
+    bin_dir = Path(pg_bin) if pg_bin else None
     cluster = _cluster_dir()
-    if not (cluster / "PG_VERSION").is_file():
+    has_cluster = (cluster / "PG_VERSION").is_file()
+    stopped = False
+
+    if has_cluster:
+        pg_ctl = find_pg_tool("pg_ctl", pg_bin)
+        if not pg_ctl:
+            reporter.warn(
+                "pg_ctl was not found; the cluster cannot be stopped automatically"
+            )
+        else:
+            # -m fast lets open connections finish their current statement and then
+            # disconnects them, which is what we want for a shutdown we asked for.
+            result = run_command(
+                [pg_ctl, "-D", str(cluster), "-m", "fast", "-w", "stop"], timeout=120
+            )
+            if result.ok or "not running" in result.output.lower():
+                reporter.detail("private cluster stopped")
+                stopped = True
+            else:
+                reporter.warn(f"pg_ctl stop reported: {result.output.strip()}")
+    else:
         reporter.detail("no private cluster to stop")
-        return True
 
-    pg_ctl = find_pg_tool("pg_ctl", pg_bin)
-    if not pg_ctl:
-        reporter.warn(
-            "pg_ctl was not found; the cluster cannot be stopped automatically"
-        )
-        return False
-
-    # -m fast lets open connections finish their current statement and then
-    # disconnects them, which is what we want for a shutdown we asked for.
-    result = run_command(
-        [pg_ctl, "-D", str(cluster), "-m", "fast", "-w", "stop"], timeout=120
-    )
-    if result.ok or "not running" in result.output.lower():
-        reporter.detail("private cluster stopped")
-        return True
-    reporter.warn(f"pg_ctl stop reported: {result.output.strip()}")
-    return False
+    # Regardless of the cluster state, clear anything still running from our own
+    # bin directory. This is the case that matters most: an attempt that died
+    # before ever creating a cluster leaves an initdb behind holding exactly the
+    # files the next install needs to overwrite, and the old code returned early
+    # here precisely because no cluster existed.
+    leftovers = stop_leftover_processes(reporter, bin_dir)
+    return not has_cluster or stopped or bool(leftovers)
 
 
 def psql_query(

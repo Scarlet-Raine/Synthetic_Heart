@@ -122,6 +122,33 @@ trap {
     exit 1
 }
 
+function Stop-Leftovers([string]$Root) {
+    # A killed installer leaves its children behind: on Windows a child is not
+    # killed along with its parent, so an initdb or a server from an earlier
+    # attempt keeps running with every DLL it loaded still locked inside the
+    # install directory (icudt67.dll is the usual one to be reported). Windows
+    # then refuses to overwrite those files, and the next install fails on a file
+    # lock that names a DLL and nothing else. Only processes whose executable is
+    # inside our own install directory are touched.
+    $stale = @()
+    try {
+        $stale = @(Get-CimInstance Win32_Process -ErrorAction Stop |
+            Where-Object { $_.ExecutablePath -and $_.ExecutablePath.ToLower().StartsWith($Root.ToLower()) })
+    } catch {
+        Write-Warn2 "could not list running processes: $($_.Exception.Message)"
+        return
+    }
+    foreach ($proc in $stale) {
+        Write-Warn2 "stopping a leftover $($proc.Name) (pid $($proc.ProcessId)) from an earlier attempt"
+        try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop }
+        catch { Write-Warn2 "could not stop pid $($proc.ProcessId): $($_.Exception.Message)" }
+    }
+    if ($stale.Count -gt 0) {
+        # Give Windows a moment to release the handles those processes held.
+        Start-Sleep -Seconds 2
+    }
+}
+
 function Ensure-Uv {
     $uvPath = Join-Path $env:USERPROFILE '.local\bin\uv.exe'
     if (Test-Path $uvPath) {
@@ -200,11 +227,26 @@ function Ensure-Postgres {
 
     Write-Note "installing into $TargetRoot"
     $started = Get-Date
-    $copyError = $null
-    try { Copy-Item -Path $inner -Destination $TargetRoot -Recurse -Force }
-    catch { $copyError = $_.Exception.Message }
+    $attempt = 0
+    while ($true) {
+        Stop-Leftovers $TargetRoot
+        $copyError = $null
+        try { Copy-Item -Path $inner -Destination $TargetRoot -Recurse -Force }
+        catch { $copyError = $_.Exception.Message }
+        if (-not $copyError) { break }
+        $attempt++
+        # Two more goes: the usual holder is a leftover process from a previous
+        # attempt, which Stop-Leftovers has just cleared, and a real-time
+        # antivirus scan releases its handle on its own a moment later.
+        if ($attempt -ge 3) { break }
+        Write-Warn2 "copy attempt $attempt failed: $copyError"
+        Start-Sleep -Seconds 3
+    }
     Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
-    if ($copyError) { Fail "could not copy PostgreSQL into $TargetRoot - $copyError" }
+    if ($copyError) {
+        Fail ("could not copy PostgreSQL into $TargetRoot - $copyError" +
+            " (something is holding those files; close any running SyntH or PostgreSQL process and try again)")
+    }
     Write-Note ("installed in {0:n0}s" -f ((Get-Date) - $started).TotalSeconds)
 
     if (-not (Test-Path $psql)) { Fail 'PostgreSQL was unpacked but psql.exe is missing' }
