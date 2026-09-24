@@ -433,6 +433,20 @@ class GrilloPlugin(AIPluginBase):
             from core import message_queue
 
             allowed_action_types = self._get_allowed_action_types_for_beat(beat_type)
+            # A beat plugin may need to hand the executor a decision it cannot
+            # put in the prompt itself, e.g. the diary consolidator saying how
+            # much of a day a part-merge covers so the write keeps the rest of
+            # it. Read once here, and clear it so it cannot ride a later beat.
+            pending_context: dict = {}
+            try:
+                beat_plugin = self.beat_plugins.get(beat_type)
+                pending = getattr(beat_plugin, "pending_beat_context", None)
+                if isinstance(pending, dict) and pending:
+                    pending_context = dict(pending)
+                    # Clear it so the handoff cannot ride a later beat.
+                    setattr(beat_plugin, "pending_beat_context", None)
+            except Exception as exc:
+                log_debug(f"[grillo] Beat context handoff skipped: {exc}")
             activity_log_id: Optional[int] = None
             try:
                 activity_log_id = await self.create_activity_log(
@@ -478,6 +492,7 @@ class GrilloPlugin(AIPluginBase):
                     "activity_log_id": activity_log_id,
                     "allowed_action_types": allowed_action_types,
                     "skip_history": True,
+                    **pending_context,
                 },
                 "priority": False,
             }
