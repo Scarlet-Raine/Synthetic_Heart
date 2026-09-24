@@ -336,6 +336,79 @@ def test_main_records_the_invocation_in_the_log(tmp_path: Path) -> None:
     assert "===" in text, "entries must be separated so repeats are distinguishable"
 
 
+def _stub_portable_cluster(monkeypatch: pytest.MonkeyPatch, cluster: Path) -> None:
+    """Point the portable-cluster helpers at *cluster* and at fake binaries."""
+    monkeypatch.setattr(bootstrap, "_cluster_dir", lambda: cluster)
+    monkeypatch.setattr(bootstrap, "_read_superuser_password", lambda: None)
+    monkeypatch.setattr(bootstrap, "find_pg_tool", lambda *a, **k: "fake-pg-tool")
+    monkeypatch.setattr(bootstrap, "generate_password", lambda length: "x" * length)
+
+
+def test_a_half_created_cluster_is_removed_before_retrying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """initdb refuses a non-empty directory, so a stopped attempt must not block.
+
+    A previous run that hit the timeout (or was closed) leaves a partial cluster
+    behind. Without this cleanup the retry fails with "directory exists but is
+    not empty", which says nothing about what actually happened.
+    """
+    cluster = tmp_path / "pgsql"
+    cluster.mkdir(parents=True)
+    (cluster / "leftover-from-a-killed-initdb").write_text("x", encoding="utf-8")
+    _stub_portable_cluster(monkeypatch, cluster)
+    monkeypatch.setattr(
+        bootstrap,
+        "run_command",
+        lambda *a, **k: bootstrap.CommandResult(1, "", "initdb says no"),
+    )
+
+    reporter = bootstrap.Reporter(1, quiet=True)
+    assert bootstrap.ensure_portable_cluster(reporter, pg_bin=None, port=5433) is None
+    assert not cluster.exists(), "the half-built cluster must be removed for the retry"
+    assert any("half-created" in warning for warning in reporter.warnings)
+
+
+def test_the_cluster_step_reports_where_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The log must not be silent across initdb; silence is a hang to a user."""
+    _stub_portable_cluster(monkeypatch, tmp_path / "pgsql")
+    monkeypatch.setattr(
+        bootstrap, "run_command", lambda *a, **k: bootstrap.CommandResult(0, "", "")
+    )
+    monkeypatch.setattr(
+        bootstrap, "psql_query", lambda *a, **k: bootstrap.CommandResult(0, "1", "")
+    )
+
+    reporter = bootstrap.Reporter(1, quiet=True)
+    bootstrap.ensure_portable_cluster(reporter, pg_bin=None, port=5433)
+    text = "\n".join(reporter.messages)
+    assert "running initdb" in text, "the slow step must announce itself"
+    assert "starting the server" in text
+    assert "cluster created in" in text
+    assert "private cluster is up" in text
+
+
+def test_initdb_timing_out_names_the_likely_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unexplained timeout sends the user to the wrong place."""
+    _stub_portable_cluster(monkeypatch, tmp_path / "pgsql")
+    monkeypatch.setattr(
+        bootstrap,
+        "run_command",
+        lambda *a, **k: bootstrap.CommandResult(124, "", "timed out"),
+    )
+
+    reporter = bootstrap.Reporter(1, quiet=True)
+    assert bootstrap.ensure_portable_cluster(reporter, pg_bin=None, port=5433) is None
+    text = "\n".join(reporter.messages)
+    assert str(bootstrap.INITDB_TIMEOUT_SEC) in text
+    assert "antivirus" in text.lower(), "the usual cause must be named"
+    assert "again" in text.lower(), "the user must know a retry is safe"
+
+
 def test_ensure_extensions_reports_success(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         bootstrap, "psql_query", lambda *a, **k: bootstrap.CommandResult(0, "", "")

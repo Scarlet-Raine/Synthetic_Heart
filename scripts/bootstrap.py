@@ -60,6 +60,12 @@ DEFAULT_DB_PORT = 5432
 DEFAULT_WEBUI_PORT = 8080
 DEFAULT_API_PORT = 11435
 
+#: initdb writes roughly a thousand small files. Twenty seconds is typical and
+#: two minutes is already a slow disk, so five minutes is a hang detector rather
+#: than a performance target - the bound exists so a wedged initdb reports itself
+#: instead of leaving a hidden installer parked with nothing in the log.
+INITDB_TIMEOUT_SEC = 300
+
 #: Ports the bootstrap will try in order when the preferred one is taken.
 PORT_SEARCH_SPAN = 40
 
@@ -501,6 +507,15 @@ def ensure_portable_cluster(
     cluster = _cluster_dir()
     superuser_password = _read_superuser_password()
     if not (cluster / "PG_VERSION").is_file():
+        if cluster.exists() and any(cluster.iterdir()):
+            # A previous attempt stopped part-way through initdb (its timeout, or
+            # the installer being closed). initdb refuses a directory that is not
+            # empty, so the half-built cluster has to go before we can retry. The
+            # directory is ours, under the data root.
+            reporter.warn(
+                f"removing a half-created cluster from an earlier attempt: {cluster}"
+            )
+            shutil.rmtree(cluster, ignore_errors=True)
         reporter.detail(f"creating a private PostgreSQL cluster in {cluster}")
         # Only the parent is created: initdb insists on creating the cluster
         # directory itself and refuses a directory that is not empty.
@@ -514,6 +529,16 @@ def ensure_portable_cluster(
             os.chmod(pwfile, 0o600)
         except Exception:
             pass
+        # initdb writes roughly a thousand small files, so on a slow disk (or
+        # with real-time antivirus watching the install folder) it takes minutes.
+        # It is the one genuinely slow step, and this line exists because the log
+        # used to be silent across the whole initdb/start/ready sequence, which
+        # is indistinguishable from a hang.
+        reporter.detail(
+            "running initdb (a minute or two is normal; this is the last line "
+            "until it returns)"
+        )
+        started_at = time.monotonic()
         try:
             result = run_command(
                 [
@@ -527,7 +552,7 @@ def ensure_portable_cluster(
                     f"--pwfile={pwfile}",
                     "--encoding=UTF8",
                 ],
-                timeout=600,
+                timeout=INITDB_TIMEOUT_SEC,
             )
         finally:
             try:
@@ -535,8 +560,18 @@ def ensure_portable_cluster(
             except Exception:
                 pass
         if not result.ok:
-            reporter.fail(f"initdb failed: {result.output}")
+            if result.returncode == 124:
+                reporter.fail(
+                    f"initdb did not finish within {INITDB_TIMEOUT_SEC}s. That is "
+                    "far longer than it needs on any normal disk, and the usual "
+                    "cause is real-time antivirus scanning the install folder. "
+                    "Add an exclusion for the install folder and run this step "
+                    "again; the half-created cluster is cleaned up automatically."
+                )
+            else:
+                reporter.fail(f"initdb failed: {result.output}")
             return None
+        reporter.ok(f"cluster created in {time.monotonic() - started_at:.0f}s")
         _write_superuser_password(superuser_password)
     elif not superuser_password:
         reporter.warn(
@@ -548,6 +583,12 @@ def ensure_portable_cluster(
             return None
 
     log_file = cluster / "postgres.log"
+    reporter.detail(f"starting the server on 127.0.0.1:{port}")
+    # Deliberately no -w here. pg_ctl's own wait reads the server's stdout, and
+    # the server it spawns inherits our pipes, so the wait can outlive pg_ctl
+    # itself and we would block on a pipe that only stays open because the
+    # database is running. The readiness poll below is the same check, with a
+    # bound we control.
     start = run_command(
         [
             pg_ctl,
@@ -557,10 +598,9 @@ def ensure_portable_cluster(
             str(log_file),
             "-o",
             f"-p {port} -c listen_addresses=127.0.0.1",
-            "-w",
             "start",
         ],
-        timeout=120,
+        timeout=60,
     )
     if not start.ok and "already running" not in start.output.lower():
         reporter.fail(f"pg_ctl start failed: {start.output}")
