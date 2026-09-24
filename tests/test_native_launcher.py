@@ -7,6 +7,7 @@ fallback, pid bookkeeping and interpreter selection. No process is started.
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import os
 import sys
@@ -200,3 +201,110 @@ def test_venv_python_never_consults_an_absolute_posix_path_on_windows(
     source = (REPO_ROOT / "scripts" / "start_synth.py").read_text(encoding="utf-8")
     assert '"/app' not in source
     assert "'/app" not in source
+
+
+# ---------------------------------------------------------------------------
+# The tray icon: a windowless launch has to look like something happened
+# ---------------------------------------------------------------------------
+
+
+def _args(**overrides: object) -> object:
+    base = {"tray": False, "no_tray": False, "foreground": False}
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_the_tray_is_shown_by_default_on_a_windows_desktop_launch() -> None:
+    """The installer's shortcut and its finish action both take this path."""
+    expected = os.name == "nt"
+    assert start_synth.wants_tray(_args()) is expected
+
+
+def test_a_foreground_run_uses_its_console_instead_of_the_tray() -> None:
+    assert start_synth.wants_tray(_args(foreground=True)) is False
+
+
+def test_no_tray_and_tray_win_over_the_default() -> None:
+    assert start_synth.wants_tray(_args(no_tray=True, tray=True)) is False
+    assert start_synth.wants_tray(_args(tray=True)) is True
+
+
+def test_the_tray_command_points_at_the_script_and_the_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(start_synth.os, "name", "nt")
+    monkeypatch.setattr(start_synth, "REPO_ROOT", tmp_path)
+    script = tmp_path / "scripts" / "synth_tray.ps1"
+    script.parent.mkdir(parents=True)
+    script.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        start_synth.shutil, "which", lambda name: "C:/ps/powershell.exe"
+    )
+
+    command = start_synth.tray_command(tmp_path / ".env")
+
+    assert command is not None
+    assert command[0] == "C:/ps/powershell.exe"
+    assert str(script) in command
+    # The tray reads the same .env, so it probes the port and scheme the app was
+    # actually configured with rather than a hard-coded 8080.
+    assert str(tmp_path / ".env") in command
+    assert "-WindowStyle" in command and "Hidden" in command
+
+
+def test_there_is_no_tray_outside_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(start_synth.os, "name", "posix")
+    assert start_synth.tray_command(tmp_path / ".env") is None
+    assert start_synth.spawn_tray(tmp_path / ".env") is False
+
+
+def test_a_missing_tray_script_is_not_an_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source tree without the script still starts SyntH."""
+    monkeypatch.setattr(start_synth.os, "name", "nt")
+    monkeypatch.setattr(start_synth, "REPO_ROOT", tmp_path)
+    assert start_synth.tray_command(tmp_path / ".env") is None
+
+
+def test_spawn_tray_launches_it_detached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(start_synth.os, "name", "nt")
+    monkeypatch.setattr(
+        start_synth, "tray_command", lambda env_file: ["powershell", "-File", "tray"]
+    )
+    launched: list[tuple[list[str], dict]] = []
+
+    class _Process:
+        pid = 4242
+
+    def fake_popen(command, **kwargs):
+        launched.append((list(command), kwargs))
+        return _Process()
+
+    monkeypatch.setattr(start_synth.subprocess, "Popen", fake_popen)
+
+    assert start_synth.spawn_tray(tmp_path / ".env") is True
+    assert launched and launched[0][0] == ["powershell", "-File", "tray"]
+    # Detached: the launcher exits after opening the browser and must not take the
+    # icon down with it.
+    assert launched[0][1].get("creationflags")
+
+
+def test_the_tray_script_offers_the_actions_the_icon_promises() -> None:
+    """The menu is the feature: pin its entries against a rename or a rewrite."""
+    script = REPO_ROOT / "scripts" / "synth_tray.ps1"
+    assert script.is_file(), "the launcher references this path"
+    text = script.read_text(encoding="utf-8")
+
+    for label in ("Open SyntH", "Restart", "Shut down", "Check for updates"):
+        assert label in text, f"missing tray menu entry: {label}"
+    # Reads the install's own .env instead of assuming a port.
+    assert "SYNTH_WEBUI_HTTP_PORT" in text
+    # Single instance, so repeated launches cannot stack icons.
+    assert "Mutex" in text
+    # The transparent artwork, not the black-tiled squircle.
+    assert "synth-tray.ico" in text

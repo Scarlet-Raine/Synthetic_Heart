@@ -197,6 +197,24 @@ DSP_CORTEX = config_registry.get_var(
     allow_env_override=False,
 )
 
+# Which of an endpoint's models to start on when its default is chosen
+# automatically. Comma or newline separated fnmatch patterns, best first; the
+# first model the endpoint reports that matches wins, and no match means the
+# endpoint's own first model. This exists because an endpoint that lists a hundred
+# models has no meaningful default: the auto-selection took whatever came first and
+# a Venice endpoint came up on a Gemini model that way.
+ENDPOINT_MODEL_PREFERENCES = config_registry.get_var(
+    "ENDPOINT_MODEL_PREFERENCES",
+    "deepseek*",
+    label="Endpoint Default Model Preference",
+    description="Ordered fnmatch patterns (comma separated) used to pick an external "
+    "endpoint's starting model, e.g. 'deepseek*,qwen*'. The first model the endpoint "
+    "lists that matches is chosen; with no match its own first model is used.",
+    group="core",
+    component="cortex",
+    allow_env_override=False,
+)
+
 # Named engine-configuration presets (extra_config + optional model bundles)
 # edited from the Engines tab.  Stored as a JSON list; hidden from the generic
 # settings grid because it is managed by the dedicated preset UI in

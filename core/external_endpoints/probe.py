@@ -254,9 +254,15 @@ async def probe_endpoint(endpoint: ExternalEndpoint, api_key: str = "") -> Probe
 
     cap_task = asyncio.create_task(adapter.probe_capabilities(models=model_infos))
     # Prefer the endpoint's configured default_model for the ping so capacity
-    # errors on a random first-in-list model don't block probing.
+    # errors on a random first-in-list model don't block probing. When none is
+    # configured yet, ping with the model the auto-selection will settle on
+    # (ENDPOINT_MODEL_PREFERENCES), so the probe validates what will actually be
+    # used instead of an arbitrary first-in-list model that may be rate-limited.
+    from core.external_endpoints.model_choice import select_default_model
+
+    ping_model = endpoint.default_model or select_default_model(model_infos)
     ping_task = asyncio.create_task(
-        adapter.ping_test(model=endpoint.default_model or None, models=model_infos)
+        adapter.ping_test(model=ping_model or None, models=model_infos)
     )
 
     try:

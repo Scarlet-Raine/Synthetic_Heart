@@ -408,12 +408,19 @@ class ExternalEndpointRegistry:
 
         ep = await self.get_endpoint(endpoint_id)
         if ep is not None:
-            # Auto-select the first available model when none has been set yet
+            # Choose a starting model when none has been set yet. An endpoint that
+            # lists a hundred and twenty models has no meaningful "first": the choice
+            # comes from ENDPOINT_MODEL_PREFERENCES (see model_choice), falling back
+            # to the endpoint's own first model.
             if status == "success" and models and ep.default_model is None:
-                await self._auto_set_default_model(endpoint_id, models[0])
-                ep = await self.get_endpoint(endpoint_id)
-                if ep is None:
-                    return
+                from core.external_endpoints.model_choice import select_default_model
+
+                chosen = select_default_model(models)
+                if chosen:
+                    await self._auto_set_default_model(endpoint_id, chosen)
+                    ep = await self.get_endpoint(endpoint_id)
+                    if ep is None:
+                        return
             await self._sync_registries(ep)
 
             # Auto-activate as cortex engine when no base cortex is set yet
@@ -510,6 +517,56 @@ class ExternalEndpointRegistry:
             except Exception:
                 pass
         log_debug(f"[ext_endpoints] Set default_model='{model}' for id={endpoint_id}")
+
+        # The runtime does not read this row for its model. Every chat turn resolves
+        # the scope model via get_active_cortex_scope() and re-applies it around the
+        # engine call (plugin_instance's scope_model_override), and that value is
+        # parsed out of the scope config keys, not from here. Updating only this row
+        # therefore left the engine on its previous model: observed live, a model set
+        # to 'deepseek-v4-1-flash' in the WebUI was still resolving as
+        # model='gemini-3-6-flash' on the very next prompt.
+        ep = await self.get_endpoint(endpoint_id)
+        if ep is not None:
+            await self._sync_scope_models(ep.engine_name(), model or None)
+
+    async def _sync_scope_models(self, engine_name: str, model: str | None) -> None:
+        """Point every cortex scope key that already names *engine_name* at *model*.
+
+        Only keys whose engine matches are rewritten, so the user's other scope
+        choices stand. An empty *model* clears the override, letting the endpoint's
+        own ``default_model`` apply. Fail-safe: a config hiccup here must not fail
+        the model change the user just made.
+        """
+        from core.config import (
+            config_registry,
+            parse_cortex_scope_value,
+            serialize_cortex_scope_value,
+        )
+
+        for key in (
+            "BASE_CORTEX",
+            "GRILLO_CORTEX",
+            "TRAINER_CORTEX",
+            "AGENT_CORTEX",
+            "LIVE_CORTEX",
+            "VESSEL_CORTEX",
+            "DSP_CORTEX",
+        ):
+            try:
+                configured_engine, current_model = parse_cortex_scope_value(
+                    config_registry.get_value(key, "")
+                )
+                if configured_engine != engine_name or current_model == model:
+                    continue
+                await config_registry.set_value(
+                    key, serialize_cortex_scope_value(engine_name, model)
+                )
+                log_info(
+                    f"[ext_endpoints] Scope {key} model set to '{model}' "
+                    f"for engine '{engine_name}'"
+                )
+            except Exception as exc:
+                log_warning(f"[ext_endpoints] Could not update scope {key}: {exc}")
 
     async def reload_endpoint(self, endpoint_id: int) -> ExternalEndpoint | None:
         """Re-read an endpoint from the DB and re-register it in all subsystems.

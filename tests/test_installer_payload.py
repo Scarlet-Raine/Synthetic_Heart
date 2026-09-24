@@ -186,6 +186,28 @@ def test_no_local_draft_at_the_root_can_be_shipped(iss_text: str) -> None:
         )
 
 
+def test_a_clean_slate_uninstall_is_opt_in(iss_text: str) -> None:
+    """data\\ and .env survive an uninstall unless the user asked otherwise.
+
+    Keeping them is deliberate: a reinstall then resumes the same persona, history
+    and keys. Removing them is the thing that must be opt-in, and it has to be
+    offered somewhere, because the installer is the only place a user is asked
+    anything about the install at all.
+    """
+    tasks = iss_text.split("[Tasks]", 1)[1].split("[", 1)[0]
+    task_lines = [line for line in tasks.splitlines() if "cleanslate" in line]
+    assert task_lines, "there is no clean-slate option to offer"
+    assert "Flags: unchecked" in task_lines[0], "a clean slate must not be the default"
+
+    uninstall = iss_text.split("[UninstallDelete]", 1)[1].split("\n[", 1)[0]
+    for name in ("{app}\\data", "{app}\\.env"):
+        entry = [line for line in uninstall.splitlines() if f'Name: "{name}"' in line]
+        assert entry, f"{name} is not handled at uninstall"
+        assert "Tasks: cleanslate" in entry[0], (
+            f"{name} would be deleted on every uninstall, not just a clean slate"
+        )
+
+
 def test_both_provisioning_steps_leave_a_log(iss_text: str) -> None:
     """Both steps run with their window hidden, so each must write a log.
 

@@ -7,6 +7,7 @@ This is what the installers' shortcuts and the Linux desktop entry invoke.  It:
 * on Windows uses ``pythonw.exe`` so no console window appears or lingers;
 * redirects output into the normal log file;
 * records a pid file so the same shortcut can stop it;
+* shows a notification-area icon on Windows, so a windowless launch is visible;
 * waits until the WebUI actually answers, then opens the browser on it.
 
 Only the standard library is used, so it also works before ``uv sync``.
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -177,6 +179,81 @@ def spawn_background(interpreter: Path | str, log_path: Path, *, console: bool) 
     return process.pid
 
 
+def tray_command(env_file: Path) -> list[str] | None:
+    """Return the command that shows the notification-area icon, if it can run.
+
+    Windows only: elsewhere SyntH is a service or a foreground process, and there is
+    no notification area to put an icon in. It runs on the system PowerShell so the
+    tray needs no dependency of its own.
+    """
+    if os.name != "nt":
+        return None
+    script = REPO_ROOT / "scripts" / "synth_tray.ps1"
+    if not script.is_file():
+        return None
+    powershell = shutil.which("powershell") or shutil.which("powershell.exe")
+    if not powershell:
+        return None
+    return [
+        powershell,
+        "-NoProfile",
+        "-WindowStyle",
+        "Hidden",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(script),
+        "-AppRoot",
+        str(REPO_ROOT),
+        "-EnvFile",
+        str(env_file),
+    ]
+
+
+def spawn_tray(env_file: Path) -> bool:
+    """Show the tray icon, reporting whether it started.
+
+    Called before waiting for the WebUI, so the icon and its "starting" balloon are
+    already on screen while SyntH boots. On a native install the launcher's own
+    window closes immediately, and without this the machine looks like it did
+    nothing at all. Best-effort: a machine without PowerShell still starts SyntH.
+    """
+    command = tray_command(env_file)
+    if not command:
+        return False
+    kwargs: dict[str, Any] = {
+        "cwd": str(REPO_ROOT),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW
+        )
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen(command, **kwargs)  # noqa: S603
+    except Exception:
+        return False
+    return True
+
+
+def wants_tray(args: argparse.Namespace) -> bool:
+    """Whether this launch should show the tray icon.
+
+    On by default for a desktop launch on Windows, because that is the launch the
+    installer creates; a foreground run has its console instead, and ``--no-tray``
+    turns it off for anything scripting the launcher.
+    """
+    if args.no_tray:
+        return False
+    if args.tray:
+        return True
+    return os.name == "nt" and not args.foreground
+
+
 def stop(quiet: bool = False) -> int:
     """Stop the background instance recorded in the pid file."""
     pid = read_pid()
@@ -267,6 +344,16 @@ def main(argv: list[str] | None = None) -> int:
         help="open the setup page instead of the WebUI (starts SyntH if needed)",
     )
     parser.add_argument(
+        "--tray",
+        action="store_true",
+        help="show the notification-area icon (default on for a Windows desktop launch)",
+    )
+    parser.add_argument(
+        "--no-tray",
+        action="store_true",
+        help="do not show the notification-area icon",
+    )
+    parser.add_argument(
         "--timeout", type=float, default=240.0, help="startup wait in seconds"
     )
     parser.add_argument("--env-file", default=str(REPO_ROOT / ".env"))
@@ -287,6 +374,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.setup:
             url = setup_url(url)
         print(f"SyntH is already running: {url}")
+        # Also a launch, from the user's point of view: if the icon is missing
+        # (a fresh session, or the icon was hidden) it comes back, and the tray's
+        # own single-instance guard keeps a second one from appearing.
+        if wants_tray(args):
+            spawn_tray(env_file)
         if args.setup or not args.no_browser:
             _open_browser(url)
         return 0
@@ -314,6 +406,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  log:         {log_path}")
     pid = spawn_background(interpreter, log_path, console=args.console)
     print(f"  pid:         {pid}")
+
+    # Before the wait, not after: this is what tells the user something is happening
+    # while the WebUI is still coming up.
+    if wants_tray(args) and spawn_tray(env_file):
+        print("  tray icon:   shown")
 
     ok, url = wait_for_webui(env_file, timeout=args.timeout, quiet=False)
     if ok:

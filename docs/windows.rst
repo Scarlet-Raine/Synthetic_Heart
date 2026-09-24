@@ -107,6 +107,16 @@ Notes and caveats
   attachments still are. SyntH adopts that state into ``data\`` on startup,
   once, without deleting the originals. Inspect it with
   ``uv run --no-project python -m core.legacy_state --dry-run``.
+- SyntH runs without a console window, so launching it looks like nothing
+  happened. A notification-area icon appears instead: it says it is starting,
+  changes to "running" once the WebUI answers, and its right-click menu opens the
+  WebUI, restarts SyntH, shuts it down, and (once updating exists) updates it.
+  "Hide this icon" leaves SyntH running; ``--no-tray`` disables it entirely.
+- Uninstalling keeps ``data\`` and ``.env`` on purpose, so a reinstall resumes the
+  same persona, history and keys. The database cluster lives in ``data\pgsql``, so
+  a reinstall reuses it rather than creating a new one. Tick "Remove all my data
+  when uninstalling" during setup if you want the install gone for good, or delete
+  those two paths by hand afterwards.
 - Selenium-based engines are being replaced by other engines; if you still use
   them, install Chrome and ``undetected-chromedriver``.
 - Some tests assume a database or other services; point them at local ones with

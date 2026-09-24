@@ -91,6 +91,7 @@
         const icons = {
             google: '🔵', anthropic: '🟠', openrouter: '⚡', github: '🐙',
             ollama: '🦙', openai: '🟢', zen: '🤖', fish: '🐟', custom: '⚙️',
+            venice: '🛶',
         };
         return icons[icon] || '🔌';
     }

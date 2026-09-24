@@ -96,6 +96,11 @@ SelectDirLabel3=Setup will install {#AppName} into the following folder.
 [Tasks]
 ; Unchecked by default: the Start Menu entry is enough for most people.
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
+; Opt-in clean slate. data\ and .env are kept by default so a reinstall resumes the
+; same persona, history and keys; this is for someone who wants the install gone for
+; good, and it is offered here because the installer is the only place a user is
+; asked about the install at all.
+Name: "cleanslate"; Description: "Remove all my data when uninstalling (&persona, history, keys, database)"; GroupDescription: "Uninstall:"; Flags: unchecked
 
 [Files]
 ; The application tree. Generated and personal things are deliberately excluded:
@@ -156,6 +161,12 @@ Type: filesandordirs; Name: "{app}\.pytest_cache"
 Type: filesandordirs; Name: "{app}\.ruff_cache"
 Type: filesandordirs; Name: "{app}\__pycache__"
 Type: files; Name: "{app}\uv.lock"
+; Only when the user asked for a clean slate at install time: data\ holds the
+; persona, the history, the encrypted endpoint secret and the database cluster,
+; and .env holds the generated credentials. Keeping them is what lets a reinstall
+; resume where the last one left off, so removing them is opt-in.
+Type: filesandordirs; Name: "{app}\data"; Tasks: cleanslate
+Type: files; Name: "{app}\.env"; Tasks: cleanslate
 
 [Code]
 const
