@@ -4048,20 +4048,26 @@ def reduce_prompt_for_llm_limit(prompt: dict, max_chars: int) -> dict:
     are NEVER removed - they are SACRED.
 
     Priority order (STEP BY STEP):
-    1. Trim `history_recent` (if present)
-    2. Trim `history_current_chat` (if present)
-    3. Slim the `actions` block (drop the per-action `examples`)
-    4. Strip the `actions` block to brief-only
+    1. Slim the `actions` block (drop the per-action `examples`)
+    2. Strip the `actions` block to brief-only
+    3. Trim `history_recent` (if present)
+    4. Trim `history_current_chat` (if present)
     5. Remove `memories` entirely if needed
     6. Remove other context sections (but KEEP any protected fields)
     7. FINAL EMERGENCY: Remove entire context (but KEEP instructions)
 
-    Steps 3/4 run BEFORE 5/6: the action catalog is the single largest
+    Steps 1/2 run BEFORE 3/4: the action catalog is the single largest
     serialized block and its redundant detail is re-supplied on demand by the
-    corrector, whereas the memory/emotion/clock/house/soul/thought blocks are
-    the grounding for the turn being answered and cannot be reconstructed.
-    With the previous order, every oversized turn deleted memories and then
-    ~20 context fields while the catalog kept its redundant `examples`.
+    corrector, whereas the conversation window IS the turn being answered --
+    a beat or an observer prompt that deletes history to make room has removed
+    the thing it was built to read, and the `history_recent` /
+    `history_current_chat` floors (3 and 1 line) mean a message-counted window
+    is the last thing that should pay for an oversized catalog. The catalog
+    steps also run before 5/6 for the same reason: the memory, emotion, clock,
+    house, soul and thought blocks are grounding and cannot be reconstructed.
+    With the original order, every oversized turn deleted history and then
+    memories and ~20 context fields while the catalog kept its redundant
+    `examples`.
 
     Note: attachment base64 data is excluded from size calculations because
     LLM engines extract it and send it as native multimodal parts.  Without
@@ -4112,16 +4118,25 @@ def reduce_prompt_for_llm_limit(prompt: dict, max_chars: int) -> dict:
     # Report where the size actually sits, so an oversized prompt names its own
     # culprit instead of only reporting the total. The serialized `actions`
     # block is by far the largest single contributor and it is reduced first
-    # (steps 3/4) precisely so the context blocks below survive.
+    # (steps 1/2) precisely so the context blocks below survive. `instructions`
+    # and `input` are reported too because neither is reducible here (the rules
+    # and the current turn are protected): when those two alone are over the
+    # limit, the CRITICAL below is unavoidable and this line says why instead of
+    # blaming the context that was just deleted for nothing.
     try:
         _actions_size = len(json_dumps(reduced_prompt.get("actions") or {}))
         _context_size = len(json_dumps(reduced_prompt.get("context") or {}))
+        _instructions_size = len(json_dumps(reduced_prompt.get("instructions") or ""))
+        _input_size = len(json_dumps(reduced_prompt.get("input") or {}))
     except Exception:
         _actions_size = -1
         _context_size = -1
+        _instructions_size = -1
+        _input_size = -1
     log_warning(
         f"[reduce_prompt] Prompt size {current_size} exceeds limit {max_chars}, reducing "
-        f"(actions block: {_actions_size} chars serialized, context: {_context_size} chars)"
+        f"(actions block: {_actions_size} chars serialized, context: {_context_size} chars, "
+        f"instructions: {_instructions_size} chars, input: {_input_size} chars)"
     )
 
     # Get references to sections
@@ -4133,37 +4148,7 @@ def reduce_prompt_for_llm_limit(prompt: dict, max_chars: int) -> dict:
     MIN_HISTORY_RECENT = 3
     MIN_HISTORY_CURRENT = 1
 
-    # === STEP 1: Trim `history_recent` if needed ===
-    while (
-        current_size > max_chars
-        and isinstance(history_recent, list)
-        and len(history_recent) > MIN_HISTORY_RECENT
-    ):
-        try:
-            history_recent.pop(0)  # Remove oldest
-        except Exception:
-            break
-        current_size = len(json_dumps(reduced_prompt)) - attachment_data_offset
-        log_debug(
-            f"[reduce_prompt] Trimmed history_recent, {len(history_recent)} remaining, now {current_size} chars"
-        )
-
-    # === STEP 2: Trim `history_current_chat` if needed ===
-    while (
-        current_size > max_chars
-        and isinstance(history_current, list)
-        and len(history_current) > MIN_HISTORY_CURRENT
-    ):
-        try:
-            history_current.pop(0)  # Remove oldest
-        except Exception:
-            break
-        current_size = len(json_dumps(reduced_prompt)) - attachment_data_offset
-        log_debug(
-            f"[reduce_prompt] Trimmed history_current_chat, {len(history_current)} remaining, now {current_size} chars"
-        )
-
-    # === STEP 3: Slim the actions block (drop per-action `examples`) ===
+    # === STEP 1: Slim the actions block (drop per-action `examples`) ===
     # The `actions` block carries, for every available action, a redundant
     # `examples`/`instructions` object that duplicates guidance already implied
     # by the schema + brief. It is NOT required for the model to *choose* an
@@ -4174,10 +4159,9 @@ def reduce_prompt_for_llm_limit(prompt: dict, max_chars: int) -> dict:
     # split to garble the request and the model to return empty actions.
     # Trimming it here keeps action *selection* intact while dropping the bulk.
     #
-    # This runs BEFORE the memories/context removal below, deliberately: the
-    # catalog is the largest serialized block and its redundant detail is
-    # reconstructible, while the context blocks are the grounding for the turn
-    # being answered.
+    # This runs BEFORE the history trims below, deliberately: the catalog is the
+    # largest serialized block and its redundant detail is reconstructible,
+    # while the conversation window is the grounding the turn exists to answer.
     if current_size > max_chars:
         actions = reduced_prompt.get("actions")
         if isinstance(actions, dict) and actions:
@@ -4187,16 +4171,13 @@ def reduce_prompt_for_llm_limit(prompt: dict, max_chars: int) -> dict:
                     del action_def["examples"]
                     trimmed = True
             if trimmed:
+                current_size = len(json_dumps(reduced_prompt)) - attachment_data_offset
                 log_warning(
                     "[reduce_prompt] Slimming actions block: removed per-action "
-                    "`examples` guidance (schema + brief retained)"
-                )
-                current_size = len(json_dumps(reduced_prompt)) - attachment_data_offset
-                log_debug(
-                    f"[reduce_prompt] After slimming actions block: {current_size} chars"
+                    f"`examples` guidance (schema + brief retained), now {current_size} chars"
                 )
 
-    # === STEP 4: Aggressively strip the actions block to brief-only ===
+    # === STEP 2: Aggressively strip the actions block to brief-only ===
     # If dropping `examples` was not enough, reduce each action to just its
     # `brief` (no `schema`/`source`), mirroring Prompt Lite Mode. The model can
     # still see *which* actions exist and what they do; the corrector re-adds
@@ -4214,14 +4195,41 @@ def reduce_prompt_for_llm_limit(prompt: dict, max_chars: int) -> dict:
                     actions[action_name] = {"brief": brief}
                     stripped = True
             if stripped:
+                current_size = len(json_dumps(reduced_prompt)) - attachment_data_offset
                 log_warning(
                     "[reduce_prompt] Stripping actions block to brief-only "
-                    "(schema/source removed; corrector re-supplies on demand)"
+                    f"(schema/source removed; corrector re-supplies on demand), now {current_size} chars"
                 )
-                current_size = len(json_dumps(reduced_prompt)) - attachment_data_offset
-                log_debug(
-                    f"[reduce_prompt] After stripping actions block: {current_size} chars"
-                )
+
+    # === STEP 3: Trim `history_recent` if needed ===
+    while (
+        current_size > max_chars
+        and isinstance(history_recent, list)
+        and len(history_recent) > MIN_HISTORY_RECENT
+    ):
+        try:
+            history_recent.pop(0)  # Remove oldest
+        except Exception:
+            break
+        current_size = len(json_dumps(reduced_prompt)) - attachment_data_offset
+        log_debug(
+            f"[reduce_prompt] Trimmed history_recent, {len(history_recent)} remaining, now {current_size} chars"
+        )
+
+    # === STEP 4: Trim `history_current_chat` if needed ===
+    while (
+        current_size > max_chars
+        and isinstance(history_current, list)
+        and len(history_current) > MIN_HISTORY_CURRENT
+    ):
+        try:
+            history_current.pop(0)  # Remove oldest
+        except Exception:
+            break
+        current_size = len(json_dumps(reduced_prompt)) - attachment_data_offset
+        log_debug(
+            f"[reduce_prompt] Trimmed history_current_chat, {len(history_current)} remaining, now {current_size} chars"
+        )
 
     # === STEP 5: Remove memories entirely if still needed ===
     # Only reached when slimming the catalog was not enough: this is real

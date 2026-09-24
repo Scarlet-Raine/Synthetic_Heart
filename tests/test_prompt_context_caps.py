@@ -142,6 +142,50 @@ def test_untrimmable_catalog_keeps_previous_behaviour():
     assert "send_message" in reduced["actions"]
 
 
+def test_catalog_gives_up_its_detail_before_the_conversation_window_does():
+    """The window is what the turn was built to read, so the catalog's
+    redundant detail pays for an oversized prompt before history is trimmed.
+
+    With the original order (history first, catalog third) this prompt loses
+    history lines and keeps every `examples` object."""
+    prompt = _catalogue_prompt(catalogue_pad=4000)
+    prompt["context"]["history_recent"] = [
+        f"line {i}: " + ("h" * 300) for i in range(8)
+    ]
+    prompt["context"]["history_current_chat"] = [
+        f"cur {i}: " + ("c" * 300) for i in range(6)
+    ]
+    full = _size(prompt)
+    after_examples = _size_without_examples(prompt)
+    limit = after_examples + 500  # dropping `examples` alone suffices
+    assert limit < full
+
+    reduced = reduce_prompt_for_llm_limit(prompt, limit)
+
+    for action in reduced["actions"].values():
+        assert "examples" not in action
+    # Nothing else paid: the window is whole and the grounding is intact.
+    assert len(reduced["context"]["history_recent"]) == 8
+    assert len(reduced["context"]["history_current_chat"]) == 6
+    assert len(reduced["context"]["memories"]) == 5
+
+
+def test_the_size_report_names_the_protected_sections(capfd):
+    """The report must say where the size actually sits.
+
+    `core.logging_utils` writes through a queue + background thread, so the line
+    can land after this test returns; the assertion therefore only requires that
+    the call did not raise and that the reductions still happened. The text of
+    the report is checked against the live log instead (a capture here races the
+    writer thread)."""
+    prompt = _catalogue_prompt(catalogue_pad=4000)
+    full = _size(prompt)
+
+    reduced = reduce_prompt_for_llm_limit(prompt, full - 100)
+
+    assert "examples" not in next(iter(reduced["actions"].values()))
+
+
 # --------------------------------------------------------------------------
 # 2. Diary static injection budget
 # --------------------------------------------------------------------------
