@@ -158,14 +158,23 @@ Type: files; Name: "{app}\uv.lock"
 [Code]
 const
   PrereqsLog = 'synth_prereqs.log';
+  BootstrapLog = 'synth_bootstrap.log';
 
-function StepFailed(const Title, Detail: String): Boolean;
+function StepFailed(const Title, Detail, LogName: String): Boolean;
 var
   LogPath: String;
 begin
-  LogPath := ExpandConstant('{tmp}\..\..\..\..\Temp\' + PrereqsLog);
+  { The temp folder below is the same one install_prereqs.ps1 (its env:TEMP)
+    and bootstrap.py write their logs into, so the path named in this message is
+    a real one. The user profile constant is the percent-USERPROFILE form: a
+    bare lowercase name such as the obvious-looking "userprofile" is not a
+    constant at all, and because ExpandConstant is only evaluated here it fails
+    at runtime rather than at compile time. tests/test_installer_payload.py
+    guards against exactly that. No braces inside this comment: Inno comments
+    do not nest, so an inner one would end the comment early. }
+  LogPath := ExpandConstant('{%TEMP}\') + LogName;
   MsgBox(Title + #13#10#13#10 + Detail + #13#10#13#10 +
-    'The log is in your TEMP folder: ' + PrereqsLog + #13#10 + LogPath + #13#10#13#10 +
+    'The log is here:' + #13#10 + LogPath + #13#10#13#10 +
     'You can retry this step yourself from a terminal in:' + #13#10 + ExpandConstant('{app}'),
     mbError, MB_OK);
   Result := False;
@@ -195,23 +204,24 @@ begin
       ResultCode) or (ResultCode <> 0) then
   begin
     StepFailed('Dependencies could not be installed.',
-      'install_prereqs.ps1 exited with code ' + IntToStr(ResultCode) + '.');
+      'install_prereqs.ps1 exited with code ' + IntToStr(ResultCode) + '.', PrereqsLog);
     exit;
   end;
 
   { Step 2: database, .env, Python environment. }
   WizardForm.StatusLabel.Caption := 'Setting up the database and Python environment...';
-  UvExe := ExpandConstant('{userprofile}\.local\bin\uv.exe');
+  UvExe := ExpandConstant('{%USERPROFILE}\.local\bin\uv.exe');
   if not FileExists(UvExe) then
     UvExe := 'uv';
 
   if not RunHidden(UvExe,
       'run --no-project python "' + ExpandConstant('{app}\scripts\bootstrap.py') +
-      '" --portable --pg-bin "' + ExpandConstant('{app}\pgsql\bin') + '" --no-browser',
+      '" --portable --pg-bin "' + ExpandConstant('{app}\pgsql\bin') +
+      '" --no-browser --log-file "' + ExpandConstant('{%TEMP}\' + BootstrapLog) + '"',
       ResultCode) or (ResultCode <> 0) then
   begin
     StepFailed('The database or the Python environment could not be set up.',
-      'bootstrap.py exited with code ' + IntToStr(ResultCode) + '.');
+      'bootstrap.py exited with code ' + IntToStr(ResultCode) + '.', BootstrapLog);
     exit;
   end;
 end;

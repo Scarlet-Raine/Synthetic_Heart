@@ -96,16 +96,41 @@ data_root = _APP_PATHS.data_root  # type: ignore[attr-defined]
 class Reporter:
     """Small progress reporter: four meaningful steps, no scrolling log."""
 
-    def __init__(self, total: int, *, quiet: bool = False, json_mode: bool = False):
+    def __init__(
+        self,
+        total: int,
+        *,
+        quiet: bool = False,
+        json_mode: bool = False,
+        log_file: str | None = None,
+    ):
         self.total = max(total, 1)
         self.index = 0
         self.quiet = quiet
         self.json_mode = json_mode
+        self.log_file = log_file
         self.warnings: list[str] = []
         self.messages: list[str] = []
 
+    def to_log(self, text: str) -> None:
+        """Append a line to the log file, when one was asked for.
+
+        The Windows installer runs this script with its window hidden, so
+        without a log a failure reaches the user as a bare exit code and
+        nothing else. Fail-safe on purpose: a log that cannot be written must
+        never be the reason an install fails.
+        """
+        if not self.log_file:
+            return
+        try:
+            with open(self.log_file, "a", encoding="utf-8") as handle:
+                handle.write(text + "\n")
+        except OSError:
+            pass
+
     def _emit(self, text: str, *, stream: TextIO = sys.stdout) -> None:
         self.messages.append(text)
+        self.to_log(text)
         if self.json_mode or self.quiet:
             return
         print(text, file=stream, flush=True)
@@ -977,12 +1002,31 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="stop the private PostgreSQL cluster and exit (used by the uninstaller)",
     )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help=(
+            "append progress and warnings to this file (the Windows installer "
+            "passes one so a hidden run is still diagnosable)"
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    reporter = Reporter(5, quiet=args.quiet, json_mode=args.json)
+    reporter = Reporter(
+        5, quiet=args.quiet, json_mode=args.json, log_file=args.log_file
+    )
+    if args.log_file:
+        # Log the arguments this run was actually given: when the script is
+        # invoked as a CLI that is sys.argv, but a programmatic caller (a test,
+        # or another script) passes its own list and sys.argv would be wrong.
+        invoked = argv if argv is not None else sys.argv[1:]
+        reporter.to_log(
+            f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"bootstrap.py {' '.join(invoked)} ==="
+        )
     if args.stop_cluster:
         # Always exit 0: the uninstaller cannot act on a failure code, and a
         # cluster that will not stop must not block the rest of the uninstall.

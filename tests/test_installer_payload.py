@@ -78,6 +78,86 @@ def test_untracked_working_notes_are_not_shipped(exclude_patterns: set[str]) -> 
     assert "venice_no_response_report.md" in exclude_patterns
 
 
+#: Inno Setup's own constants, plus the ones this installer is allowed to use.
+#: An environment variable (``{%NAME}``) is always acceptable and is handled
+#: separately, because it is a different mechanism with different syntax.
+VALID_INNO_CONSTANTS = frozenset(
+    {
+        "app",
+        "tmp",
+        "sys",
+        "sysnative",
+        "win",
+        "src",
+        "sd",
+        "localappdata",
+        "userappdata",
+        "userdocs",
+        "userdesktop",
+        "userprograms",
+        "userstartmenu",
+        "usercf",
+        "userpf",
+        "commonappdata",
+        "commonprograms",
+        "commondesktop",
+        "commonpf",
+        "commoncf",
+        "autodesktop",
+        "autoprograms",
+        "group",
+        "uninstallexe",
+        "fonts",
+        "dao",
+    }
+)
+
+
+def test_only_real_inno_constants_are_used(iss_text: str) -> None:
+    """``{userprofile}`` is not a constant, and only fails at runtime.
+
+    ``ExpandConstant('{userprofile}')`` aborts the install with "unknown
+    constant" *after* the files are copied and the prerequisites installed. The
+    compile is perfectly clean, so nothing catches it before a user does. Any
+    braced name that is not a documented constant must be an environment
+    variable (``{%NAME}``), which this regex deliberately does not match.
+    """
+    used = set(re.findall(r"\{([a-z][a-z0-9_]*)\}", iss_text))
+    unknown = sorted(name for name in used if name not in VALID_INNO_CONSTANTS)
+    assert not unknown, (
+        f"not Inno Setup constants: {unknown} - the user profile is "
+        "{%USERPROFILE} and the temp folder is {%TEMP} or {tmp}"
+    )
+
+
+def test_no_inno_comment_swallows_itself(iss_text: str) -> None:
+    """Inno's ``{ }`` comments do not nest, so an inner ``{`` ends one early.
+
+    The rest of the line is then parsed as Pascal and the compiler reports a
+    column number pointing at prose, which is a slow way to learn this. Writing
+    the temp-folder constant inside a comment that explains the temp-folder
+    constant is the natural thing to do, so it is worth a guard.
+    """
+    offenders = [
+        (number, line.strip())
+        for number, line in enumerate(iss_text.splitlines(), start=1)
+        if line.lstrip().startswith("{") and line.count("{") > 1
+    ]
+    assert not offenders, f"a brace inside an Inno comment ends it early: {offenders}"
+
+
+def test_both_provisioning_steps_leave_a_log(iss_text: str) -> None:
+    """Both steps run with their window hidden, so each must write a log.
+
+    Otherwise a failure reaches the user as a bare exit code, which is exactly
+    what the installer's own error dialog has to explain.
+    """
+    assert "synth_prereqs.log" in iss_text
+    assert "synth_bootstrap.log" in iss_text
+    assert "--log-file" in iss_text, "bootstrap is invoked without a log file"
+    assert "{%TEMP}" in iss_text, "the reported log path must be the real TEMP folder"
+
+
 def test_the_installer_is_user_scoped(iss_text: str) -> None:
     """No admin, no UAC: that was the main complaint about the old installer."""
     assert "PrivilegesRequired=lowest" in iss_text

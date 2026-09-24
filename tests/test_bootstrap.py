@@ -286,6 +286,56 @@ def test_ensure_extensions_reports_what_is_missing(
     assert any("vector" in warning for warning in reporter.warnings)
 
 
+def test_log_file_receives_every_line_and_never_breaks_the_run(
+    tmp_path: Path,
+) -> None:
+    """The installer runs bootstrap hidden; the log is the only trace of it."""
+    log = tmp_path / "bootstrap.log"
+    reporter = bootstrap.Reporter(2, quiet=True, log_file=str(log))
+    reporter.step("Locating a database engine")
+    reporter.ok("found one")
+    reporter.warn("something worth knowing")
+
+    text = log.read_text(encoding="utf-8")
+    assert "Locating a database engine" in text
+    assert "ok: found one" in text
+    assert "warning: something worth knowing" in text, "warnings must be logged"
+
+    # A log that cannot be written must never be the reason an install fails.
+    broken = bootstrap.Reporter(
+        1, quiet=True, log_file=str(tmp_path / "missing-dir" / "x.log")
+    )
+    broken.step("still runs")
+    assert broken.messages
+
+
+def test_without_a_log_file_nothing_is_written(tmp_path: Path) -> None:
+    reporter = bootstrap.Reporter(1, quiet=True)
+    reporter.step("no log configured")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_main_records_the_invocation_in_the_log(tmp_path: Path) -> None:
+    """A log with no header cannot be told from the previous attempt's."""
+    log = tmp_path / "run.log"
+    exit_code = bootstrap.main(
+        [
+            "--dry-run",
+            "--skip-sync",
+            "--no-browser",
+            "--log-file",
+            str(log),
+            "--env-file",
+            str(tmp_path / "test.env"),
+        ]
+    )
+    assert exit_code == 0
+    text = log.read_text(encoding="utf-8")
+    assert "bootstrap.py" in text, "the log must say what was run"
+    assert "--log-file" in text, "the log must record the arguments"
+    assert "===" in text, "entries must be separated so repeats are distinguishable"
+
+
 def test_ensure_extensions_reports_success(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         bootstrap, "psql_query", lambda *a, **k: bootstrap.CommandResult(0, "", "")
