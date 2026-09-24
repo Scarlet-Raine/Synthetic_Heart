@@ -9,11 +9,15 @@ deployment at a setup page would be worse than never showing it.
 from __future__ import annotations
 
 import asyncio
+import re
 import types
+from pathlib import Path
 
 import pytest
 
 from core import webui as webui_module
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _renderer():
@@ -176,6 +180,77 @@ def test_a_local_request_on_a_fresh_install_is_offered_the_page(
 def test_a_textual_flag_is_read_as_a_boolean(raw: object, expected: bool) -> None:
     """`bool("False")` is True, which would retire the page forever, silently."""
     assert webui_module.as_flag(raw) is expected
+
+
+def _root_stub(monkeypatch: pytest.MonkeyPatch, *, local: bool, pending: bool):
+    """A WebUI stub able to run the real root handler.
+
+    The gate methods are bound onto the stub instance, not the class: the stub is a
+    plain namespace rather than an instance, so a class-level patch would not be
+    visible to it. ``_first_run_pending`` is called with no arguments by the handler.
+    """
+    stub = _stub()
+    stub._render_index = lambda: "<html>landing page</html>"
+    stub._is_local_client = lambda request: local
+
+    async def _pending():
+        return pending
+
+    stub._first_run_pending = _pending
+    return stub
+
+
+def test_the_root_route_redirects_a_local_browser_to_the_setup_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The behaviour the middleware must not bypass: a redirect, not the page."""
+    stub = _root_stub(monkeypatch, local=True, pending=True)
+    request = types.SimpleNamespace(client=types.SimpleNamespace(host="127.0.0.1"))
+    response = asyncio.run(webui_module.SynthWebUIInterface.index(stub, request))
+    assert response.status_code == 307
+    assert response.headers["location"] == "/setup"
+
+
+def test_an_established_install_gets_the_landing_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = _root_stub(monkeypatch, local=True, pending=False)
+    request = types.SimpleNamespace(client=types.SimpleNamespace(host="127.0.0.1"))
+    response = asyncio.run(webui_module.SynthWebUIInterface.index(stub, request))
+    assert response.status_code == 200
+    assert b"landing page" in response.body
+
+
+def test_a_remote_browser_gets_the_landing_page_even_when_the_gate_would_fire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = _root_stub(monkeypatch, local=False, pending=True)
+    request = types.SimpleNamespace(client=types.SimpleNamespace(host="192.168.1.50"))
+    response = asyncio.run(webui_module.SynthWebUIInterface.index(stub, request))
+    assert response.status_code == 200
+
+
+def test_the_root_middleware_does_not_bypass_the_first_run_gate() -> None:
+    """The root middleware must hand off to the handler, not serve the page itself.
+
+    A middleware runs before routing, so a root request it answers itself never
+    reaches the root route - and the first-run redirect lives in that route. That
+    is exactly what happened on a live install: the middleware logged
+    "intercepting root request" four times and `index()` was never called at all,
+    so the gate was dead code and the user met the avatar scene.
+    """
+    source = (REPO_ROOT / "core" / "webui.py").read_text(encoding="utf-8")
+    middleware = re.search(
+        r"class _IndexMiddleware.*?(?=\n\s*self\.app\.add_middleware)",
+        source,
+        re.DOTALL,
+    )
+    assert middleware, "the root middleware was removed or renamed"
+    body = middleware.group(0)
+    assert "await self.index(request)" in body, (
+        "the middleware must delegate to the root handler, or the first-run "
+        "redirect in it can never run"
+    )
 
 
 def test_only_a_local_browser_is_ever_redirected() -> None:

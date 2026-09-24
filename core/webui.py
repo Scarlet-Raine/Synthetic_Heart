@@ -505,9 +505,12 @@ class SynthWebUIInterface:
 
         # Ensure the root path always returns the rendered HTML directly.
         # In some deployment or hot-reload scenarios a previous handler may
-        # end up returning None (serialized as JSON null). Add a lightweight
-        # middleware that intercepts '/' and returns the rendered index to
-        # guarantee consistent behaviour.
+        # end up returning None (serialized as JSON null). This middleware
+        # guarantees HTML for '/'. It delegates to the real root handler rather
+        # than rendering a second, divergent copy of the page: a middleware runs
+        # BEFORE routing, so anything it answers itself makes the root route
+        # unreachable - including the first-run redirect that lives there. Serving
+        # the page here is precisely why a fresh install never saw the setup page.
         try:
             from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -515,19 +518,24 @@ class SynthWebUIInterface:
                 async def dispatch(inner_self, request, call_next):
                     if request.url.path == "/":
                         log_info(
-                            f"{LOG_PREFIX} Index middleware intercepting root request"
+                            f"{LOG_PREFIX} Index middleware handing the root to the handler"
                         )
                         try:
-                            content = self._render_index()
-                            log_info(
-                                f"{LOG_PREFIX} Index middleware rendered length {len(content)}"
-                            )
-                            return HTMLResponse(content=content, media_type="text/html")
+                            response = await self.index(request)
                         except Exception as e:
                             log_error(
-                                f"{LOG_PREFIX} Index middleware failed to render index: {e}"
+                                f"{LOG_PREFIX} Index handler failed to render index: {e}"
                             )
                             raise
+                        if response is None:
+                            log_warning(
+                                f"{LOG_PREFIX} Root handler returned nothing; "
+                                "serving the rendered page directly"
+                            )
+                            response = HTMLResponse(
+                                content=self._render_index(), media_type="text/html"
+                            )
+                        return response
                     return await call_next(request)
 
             self.app.add_middleware(_IndexMiddleware)
