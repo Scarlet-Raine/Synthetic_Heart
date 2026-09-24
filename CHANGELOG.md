@@ -4,6 +4,21 @@
 **Fix:** a non-mapping value is no longer collected as a history candidate, `_is_internal_noise` returns True for a non-mapping instead of raising, and the final candidate filter requires a dict; the swallow is now a WARNING naming the exception type, so a future failure here cannot be silent.
 **Notes:** reproduced against the live DB before touching the code (`HistoryEngine().build_context` with the beat's real context shape returned `history_recent: 0`; with an empty `grillo_snippets` it returned 8 lines; the swallowed line read `[history_engine] Failed building UNIFIED history: 'str' object has no attribute 'get'`). Pinned in `tests/test_history_engine.py::test_cross_chat_history_survives_non_dict_context_values` (the observer-beat shape and the `attachment_paths` shape on an ordinary chat turn); reverting the one-line `continue` makes it fail. 64 passed across the history, current-chat-history, beat-routing and observer suites; the single failure in that set (`test_diary_entry_renders_created_at_timestamp`, a local-TZ render against an asserted UTC hour) fails identically at HEAD. Grillo's *internal* reflection beats (relationship, curiosity, ...) still receive no chat history: they set `skip_history: True` and are scoped `is_grillo_internal` on purpose, and changing that changes what the synth reflects on, so it is left alone here. `core/history_engine.py` is imported at boot, so the fix is not live until the instance is restarted.
 
+### fix(tray): the icon never appeared, and a child process could not say why  <!-- 2026-09-25 -->
+
+**Why:** the tray icon added earlier the same day did not appear on a real install. The cause was not the icon: the process that draws it was started and killed before it ran.
+
+**A console program started detached runs nothing.** `scripts/start_synth.py` started PowerShell with `DETACHED_PROCESS`, which gives a console program no console at all. Measured on the machine that reported this: `powershell -Command '... | Set-Content marker'` with `DETACHED_PROCESS` writes nothing and exits 0, while the same command with `CREATE_NO_WINDOW` does its work and shows no window. So the tray process was born, exited and left no trace — no icon, no log, nothing to explain it. Both children the launcher starts (the tray, and the application itself when `pythonw.exe` is missing) now use `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`. `tests/test_native_launcher.py` and `tests/test_tray_script.py` fail if `DETACHED_PROCESS` comes back, and one test starts a real interpreter with these flags to prove a child still runs.
+
+**A silent helper cannot be diagnosed.** `spawn_tray` sent the tray's output to `DEVNULL`, so nothing anywhere recorded why no icon appeared. The tray now appends every step to `logs\tray.log` (environment, icon, mutex, menu, balloon, state changes, and any exception with a stack trace) and the launcher records its own decision in `logs\synth_launch.log`; the child's stdout and stderr go to `logs\tray.out.log` instead of nowhere.
+
+**A second bug, found by that logging before it ever shipped:** `-notmatch` overwrites PowerShell's automatic `$matches` group variable, so `Map[$matches[1]]` in the new `.env` reader indexed into the previous match and threw. The groups are now copied to locals before any further regex runs. Two new tests run the real script the way the launcher runs it and require it to reach its message loop.
+
+**Validation:** 115 tests across the tray, launcher, payload, bootstrap and endpoint-model suites; the tray script was run from a `pythonw` parent exactly as the installer does and logged `notification icon created and made visible` → `entering the message loop`, staying alive; ruff and `ty` clean on the launcher; installer rebuilt.
+
+**Not verified:** the icon on the reporter's own machine, which the next install settles.
+
+
 ### fix(install): the first-run engine, the model that would not change, and a launch you can see  <!-- 2026-09-25 -->
 
 **Why:** a native install is only as good as its first five minutes, and the first five minutes were the weakest part. On a machine that installed cleanly, onboarding completed, the endpoint was configured and enabled, and then the WebUI accepted a message and answered nothing at all. Three separate causes, all found from the user's own logs.

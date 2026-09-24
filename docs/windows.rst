@@ -111,7 +111,11 @@ Notes and caveats
   happened. A notification-area icon appears instead: it says it is starting,
   changes to "running" once the WebUI answers, and its right-click menu opens the
   WebUI, restarts SyntH, shuts it down, and (once updating exists) updates it.
-  "Hide this icon" leaves SyntH running; ``--no-tray`` disables it entirely.
+  "Hide this icon" leaves SyntH running; ``--no-tray`` disables it entirely. On
+  Windows 11 a new icon may be filed under the taskbar's overflow chevron rather
+  than shown in the tray: the balloon and the tooltip still appear. If no icon
+  appears at all, ``logs\tray.log`` names the step it reached and
+  ``logs\synth_launch.log`` records whether the launcher tried to start it.
 - Uninstalling keeps ``data\`` and ``.env`` on purpose, so a reinstall resumes the
   same persona, history and keys. The database cluster lives in ``data\pgsql``, so
   a reinstall reuses it rather than creating a new one. Tick "Remove all my data

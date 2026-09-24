@@ -164,11 +164,12 @@ def spawn_background(interpreter: Path | str, log_path: Path, *, console: bool) 
         "env": env,
     }
     if os.name == "nt":
-        flags = subprocess.CREATE_NEW_PROCESS_GROUP
-        if not console:
-            flags |= subprocess.DETACHED_PROCESS
-            flags |= subprocess.CREATE_NO_WINDOW
-        kwargs["creationflags"] = flags
+        # CREATE_NO_WINDOW, never DETACHED_PROCESS: a console program given no console
+        # at all starts, exits 0 and does nothing. pythonw.exe ignores the flag and
+        # python.exe gets a hidden console it can run in, so this is safe for both.
+        kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        )
         # Keep the log file handle alive for the child's lifetime by holding a
         # reference; the child owns the descriptor after Popen returns.
         kwargs["close_fds"] = True
@@ -179,20 +180,41 @@ def spawn_background(interpreter: Path | str, log_path: Path, *, console: bool) 
     return process.pid
 
 
+def _launch_log(message: str) -> None:
+    """Append a line to ``logs/synth_launch.log``.
+
+    A native install runs the launcher with ``pythonw.exe``, so it has no console and
+    no one to print to. Anything worth saying has to go to a file, which is how a tray
+    that refuses to start becomes a line of evidence instead of a silent desktop.
+    """
+    try:
+        directory = REPO_ROOT / "logs"
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(directory / "synth_launch.log", "a", encoding="utf-8") as handle:
+            handle.write(f"[{stamp}] {message}\n")
+    except Exception:
+        pass
+
+
 def tray_command(env_file: Path) -> list[str] | None:
     """Return the command that shows the notification-area icon, if it can run.
 
     Windows only: elsewhere SyntH is a service or a foreground process, and there is
     no notification area to put an icon in. It runs on the system PowerShell so the
-    tray needs no dependency of its own.
+    tray needs no dependency of its own. Reasons for declining are logged, because
+    "no icon" and "no icon because PowerShell is missing" look identical otherwise.
     """
     if os.name != "nt":
+        _launch_log("tray: not Windows, so there is no notification area")
         return None
     script = REPO_ROOT / "scripts" / "synth_tray.ps1"
     if not script.is_file():
+        _launch_log(f"tray: {script} is missing")
         return None
     powershell = shutil.which("powershell") or shutil.which("powershell.exe")
     if not powershell:
+        _launch_log("tray: powershell.exe is not on PATH")
         return None
     return [
         powershell,
@@ -207,6 +229,8 @@ def tray_command(env_file: Path) -> list[str] | None:
         str(REPO_ROOT),
         "-EnvFile",
         str(env_file),
+        "-LogFile",
+        str(REPO_ROOT / "logs" / "tray.log"),
     ]
 
 
@@ -221,22 +245,44 @@ def spawn_tray(env_file: Path) -> bool:
     command = tray_command(env_file)
     if not command:
         return False
+    # The tray's own output goes to a file rather than nowhere. It was DISCARDED once,
+    # and a tray that never appeared cost a round trip to the user's machine because
+    # nothing anywhere had recorded why.
+    sink = None
+    try:
+        logs = REPO_ROOT / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        sink = open(logs / "tray.out.log", "ab")
+    except Exception as exc:
+        _launch_log(f"tray: cannot open logs/tray.out.log ({exc!r}); output discarded")
     kwargs: dict[str, Any] = {
         "cwd": str(REPO_ROOT),
         "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
+        "stdout": sink if sink else subprocess.DEVNULL,
+        "stderr": subprocess.STDOUT if sink else subprocess.DEVNULL,
     }
     if os.name == "nt":
+        # NOT DETACHED_PROCESS. A console program given no console at all starts and
+        # exits immediately without running: measured here, powershell.exe spawned with
+        # DETACHED_PROCESS wrote nothing and returned 0, while CREATE_NO_WINDOW did the
+        # work and still showed no window. That silent no-op is exactly why the tray
+        # icon never appeared. CREATE_NO_WINDOW gives it a hidden console it can use.
         kwargs["creationflags"] = (
-            subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW
+            subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         )
     else:
         kwargs["start_new_session"] = True
     try:
-        subprocess.Popen(command, **kwargs)  # noqa: S603
-    except Exception:
+        process = subprocess.Popen(command, **kwargs)  # noqa: S603
+    except Exception as exc:
+        _launch_log(f"tray: could not start it: {exc!r}")
+        if sink:
+            sink.close()
         return False
+    if sink:
+        # The child holds its own handle now.
+        sink.close()
+    _launch_log(f"tray: started pid={process.pid}")
     return True
 
 

@@ -2,7 +2,9 @@
 
 ``scripts/healthcheck.py`` and ``scripts/start_synth.py`` are what the installers'
 shortcuts call, so their decision logic is pinned here: URL derivation, scheme
-fallback, pid bookkeeping and interpreter selection. No process is started.
+fallback, pid bookkeeping and interpreter selection. One test does start a process,
+because the flags a child is started with are the difference between it running and
+silently doing nothing.
 """
 
 from __future__ import annotations
@@ -10,7 +12,10 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -308,3 +313,51 @@ def test_the_tray_script_offers_the_actions_the_icon_promises() -> None:
     assert "Mutex" in text
     # The transparent artwork, not the black-tiled squircle.
     assert "synth-tray.ico" in text
+
+
+def test_no_child_of_the_launcher_is_started_console_detached() -> None:
+    """DETACHED_PROCESS turns a console program into a no-op on Windows.
+
+    Measured on a real machine: ``powershell -Command '... | Set-Content marker'``
+    writes the marker with no flags and with CREATE_NO_WINDOW, and writes nothing at
+    all with DETACHED_PROCESS, exiting 0 either way. The launcher starts both the
+    application and the tray, and python.exe and powershell.exe are console programs,
+    so using it there means a process that starts, disappears and leaves no trace.
+    """
+    source = (REPO_ROOT / "scripts" / "start_synth.py").read_text(encoding="utf-8")
+    code = "\n".join(
+        line for line in source.splitlines() if not line.strip().startswith("#")
+    )
+    assert "DETACHED_PROCESS" not in code, (
+        "a detached console program runs nothing at all on Windows"
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only process creation flags")
+def test_a_python_child_really_runs_with_the_launchers_flags(tmp_path: Path) -> None:
+    """Prove the flags the launcher uses let a child actually do its work.
+
+    The tray icon failing to appear was caused by exactly this: flags that made the
+    child start and exit without running. Asserting the flags by name is not enough,
+    because the failure mode is silence, so this starts a real interpreter with them.
+    """
+    marker = tmp_path / "marker.txt"
+    interpreter = sys.executable or shutil.which("python")
+    script = f"from pathlib import Path; Path(r'{marker}').write_text('ran', encoding='utf-8')"
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    process = subprocess.Popen(  # noqa: S603
+        [interpreter, "-c", script],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=flags,
+    )
+    try:
+        deadline = time.time() + 30.0
+        while time.time() < deadline and not marker.is_file():
+            time.sleep(0.1)
+        assert marker.is_file(), "a child started with these flags did not run"
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=15)
