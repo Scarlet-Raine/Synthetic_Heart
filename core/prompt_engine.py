@@ -1338,7 +1338,11 @@ def _build_context_summary(
                 "- NOTE: these messages come from OTHER chats you take part in. "
                 "The people named here might NOT be participants in the current conversation. "
                 "Do not name-drop them to the current interlocutor or assume they are known; "
-                "only reference them if the current user brings them up first."
+                "only reference them if the current user brings them up first. "
+                "Every line names its own speaker: 'self (you)' is a message YOU wrote "
+                "in that chat, any other label is that person's words. Never repeat "
+                "another person's line as the current interlocutor's, and never ask "
+                "them to explain wording that is not theirs."
             )
             for line in history_recent:
                 parts.append(f"- {line}")
@@ -1486,6 +1490,13 @@ def _history_to_turns(
         if not content.strip():
             continue
         sender_lower = sender.lower()
+        # The history renderer spells the persona's own lines out for the reader
+        # ("self (you)", see core/history_engine.py::_render_speaker_label), so
+        # the canonical token has to be recovered BEFORE the role test: without
+        # this the persona's own past replies parse as the HUMAN's turns and the
+        # messages array hands its own words back to it as his (measured
+        # 2026-09-24: a decorated line came back role="user").
+        sender_lower = re.sub(r"\s*\((?:you|the persona)\)$", "", sender_lower).strip()
         is_peer = False
         if sender_lower in all_synth_names:
             role = "assistant"

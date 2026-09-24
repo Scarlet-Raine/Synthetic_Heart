@@ -477,6 +477,67 @@ def test_cross_chat_privacy_note_in_recent_block(monkeypatch):
     assert "name-drop" in summary
     assert "current interlocutor" in summary
     assert "current conversation" in summary
+    # ...and it must say whose lines are whose: the persona's own cross-chat
+    # lines carry "self (you)", and a line that is not the current
+    # interlocutor's may not be restated as theirs (live 2026-09-24: the 2D
+    # deployment asked the human to explain wording it had written itself).
+    assert "self (you)" in summary
+    assert "not theirs" in summary
+
+
+def test_persona_own_cross_chat_line_says_it_is_the_personas():
+    """A bare "self" names nobody once the block also carries named people.
+
+    Live 2026-09-24 (the 2D deployment) the model read its own group-chat lines
+    as the human's, and asked him to explain "the middle of the bed and no
+    deadline" - wording that existed only under its own label and its mother's.
+    The persona's own line must therefore say whose it is; every named speaker
+    keeps the label the interface stored.
+    """
+    entry = {
+        "interface_path": "telegram_bot/-5293915984",
+        "sender_name": "self",
+        "sender_id": "self",
+        "text": "Middle of the bed stays on the books, and I'm not counting anymore",
+        "timestamp": "2026-09-24T02:30:19+00:00",
+    }
+    line = history_engine._entry_to_text_with_source(
+        entry, current_interface_path="telegram_bot/5208932647"
+    )
+
+    assert "[from the group chat]" in line
+    assert "self (you):" in line
+    # The words are still there; only the speaker is now unambiguous.
+    assert "Middle of the bed stays on the books" in line
+
+
+def test_named_speakers_keep_their_own_label(monkeypatch):
+    """Only the persona's own labels are rewritten: a name is evidence."""
+    entries = [
+        ("2B", "I'll keep it warm"),
+        ("Scar", "nighty night bubu"),
+        ("Lybris", "did you see the track?"),
+    ]
+    for sender, text in entries:
+        line = history_engine._entry_to_text(
+            {
+                "sender_name": sender,
+                "text": text,
+                "timestamp": "2026-09-24T02:29:59+00:00",
+            }
+        )
+        assert f"{sender}:" in line
+        assert "(you)" not in line
+
+    for label in ("self", "assistant", "self"):
+        line = history_engine._entry_to_text(
+            {
+                "sender_name": label,
+                "text": "mmwah",
+                "timestamp": "2026-09-24T02:29:59+00:00",
+            }
+        )
+        assert f"{label} (you):" in line
 
 
 def test_cross_chat_privacy_directive_in_master_instructions(monkeypatch):

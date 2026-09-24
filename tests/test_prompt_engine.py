@@ -1426,6 +1426,33 @@ class TestHistoryToTurns:
         assert len(turns) == 1
         assert turns[0].role == "assistant"
 
+    def test_spelled_out_self_label_still_becomes_assistant(self) -> None:
+        """The history renderer writes the persona's own line as `self (you)`.
+
+        The canonical token must survive the role test: parsed as a plain name
+        it is not in the synth name set, so the persona's own past reply lands
+        in the messages array as the HUMAN's turn (measured 2026-09-24: the
+        decorated line came back role="user").
+        """
+        lines = [
+            '[24/09/26:0650] Scar: "morning"',
+            '[24/09/26:0653] self (you): "my own line, decorated"',
+            '[24/09/26:0655] Scar: "back again"',
+        ]
+        turns = self._call(lines, {"2d"})
+        assert [t.role for t in turns] == ["user", "assistant", "user"]
+        assert "my own line, decorated" in turns[1].content
+
+    def test_decorated_label_does_not_leak_into_content(self) -> None:
+        """Only the role test is normalised: the content is passed through."""
+        lines = [
+            '[24/09/26:0650] Scar: "morning"',
+            '[24/09/26:0653] self (you): "kept verbatim"',
+        ]
+        turns = self._call(lines, {"2d"})
+        assert turns[1].role == "assistant"
+        assert turns[1].content == "kept verbatim"
+
     def test_user_sender_becomes_user(self) -> None:
         lines = ['[13/04/26:0924] Alice: "Hey there"']
         turns = self._call(lines, {"syntha"})

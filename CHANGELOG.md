@@ -28,7 +28,6 @@
 
 **Not verified:** the button on the reporter's own machine, which his next install settles.
 
-
 ### fix(branding): one logo on transparency, and a starting model that is the fast one  <!-- 2026-09-25 -->
 
 **Why:** two small things a real install showed, after the tray icon started working.
@@ -38,7 +37,6 @@
 **The default model preference picked whichever DeepSeek the endpoint listed first.** `deepseek*` matched both the fast and the large variant, and within one pattern the endpoint's own list order decides, so a fresh endpoint could come up on the large one. The default is now `*deepseek*flash*,deepseek*`: the fast variant first, with the bare family pattern second so an endpoint that carries no flash model still starts inside the same family instead of on whatever the API happened to return first. Pinned by a test built from a listing that offers the large variant first, which is the case that used to decide it.
 
 **Validation:** 110 tests across the endpoint-model, launcher, tray, payload, probe and config suites; rebuilt icons checked numerically for transparent corners and rendered at five sizes on two backgrounds; installer rebuilt and its payload audited (no local state).
-
 
 ### fix(tray): the icon never appeared, and a child process could not say why  <!-- 2026-09-25 -->
 
@@ -53,7 +51,6 @@
 **Validation:** 115 tests across the tray, launcher, payload, bootstrap and endpoint-model suites; the tray script was run from a `pythonw` parent exactly as the installer does and logged `notification icon created and made visible` → `entering the message loop`, staying alive; ruff and `ty` clean on the launcher; installer rebuilt.
 
 **Not verified:** the icon on the reporter's own machine, which the next install settles.
-
 
 ### fix(install): the first-run engine, the model that would not change, and a launch you can see  <!-- 2026-09-25 -->
 
@@ -75,7 +72,6 @@
 
 **Not verified:** the tray icon has been syntax-checked, unit-tested at the contract level, and its artwork inspected, but not clicked: it needs a real install. The new-format model switch is proven against the log that produced it, not by a live model call.
 
-
 ### feat(install): one-click native installs for Windows and Linux, and the Docker-era assumptions that were breaking them  <!-- 2026-09-24 -->
 
 **Why:** installation is the single largest source of support requests, and the answer was "read the docs, install Docker and a database, or hand-assemble a Python environment". The repository is Docker-first, and the native path had inherited that assumption in ways that fail confusingly rather than loudly: container paths resolving against the working drive, an `.env` template offering a MariaDB port, and a WebUI binding `0.0.0.0` with TLS on, which greets a desktop with a firewall prompt and a self-signed certificate warning. The native path is now first-class: one action, no CLI choices, no administrator rights.
@@ -95,6 +91,23 @@
 **Validation:** `ruff check` and `ty check` clean on every new module; 112 passing tests across seven new test files; `check_dockerisms.py` green; the installer compiles to a 36.8 MB `SyntH-Setup-<version>.exe` (from 148 MB, of which ~80 MB was optional example personas and ~44 MB documentation screenshots — `/DWithExampleSkins=1` restores the former).
 
 **Not verified:** `install.sh` has only been dry-run tested under a fake `uname` shim and has never run on a real Linux host (`shellcheck` unavailable, so only `bash -n` passed), and the installer has been compiled but not run end to end — a silent install pulls ~320 MB of PostgreSQL plus ~2 GB of wheels, so that is left as a manual step.
+
+### fix(history): the cross-chat block printed the persona's own lines under the bare label `self`, so the persona read its own words as the human's  <!-- 2026-09-24 -->
+
+**Symptom (live, 2026-09-24, the 2D instance):** the reported turn (trace `93f0cee1-f821-4b26-9064-4dbbed697e31`, 06:56 UTC, the 08:56 CEST message in the DM) asked the human to explain wording he had never used: "(4th) what did you mean, half four, about the middle of the bed and no deadline?", after the previous turn's "I've been turning your half-four speech over all morning". Both phrases are in that prompt, and both belong to someone else: "No deadline" / "the middle of the bed stays on the books" is the persona's OWN group-chat line at 04:30 CEST, and "You're up at half four turning over a compliment like it's contraband" is 2B's at 04:29. The `[Recent context from other conversations]` block carried six lines that night, four labelled `2B:` and two labelled `self:` (the persona's own two), and no line in it was the human's. His own half-four line was in the store but not in the prompt at all: the DM's own history in the messages array held a single earlier exchange, so a conversation four hours old was simply absent. Handed first-person material labelled `self` next to named people and told not to name-drop them, the model attached the words to the only other participant it is allowed to mention.
+
+**Root cause:** `core/history_engine.py::_entry_to_text` rendered the stored sender verbatim, and the interfaces cache the persona's own messages under the canonical label `self`. Every other prompt path had already been taught to translate that token for the reader (`core/prompt_engine.py::_label_stored_memory` renders `your own line`, `plugins/soul_plugin/soul_plugin.py::_transcript_speaker_label` renders `<name> (the persona)`, both from the 2026-09-23 speaker-identity fix); the cross-chat history block was the remaining place where it reached the model raw, in a list that also carries named people, where a bare `self` names nobody.
+
+**Fix:**
+- `core/history_engine.py`: `_render_speaker_label()` maps the interfaces' canonical self labels (`_SELF_SPEAKER_LABELS`: `self`, `me`, `assistant`, `synt`, `synth`, `bot`, the same set `core/prompt_engine.py` uses) to `self (you)` and leaves every other label exactly as stored, because a name is evidence about whoever carries it. `_entry_to_text` renders through it, so the current-chat and cross-chat history paths both cover it.
+- `core/prompt_engine.py`: the block's NOTE now says whose each line is ("'self (you)' is a message YOU wrote in that chat, any other label is that person's words") and names the two failure modes behind the report (never repeat another person's line as the current interlocutor's, never ask them to explain wording that is not theirs).
+- `core/prompt_engine.py` (`_history_to_turns`): the decorated label is recovered before the role test (`sender_lower` has a trailing `(you)` / `(the persona)` stripped). Without it the current-chat path REGRESSES in the worst direction: the label is not in the synth name set, so the persona's own past replies parse as the HUMAN's turns in the messages array. Measured on the renderer change alone: a `self (you)` line came back `role="user"`, i.e. its own words handed back to it as his.
+
+**Notes:** guards in `tests/test_current_chat_history.py`: the persona's own cross-chat line renders `self (you)` and still carries its words, a named speaker (`2B`, `Scar`, `Lybris`) keeps its label with no `(you)` leaking onto it, and the privacy note carries the label rules. All three fail against the unmodified sources (verified by stashing both files: 3 failed) and pass with them (16 passed in the file). Guards in `tests/test_prompt_engine.py::TestHistoryToTurns`: a decorated `self (you)` line still becomes an assistant turn, and the content is passed through verbatim; both fail against the unmodified `core/prompt_engine.py` (2 failed) and pass with it (20 passed in the class). Scoped runs with the change: 221 passed across `tests/test_current_chat_history.py`, `tests/test_history_engine.py`, `tests/test_prompt_renderers.py`, `tests/test_prompt_minification.py`, `tests/test_prompt_context_caps.py`, `tests/test_prompt_engine.py`, `tests/test_prompt_instruction_budget.py`, `tests/test_grillo_logging.py`, `tests/test_grillo_observer.py`, `tests/plugins/test_grillo_suppression.py`, `tests/test_append_history_db_sender_mapping.py` and `tests/test_chat_archives.py`, with TWO PRE-EXISTING failures, both reproducible with this change parked and both live-state dependent rather than code defects: `tests/test_history_engine.py::test_diary_entry_renders_created_at_timestamp` (the renderer formats in local time while the assertion hard-codes a UTC stamp; it passes when the whole file runs together, so order matters) and `tests/test_grillo_observer.py::test_observer_prompt_marks_own_lines_and_keeps_them_out_of_routing` (the observer only enqueues when the live store has an eligible target, and the newest conversation is live right now, so the fake enqueue is never called: `KeyError: 'text'`). `ruff format --check` / `ruff check` clean on all four touched files.
+
+**Not changed (deliberate), now measured:** why the night was absent from the current chat. `CONTEXT_VERBOSITY` is 6 for this deployment, so the window held the last 6 DM messages (3,496 chars, back to 07:29 CEST) as of that turn; two of those slots were the persona's own unanswered replies, and `_history_to_turns` drops leading assistant turns, so a single exchange (771 chars) survived into the messages array while the night sat 8 to 15 messages further back (8 messages = 4,823 chars / ~1,206 tokens, reaching his 04:44 line; 15 = 8,057 / ~2,014, reaching the bed/deadline exchange). Widening that window is a prompt-budget decision of its own, not part of this defect.
+
+**Deployment:** `core/` loads at boot, so the 2D instance needs a restart before the cross-chat block labels its own lines.
 
 
 ### fix(grillo): the chat observer saw only the human's side of a conversation, so its outreach came out in the human's voice  <!-- 2026-09-23 -->

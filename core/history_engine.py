@@ -293,6 +293,31 @@ def _relative_age_marker(ts: Any, now: datetime | None = None) -> str:
 # Max chars of a quoted message rendered in the history reply annotation.
 _REPLY_QUOTE_MAX_CHARS = 200
 
+# The interfaces cache the persona's OWN messages under the canonical label
+# "self" (Telegram, Discord and the Vessel all do), and this block renders the
+# stored label verbatim. In a block that also carries named people, a bare
+# "self" names nobody: measured live (2026-09-24, the 2D deployment) the model
+# read its own group-chat lines as the human's, asked him to explain a sentence
+# it had written itself, and the two lines it quoted ("the middle of the bed",
+# "no deadline") existed only under its own and its mother's labels. So the
+# label is spelled out for the reader, keeping the stored token in front of it
+# because the instruction block still refers to the persona's own lines as
+# 'self' (RULE_NO_SELF_REPETITION).
+_SELF_SPEAKER_LABELS = frozenset({"self", "me", "assistant", "synt", "synth", "bot"})
+
+
+def _render_speaker_label(sender: Any) -> str:
+    """Render one stored sender label so the persona's own lines say so.
+
+    The persona's own line becomes ``self (you)``; every other label is left
+    exactly as the interface stored it, because a name is evidence about
+    whoever carries it and rewriting one would be worse than leaving it.
+    """
+    label = " ".join(str(sender or "").split()) or "Unknown"
+    if label.casefold() in _SELF_SPEAKER_LABELS:
+        return f"{label} (you)"
+    return label
+
 
 def _entry_to_text(entry: HistoryEntry) -> str:
     if isinstance(entry, str):
@@ -303,7 +328,7 @@ def _entry_to_text(entry: HistoryEntry) -> str:
 
     # Chat-like message dicts
     text = entry.get("text") or entry.get("message_text") or entry.get("content") or ""
-    sender = (
+    sender = _render_speaker_label(
         entry.get("sender_name")
         or entry.get("username")
         or entry.get("sender_id")
