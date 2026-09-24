@@ -939,8 +939,18 @@ class HistoryEngine:
                     except Exception:
                         msgs = []
 
-                # Fall back to persisted cache if not enough
-                if verbosity > 0 and len(msgs) < verbosity:
+                # Fall back to persisted cache if not enough.
+                #
+                # The in-memory buffer's own maxlen is CONTEXT_VERBOSITY (see
+                # chat_context_manager.get_context), so it can never carry a
+                # window that reaches further back than that many messages. In
+                # exchange mode the cache is therefore merged in whenever the
+                # buffer is shorter than the scan, not merely when it is shorter
+                # than the message count, or the window silently shrinks back to
+                # whatever the buffer happens to hold. The legacy condition is
+                # kept byte-identical when the knob is off.
+                buffer_target = scan_messages if exchange_limit > 0 else verbosity
+                if buffer_target > 0 and len(msgs) < buffer_target:
                     try:
                         from core.chat_history_cache import (
                             load_chat_history as cache_load,

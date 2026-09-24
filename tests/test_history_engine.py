@@ -687,3 +687,73 @@ async def test_build_context_keeps_the_message_count_when_the_knob_is_off(
     assert "line 6" in joined
     assert "line 11" in joined
     assert "line 5" not in joined
+
+
+@pytest.mark.asyncio
+async def test_exchange_window_reads_the_cache_even_when_the_buffer_is_full(
+    monkeypatch,
+) -> None:
+    """The in-memory buffer is a deque with maxlen=CONTEXT_VERBOSITY, so on its
+    own it can never carry an exchange window that reaches further back than
+    that. The persisted cache must therefore be merged in while the knob is on,
+    even when the buffer already holds more messages than the message count."""
+    from core import history_engine
+    from core.history_engine import HistoryEngine
+
+    current_path = "telegram_bot/5208932647"
+    senders = ["Scar", "self", "Scar", "self", "Scar", "self"]
+    entries = [
+        {
+            "sender_name": sender,
+            "text": f"line {i}",
+            "timestamp": f"2026-09-24T{i:02d}:00:00+00:00",
+            "interface_path": current_path,
+        }
+        for i, sender in enumerate(senders)
+    ]
+    context_memory = {current_path: deque(entries)}
+
+    calls = 0
+
+    async def _counting_cache_load(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return deque()
+
+    monkeypatch.setattr(
+        "core.chat_history_cache.load_chat_history", _counting_cache_load
+    )
+    monkeypatch.setattr(
+        "core.chat_history_cache.load_global_chat_history",
+        AsyncMock(return_value=deque()),
+    )
+    monkeypatch.setattr("core.core_initializer.PLUGIN_REGISTRY", {})
+    real_get_int = history_engine._get_int
+    monkeypatch.setattr(
+        history_engine,
+        "_get_int",
+        lambda key, default: (
+            6 if key == "CONTEXT_VERBOSITY" else real_get_int(key, default)
+        ),
+    )
+
+    async def _build() -> None:
+        await HistoryEngine().build_context(
+            message=SimpleNamespace(interface_path=current_path),
+            context_memory=context_memory,
+            interface_name="telegram_bot",
+            text="current input",
+        )
+
+    # Knob off: six buffered messages already exceed the message count of six,
+    # which is the legacy rule, and no cache read is needed.
+    monkeypatch.delenv("CONTEXT_EXCHANGE_WINDOW", raising=False)
+    await _build()
+    assert calls == 0
+
+    # Knob on: the window wants to reach further back than the buffer can, so
+    # the persisted rows are read.
+    monkeypatch.setenv("CONTEXT_EXCHANGE_WINDOW", "5")
+    monkeypatch.setenv("CONTEXT_EXCHANGE_CHAR_CAP", "8000")
+    await _build()
+    assert calls == 1

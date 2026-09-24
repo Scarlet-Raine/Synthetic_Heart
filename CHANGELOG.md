@@ -92,6 +92,15 @@
 
 **Not verified:** `install.sh` has only been dry-run tested under a fake `uname` shim and has never run on a real Linux host (`shellcheck` unavailable, so only `bash -n` passed), and the installer has been compiled but not run end to end — a silent install pulls ~320 MB of PostgreSQL plus ~2 GB of wheels, so that is left as a manual step.
 
+### fix(history): the exchange window was capped by the in-memory buffer's own length  <!-- 2026-09-24 -->
+
+**Symptom:** the first post-restart turns read correctly (the last five exchanges, see the entry below), but the buffer that is consulted first is a deque whose `maxlen` is `CONTEXT_VERBOSITY` (`chat_context_manager.get_context`), six on this deployment, and the persisted cache was only merged when the buffer held *fewer messages than that count*. A buffer that fills up during a long session therefore caps every window at six messages however large `CONTEXT_EXCHANGE_WINDOW` is, and the active chat's window silently shrinks back to what it was: the exact failure the window exists to remove, arriving one restart later.
+
+**Fix (`core/history_engine.py`):** while the window is on, the cache is merged whenever the buffer is shorter than the *scan* (`_EXCHANGE_SCAN_MESSAGES`, 60), not shorter than the message count. With the knob off the condition is the original one, byte for byte.
+
+**Notes:** guard `test_exchange_window_reads_the_cache_even_when_the_buffer_is_full` (buffer of six messages, message count pinned to six: no cache read with the knob off, one with it on) fails against the unmodified file with `assert 0 == 1` and passes with the fix. Buffered messages are also in the persisted cache; `history_current_chat` is deduplicated on the rendered line (`seen_history` + `_dedup_key`), so merging the two has always been safe. Scoped run `tests/test_history_engine.py tests/test_current_chat_history.py`: 34 passed, 1 known failure (the order/timezone-dependent diary timestamp).
+
+
 ### fix(history): the active chat's history was counted in messages, so a run of the persona's own replies left one exchange in the prompt  <!-- 2026-09-24 -->
 
 **Symptom (live, 2026-09-24, the 2D instance):** the DM turn whose answer asked the human to explain "half four ... the middle of the bed and no deadline" (trace `93f0cee1-f821-4b26-9064-4dbbed697e31`) had exactly ONE exchange of its own chat in the prompt: his 08:53 CEST message and the reply to it. Measured against the store: `CONTEXT_VERBOSITY` is 6 for this deployment, so the window held the last 6 DM messages (3,496 chars), two of those slots were the persona's own unanswered replies (she had posted at 07:29 and 08:29 with nothing back), and `core/prompt_engine.py::_history_to_turns` drops leading assistant turns as orphans, so 2 lines of 771 chars survived. The night being asked about (04:15-09:00 CEST, 22 lines / 11,538 chars, of which the human's own words are 991) sat 8 to 15 messages further back. Her lines average 811 chars against his 110, so a message-counted window buys about seven times less of the human's conversation than it looks like.
