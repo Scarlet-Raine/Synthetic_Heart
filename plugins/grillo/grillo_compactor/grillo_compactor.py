@@ -344,6 +344,96 @@ class GrilloCompactorPlugin:
             )
         )
 
+        # Day-unit level 1 (the pass that replaced cross-day clustering). These are read on every run
+        # rather than once at boot, so an edit here takes effect without a restart. The defaults are
+        # the numbers the persona and the human agreed on; see MEMORY_COMPACTION_PLAN.md 5.5.
+        config_registry.get_value(
+            "GRILLO_COMPACT_DAY_UNITS",
+            True,
+            label="Compact One Day At A Time",
+            description=(
+                "Level 1 summarises each diary day as itself instead of clustering a week into a few "
+                "themes. A day already lives in one row, so nothing is merged across days. False "
+                "restores the older clustering path."
+            ),
+            value_type=bool,
+            group="grillo",
+            component="grillo_compactor",
+        )
+        config_registry.get_value(
+            "GRILLO_COMPACT_DAY_AGE_DAYS",
+            2,
+            label="Day Unit: Eligibility Age (days)",
+            description=(
+                "A day becomes eligible this many days after it was written. The newest days stay raw "
+                "because live chat is standing on them."
+            ),
+            value_type=int,
+            group="grillo",
+            component="grillo_compactor",
+        )
+        config_registry.get_value(
+            "GRILLO_COMPACT_DAY_MAX_SUMMARY_CHARS",
+            2000,
+            label="Day Unit: Summary Ceiling (chars)",
+            description=(
+                "Ceiling for a day-unit summary. It has to be large enough to hold the day's anchors, "
+                "which is why it is much higher than the old 300."
+            ),
+            value_type=int,
+            group="grillo",
+            component="grillo_compactor",
+        )
+        config_registry.get_value(
+            "GRILLO_COMPACT_DAY_THOUGHTS_CHARS",
+            6000,
+            label="Day Unit: Private Thoughts Shown (chars)",
+            description=(
+                "How much of the day's personal_thought is shown to the summariser. It used to be shown "
+                "none of it, and the entries' private thoughts are usually the larger half."
+            ),
+            value_type=int,
+            group="grillo",
+            component="grillo_compactor",
+        )
+        config_registry.get_value(
+            "GRILLO_COMPACT_REPLACE_MIN_CONFIDENCE",
+            0.9,
+            label="Day Unit: Confidence Needed To Replace The Day",
+            description=(
+                "Below this confidence the memory is written AND the raw day is kept beside it. Her "
+                "rule: the uncertain summaries are the ones whose original text has to stay reachable."
+            ),
+            value_type=float,
+            group="grillo",
+            component="grillo_compactor",
+        )
+        config_registry.get_value(
+            "GRILLO_COMPACT_ANCHOR_CHECK",
+            True,
+            label="Day Unit: Enforce Anchors",
+            description=(
+                "Check that the day's concrete terms (weather, places, names, objects) survived into the "
+                "summary, with one retry that names what was dropped. Off means a summary is accepted on "
+                "the model's word alone."
+            ),
+            value_type=bool,
+            group="grillo",
+            component="grillo_compactor",
+        )
+        config_registry.get_value(
+            "GRILLO_COMPACT_SKIP_DECLINED",
+            True,
+            label="Skip Declined Clusters",
+            description=(
+                "A cluster or day the model declined writes nothing and keeps its source rows. Before "
+                "this, a decline only skipped the size gate and the sources were archived and deleted."
+            ),
+            value_type=bool,
+            group="grillo",
+            component="grillo_compactor",
+        )
+
         # Register in core
         register_plugin("grillo_compactor", self)
         log_info("[grillo_compactor] Registered GrilloCompactorPlugin")
