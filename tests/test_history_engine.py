@@ -446,3 +446,244 @@ def test_diary_entry_renders_created_at_timestamp() -> None:
     )
     assert line.startswith("[diary 13/08/26:0130] summary: ")
     assert "Dee is showing Daddy" in line
+
+
+# ── Exchange window (CONTEXT_EXCHANGE_WINDOW) ────────────────────────────────
+
+
+def _lines(*specs: str) -> list[str]:
+    """Render history lines from "Sender: text" specs, with a rising timestamp."""
+    out: list[str] = []
+    for i, spec in enumerate(specs):
+        sender, _, text = spec.partition(": ")
+        out.append(f'[24/09/26:{700 + i:04d}] {sender}: "{text}"')
+    return out
+
+
+def test_exchange_window_keeps_the_last_n_exchanges() -> None:
+    """Two exchanges = the last two turns by somebody else plus what followed."""
+    from core.history_engine import _select_exchange_window
+
+    lines = _lines(
+        "Scar: H1",
+        "self (you): A1",
+        "self (you): A2",
+        "Scar: H2",
+        "self (you): A3",
+        "self: A4",
+        "Scar: H3",
+        "self (you): A5",
+    )
+    selected = _select_exchange_window(lines, 2)
+    assert selected == lines[3:]
+
+
+def test_exchange_window_survives_a_run_of_unanswered_replies() -> None:
+    """The failure mode this exists for: the persona's own replies eat a
+    message-counted window and the orphan-turn rule then deletes what is left
+    (measured 2026-09-24: six slots held one exchange)."""
+    from core.history_engine import _select_exchange_window
+
+    lines = _lines(
+        "Scar: the half-four thing",
+        "self (you): " + "x" * 500,
+        "self (you): " + "x" * 500,
+        "self (you): " + "x" * 500,
+        "self (you): " + "x" * 500,
+        "self (you): " + "x" * 500,
+        "Scar: are you awake",
+        "self (you): " + "x" * 500,
+    )
+    selected = _select_exchange_window(lines, 2)
+    assert selected == lines[0:]
+
+
+def test_exchange_window_drops_oldest_exchanges_over_the_char_cap() -> None:
+    from core.history_engine import _select_exchange_window
+
+    lines = _lines(
+        "Scar: old turn",
+        "self (you): " + "x" * 300,
+        "Scar: middle turn",
+        "self (you): " + "x" * 300,
+        "Scar: newest turn",
+        "self (you): " + "x" * 300,
+    )
+    selected = _select_exchange_window(lines, 3, char_cap=500)
+    # Whole oldest exchanges are dropped until the cap is met; the newest one
+    # always survives, and it is never truncated.
+    assert selected == lines[4:]
+    assert len("\n".join(selected)) <= 500
+
+
+def test_exchange_window_keeps_the_newest_exchange_whole_over_the_cap() -> None:
+    from core.history_engine import _select_exchange_window
+
+    lines = _lines("Scar: a huge turn", "self (you): " + "x" * 4000)
+    selected = _select_exchange_window(lines, 3, char_cap=100)
+    assert selected == lines
+
+
+def test_exchange_window_treats_spelled_out_self_labels_as_the_persona() -> None:
+    """`self (you)` is the persona's own line, not another speaker."""
+    from core.history_engine import _is_other_speaker_line
+
+    assert not _is_other_speaker_line('[24/09/26:0700] self (you): "mine"')
+    assert not _is_other_speaker_line('[24/09/26:0700] self: "mine"')
+    assert not _is_other_speaker_line('[24/09/26:0700] assistant: "mine"')
+    assert _is_other_speaker_line('[24/09/26:0700] Scar: "his"')
+    assert _is_other_speaker_line('[24/09/26:0700] 2B: "mama"')
+    # Unparseable lines are events, not people.
+    assert not _is_other_speaker_line("[diary 13/08/26:0130] summary: something")
+
+
+def test_exchange_window_off_returns_the_lines_untouched() -> None:
+    from core.history_engine import _select_exchange_window
+
+    lines = _lines("Scar: H1", "self (you): A1", "Scar: H2")
+    assert _select_exchange_window(lines, 0) == lines
+    assert _select_exchange_window([], 3) == []
+
+
+def test_exchange_window_falls_back_to_a_char_bounded_tail() -> None:
+    """Only the persona spoke: there is no exchange to anchor on."""
+    from core.history_engine import _select_exchange_window
+
+    lines = _lines("self (you): " + "y" * 200, "self (you): " + "y" * 200)
+    selected = _select_exchange_window(lines, 3, char_cap=300)
+    assert selected == lines[1:]
+
+
+@pytest.mark.asyncio
+async def test_build_context_uses_the_exchange_window_for_the_active_chat(
+    monkeypatch,
+) -> None:
+    """With the knob on, the active chat keeps whole exchanges: the run of the
+    persona's own replies stops eating the window (the reported incident kept
+    one exchange out of six message slots)."""
+    from core.history_engine import HistoryEngine
+
+    current_path = "telegram_bot/5208932647"
+    # Three human turns; the persona answers in long runs between them.
+    senders = [
+        "Scar",
+        "self",
+        "self",
+        "self",
+        "self",
+        "self",
+        "Scar",
+        "self",
+        "self",
+        "Scar",
+        "self",
+        "self",
+    ]
+    entries = [
+        {
+            "sender_name": sender,
+            "text": f"line {i}",
+            "timestamp": f"2026-09-24T{i:02d}:00:00+00:00",
+            "interface_path": current_path,
+        }
+        for i, sender in enumerate(senders)
+    ]
+    context_memory = {current_path: deque(entries)}
+
+    monkeypatch.setattr(
+        "core.chat_history_cache.load_chat_history", AsyncMock(return_value=deque())
+    )
+    monkeypatch.setattr(
+        "core.chat_history_cache.load_global_chat_history",
+        AsyncMock(return_value=deque()),
+    )
+    monkeypatch.setattr("core.core_initializer.PLUGIN_REGISTRY", {})
+    monkeypatch.setenv("CONTEXT_EXCHANGE_WINDOW", "1")
+    monkeypatch.setenv("CONTEXT_EXCHANGE_CHAR_CAP", "8000")
+
+    context = await HistoryEngine().build_context(
+        message=SimpleNamespace(interface_path=current_path),
+        context_memory=context_memory,
+        interface_name="telegram_bot",
+        text="current input",
+    )
+
+    joined = "\n".join(context["history_current_chat"])
+    # One exchange = the last human turn and the replies it got.
+    assert "line 9" in joined
+    assert "line 10" in joined and "line 11" in joined
+    # Everything before it is gone, including the six-line run of her replies.
+    assert "line 8" not in joined
+    assert "line 6" not in joined
+    assert "line 0" not in joined
+
+
+@pytest.mark.asyncio
+async def test_build_context_keeps_the_message_count_when_the_knob_is_off(
+    monkeypatch,
+) -> None:
+    """Knob off (or absent): the message count decides, which is what the
+    reported incident ran into, six slots holding one exchange."""
+    from core import history_engine
+    from core.history_engine import HistoryEngine
+
+    current_path = "telegram_bot/5208932647"
+    senders = [
+        "Scar",
+        "self",
+        "self",
+        "self",
+        "self",
+        "self",
+        "Scar",
+        "self",
+        "self",
+        "Scar",
+        "self",
+        "self",
+    ]
+    entries = [
+        {
+            "sender_name": sender,
+            "text": f"line {i}",
+            "timestamp": f"2026-09-24T{i:02d}:00:00+00:00",
+            "interface_path": current_path,
+        }
+        for i, sender in enumerate(senders)
+    ]
+    context_memory = {current_path: deque(entries)}
+
+    monkeypatch.setattr(
+        "core.chat_history_cache.load_chat_history", AsyncMock(return_value=deque())
+    )
+    monkeypatch.setattr(
+        "core.chat_history_cache.load_global_chat_history",
+        AsyncMock(return_value=deque()),
+    )
+    monkeypatch.setattr("core.core_initializer.PLUGIN_REGISTRY", {})
+    monkeypatch.delenv("CONTEXT_EXCHANGE_WINDOW", raising=False)
+    # Pin the message count so the comparison does not depend on the host's
+    # CONTEXT_VERBOSITY (10 by default, 6 in the 2D deployment).
+    real_get_int = history_engine._get_int
+    monkeypatch.setattr(
+        history_engine,
+        "_get_int",
+        lambda key, default: (
+            6 if key == "CONTEXT_VERBOSITY" else real_get_int(key, default)
+        ),
+    )
+
+    context = await HistoryEngine().build_context(
+        message=SimpleNamespace(interface_path=current_path),
+        context_memory=context_memory,
+        interface_name="telegram_bot",
+        text="current input",
+    )
+
+    joined = "\n".join(context["history_current_chat"])
+    # The last six messages, whatever the sender: the older run survives and the
+    # newest human turn is still there, which is how a window ends up holding a
+    # single readable exchange once the orphan-turn rule runs.
+    assert "line 6" in joined
+    assert "line 11" in joined
+    assert "line 5" not in joined
