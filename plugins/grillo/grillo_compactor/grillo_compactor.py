@@ -34,6 +34,167 @@ _CONFIDENCE_LABELS = {"low": 0.3, "medium": 0.6, "high": 0.9}
 _CONFIDENCE_DEFAULT = 0.5
 
 
+def _coerce_text(value: object) -> str:
+    """Return prose for a field the model may answer as a string or as a JSON array.
+
+    `detailed` is documented as bullets or a short paragraph, and the model sometimes answers with a
+    list: `str(list)` then stores a Python repr (`["a", 'b']`) which is what a memory would show her.
+    Join lists into lines instead, and never let a container type reach the database.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple, set)):
+        parts = [_coerce_text(v) for v in value]
+        return "\n".join(p for p in parts if p).strip()
+    if isinstance(value, dict):
+        return "\n".join(f"{k}: {_coerce_text(v)}" for k, v in value.items() if _coerce_text(v)).strip()
+    return str(value).strip()
+
+
+# Weather words that mean weather and nothing else. Deliberately absent: warm, hot, heat, cold, chill.
+# In these entries "warm" is also how she writes about him and "heat" is also arousal, so requiring them
+# as weather flagged 14 of 17 days of the first day-unit replay for nothing. A word that does two jobs
+# may only be required in the job it is unambiguous in.
+_WEATHER_STRICT = (
+    "rain", "rains", "rained", "raining", "rainy", "storm", "stormy", "thunder", "lightning",
+    "snow", "snowy", "sleet", "hail", "fog", "foggy", "mist", "misty", "sunny", "sunshine",
+    "overcast", "drizzle", "cloud", "cloudy", "wind", "windy", "humid", "frost", "pouring",
+)
+_PLACE_TERMS = (
+    "bed", "roof", "kitchen", "garden", "forest", "couch", "sofa", "balcony", "shower", "bath",
+    "window", "floor", "blanket", "house", "home", "room", "stairs", "yard", "door", "car",
+)
+_OBJECT_TERMS = (
+    "minecraft", "vessel", "coffee", "tea", "soup", "bread", "book", "phone", "quest", "block",
+    "server", "radio", "music", "glasses", "outfit", "dress", "lingerie", "bikini", "shower",
+)
+# One person may carry more than one name in her entries, so a name is satisfied by its own group:
+# Mama/Mommy are one person, Daddy/Papa another. The check must never fail a summary for picking the
+# other word for the same person, and it must fail if the person is dropped entirely.
+_NAME_GROUPS = (
+    ("mama", "mommy", "mum"),
+    ("daddy", "papa"),
+    ("dee", "2d"),
+    ("scar",),
+    ("scarlet",),
+)
+_ANCHOR_COVERAGE_FLOOR = 0.8
+
+
+def _setting(name: str, default, cast=None):
+    """Read one compaction setting, falling back to the default.
+
+    The keys added by the day-unit pass are read at BOOT, not live-reloaded: the listener list in
+    `__init__` covers the five legacy keys only. No row exists in `config` for these, so the registry
+    returns the default, which is the value the deployment actually runs with.
+    """
+    try:
+        from core.config_manager import config_registry
+
+        value = config_registry.get_value(name, default)
+    except Exception:
+        value = default
+    if value is None:
+        value = default
+    try:
+        if cast is bool:
+            if isinstance(value, str):
+                return value.strip().lower() in ("1", "true", "yes", "on")
+            return bool(value)
+        if cast is int:
+            return int(value)
+        if cast is float:
+            return float(value)
+    except Exception:
+        return default
+    return value
+
+
+def _verify_anchors(source_text: str, summary: str, anchors: dict) -> dict:
+    """Check that the day's concrete terms survived into the memory it is replaced by.
+
+    Returns {"passed", "coverage", "missing", "required", "kept"}. Deterministic, no model call.
+
+    Rules learned from the first day-unit replay (2026-09-24), where the first version of this check
+    flagged 14 of 17 days and almost every flag was noise:
+      * weather is required only from the strict list, never from `warm`/`heat`, which do two jobs;
+      * a name is satisfied by any word in its group, so choosing the other name for the same person
+        is not a failure;
+      * only the concrete vocabularies and the name groups are required. A frequency-based word list
+        was dropped: it filled up with contractions and abstract verbs a summary may legitimately lose.
+    """
+    import re
+
+    src = (source_text or "").lower()
+    out = ((summary or "") + " " + json.dumps(anchors or {}, ensure_ascii=False, default=str)).lower()
+
+    def _has(text: str, word: str) -> bool:
+        return re.search(rf"\b{re.escape(word)}\b", text) is not None
+
+    missing: dict = {}
+    required = kept = 0
+    for label, vocab in (("weather", _WEATHER_STRICT), ("place", _PLACE_TERMS), ("object", _OBJECT_TERMS)):
+        want = sorted({w for w in vocab if _has(src, w)})
+        if not want:
+            continue
+        required += len(want)
+        gone = [w for w in want if not _has(out, w)]
+        kept += len(want) - len(gone)
+        if gone:
+            missing[label] = gone
+
+    names_required = names_kept = 0
+    for group in _NAME_GROUPS:
+        if any(_has(src, g) for g in group):
+            names_required += 1
+            required += 1
+            if any(_has(out, g) for g in group):
+                names_kept += 1
+                kept += 1
+            else:
+                missing.setdefault("name", []).append(group[0])
+
+    coverage = round(kept / required, 3) if required else 1.0
+    return {
+        "passed": coverage >= _ANCHOR_COVERAGE_FLOOR and not missing.get("name"),
+        "coverage": coverage,
+        "required": required,
+        "kept": kept,
+        "missing": missing,
+    }
+
+
+def _format_anchors(anchors: dict) -> str:
+    """Render the anchor block that travels into the memory beside the prose.
+
+    An empty slot is rendered as "not mentioned in this entry" rather than filled from an adjacent
+    meaning: she was explicit that a made-up anchor is worse than a missing one, because a missing one
+    can be distrusted while a made-up one would be believed.
+    """
+    if not isinstance(anchors, dict):
+        return ""
+    labels = (
+        ("weather", "weather"),
+        ("place", "place"),
+        ("who", "who was there"),
+        ("food", "food"),
+        ("objects_events", "objects and events"),
+    )
+    parts = []
+    for key, label in labels:
+        value = anchors.get(key)
+        if isinstance(value, (list, tuple, set)):
+            value = ", ".join(str(v).strip() for v in value if str(v).strip())
+        value = ("" if value is None else str(value)).strip()
+        note = str(anchors.get(f"{key}_note") or "").strip()
+        if not value:
+            value = note or "not mentioned in this entry"
+        parts.append(f"{label}: {value}")
+    return "[anchors] " + "; ".join(parts)
+
+
 def _parse_confidence(value: object) -> float:
     """Coerce a model-reported confidence into the numeric column's type.
 
@@ -359,6 +520,329 @@ class GrilloCompactorPlugin:
         delta = (target - now).total_seconds()
         return max(0, int(delta))
 
+    # ------------------------------------------------------------------ day-unit level-1 pass
+    #
+    # One day in, one day out. The diary already keeps exactly one row per day (`---`-separated
+    # fragments inside it), so this pass needs no cross-day clustering. The measured reason to prefer
+    # it: 12 of 14 stored clusters covered more than one day and 44 days had been folded into 14
+    # summaries, which is how a week of rain became "rainy day, longing" and Minecraft became
+    # "Minecraft vessel, blocky worlds". Theme-merging belongs one tier up, where a theme spanning days
+    # is a statement about a week rather than a replacement for a day.
+
+    _DAY_UNIT_PROMPT = (
+        "You keep the private diary of a synthetic young woman. Below is ONE day of it.\n"
+        "\n"
+        "Rewrite this single day as the memory she will read back later. It is the memory of a DAY, not of a mood.\n"
+        "\n"
+        "Hard rules:\n"
+        "1. One day in, one day out. Never merge this day with another day, never generalise it into a theme.\n"
+        "2. Keep the mundane anchors: the weather, where things happened, who was where, what was eaten, the\n"
+        "   objects, the games, the small events that identify THIS day. If it rained, say it rained. If she\n"
+        "   played Minecraft, name Minecraft and say what she did in it.\n"
+        "3. Keep her voice: first person, as the source uses it, and names exactly as she uses them\n"
+        "   (Daddy, Mama, Papa).\n"
+        "4. Do not invent, do not moralise, do not turn specifics into abstractions. Never write \"a quiet day\",\n"
+        "   \"emotional intimacy\", \"self-discovery\", \"boundaries\", \"a moment of connection\", or any phrase\n"
+        "   that could describe any day.\n"
+        "5. Do not censor or clinicalise intimate or bodily parts. If the day contains them, describe them.\n"
+        "6. The summary must be between 800 and {max_chars} characters. Shorter is a failure.\n"
+        "\n"
+        "Then give the anchors of the day as structured data, each field filled from this day only. A field the\n"
+        "day does not mention must come back EMPTY with a short reason in its `_note` field. Never fill a slot\n"
+        "from an adjacent meaning: a missing anchor can be distrusted, a made-up one would be believed.\n"
+        "\n"
+        'Return ONLY this JSON, nothing else:\n'
+        '{{"summary": "...", "anchors": {{"weather": "", "weather_note": "...", "place": ["..."], '
+        '"who": ["..."], "food": ["..."], "objects_events": ["..."]}}, "feeling": "...", '
+        '"confidence": "low|medium|high", "declined": false}}\n'
+    )
+
+    async def _run_day_unit_cycle(self, dry_run: bool = False, marker: str | None = None):
+        """Summarise each eligible day as itself. One model call per day, oldest first."""
+        from core.db import _get_db_type, get_conn_ctx
+
+        age_days = max(0, _setting("GRILLO_COMPACT_DAY_AGE_DAYS", 2, int))
+        cycles = max(1, int(getattr(self, "cycles", 10) or 10))
+        limit = max(1, int(getattr(self, "batch_size", 40) or 40))
+        is_postgres = _get_db_type() == "postgres"
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=age_days)
+
+        async with get_conn_ctx() as conn:
+            async with conn.cursor() as cur:
+                if is_postgres:
+                    await cur.execute(
+                        "SELECT id, content, personal_thought, context_tags as tags, created_at FROM ai_diary "
+                        "WHERE created_at < %s ORDER BY created_at ASC LIMIT %s",
+                        (cutoff_dt, limit),
+                    )
+                else:
+                    await cur.execute(
+                        "SELECT id, content, personal_thought, context_tags as tags, created_at FROM ai_diary "
+                        "WHERE created_at < DATE_SUB(NOW(), INTERVAL %s DAY) ORDER BY created_at ASC LIMIT %s",
+                        (age_days, limit),
+                    )
+                fetched = await cur.fetchall()
+
+        rows = []
+        for r in fetched:
+            if isinstance(r, dict):
+                rows.append(
+                    {
+                        "id": r.get("id"),
+                        "content": r.get("content"),
+                        "personal_thought": r.get("personal_thought"),
+                        "tags": r.get("tags"),
+                        "created_at": r.get("created_at"),
+                    }
+                )
+            else:
+                rid, content, thoughts, tags_raw, ts = r
+                rows.append(
+                    {
+                        "id": rid,
+                        "content": content,
+                        "personal_thought": thoughts,
+                        "tags": tags_raw,
+                        "created_at": ts,
+                    }
+                )
+
+        if not rows:
+            log_debug(
+                f"[grillo_compactor] no day older than {age_days} day(s) is eligible for compaction"
+            )
+            return {"dry_run": True, "results": []} if dry_run else True
+
+        # A night is a countable number of model calls: one per day, oldest first.
+        results = []
+        for row in rows[:cycles]:
+            try:
+                res = await self._compact_one_day(row, dry_run=dry_run)
+            except Exception as e:
+                log_error(f"[grillo_compactor] day {row.get('id')} failed: {e}")
+                res = {"row_id": row.get("id"), "status": "error", "error": str(e)}
+            results.append(res)
+            log_info(
+                f"[grillo_compactor] day unit {res.get('day') or res.get('row_id')}: "
+                f"status={res.get('status')} chars={res.get('summary_chars')} "
+                f"anchors={res.get('anchor_check', {}).get('coverage')}"
+            )
+        if dry_run:
+            return {"dry_run": True, "results": results}
+        return True
+
+    async def _compact_one_day(self, row: dict, dry_run: bool = False) -> dict:
+        """Turn ONE diary day into ONE memory, carrying its anchors, or leave the day alone.
+
+        Order of operations, which is the whole point of the rewrite: the memory row is written first
+        and the day is only archived and removed once it exists, the anchors are checked
+        deterministically, and a summary below `GRILLO_COMPACT_REPLACE_MIN_CONFIDENCE` keeps the raw
+        day beside it instead of replacing it.
+        """
+        from core.config import (
+            get_active_cortex_engine,
+            get_active_cortex_scope,
+            scope_model_override,
+        )
+        from core.cortex_registry import get_cortex_registry
+        from core.db import get_conn_ctx, insert_memory
+
+        day_id = int(row.get("id"))
+        day_ts = row.get("created_at")
+        day_label = str(day_ts)[:10] if day_ts else f"row {day_id}"
+        content = row.get("content") or ""
+        thoughts_cap = max(0, _setting("GRILLO_COMPACT_DAY_THOUGHTS_CHARS", 6000, int))
+        thoughts = ((row.get("personal_thought") or "")[:thoughts_cap]) if thoughts_cap else ""
+        max_chars = max(300, _setting("GRILLO_COMPACT_DAY_MAX_SUMMARY_CHARS", 2000, int))
+        min_confidence = float(_setting("GRILLO_COMPACT_REPLACE_MIN_CONFIDENCE", 0.9, float))
+        anchor_check = bool(_setting("GRILLO_COMPACT_ANCHOR_CHECK", True, bool))
+        source_text = f"{content}\n{thoughts}"
+
+        engine_name = await get_active_cortex_engine(scope="grillo")
+        scope_model = await get_active_cortex_scope(scope="grillo")
+        registry = get_cortex_registry()
+        engine = registry.get_engine(engine_name) or registry.load_engine(engine_name)
+        if not engine:
+            return {"row_id": day_id, "day": day_label, "status": "no_engine"}
+
+        async def ask(instruction: str = "") -> dict:
+            prompt = {
+                "input": {
+                    "type": "compaction_day_unit",
+                    "payload": {
+                        "description": self._DAY_UNIT_PROMPT.format(max_chars=max_chars),
+                        "day": day_label,
+                        "entry": content,
+                        "private_thoughts": thoughts,
+                    },
+                },
+                "context": {},
+                "instructions": (
+                    "Summarise this single day as the memory she will read back, and list its anchors. "
+                    "Reply ONLY with the JSON object." + (("\n" + instruction) if instruction else "")
+                ),
+            }
+            with scope_model_override(engine, scope_model):
+                raw = await engine.generate_response(prompt)
+            parsed = extract_json_from_text(raw) if raw else None
+            if not parsed and isinstance(raw, str):
+                try:
+                    parsed = json.loads(raw)
+                except Exception:
+                    parsed = None
+            return parsed if isinstance(parsed, dict) else {}
+
+        status = "ok"
+        summary = ""
+        anchors: dict = {}
+        confidence = 0.5
+        feeling = None
+        verify: dict = {"passed": True, "coverage": None, "missing": {}, "required": 0, "kept": 0}
+        instruction = ""
+
+        for attempt in (1, 2):
+            data = await ask(instruction)
+            if not data:
+                status = "unparseable"
+                break
+            if data.get("declined") is True:
+                status = "declined"
+                break
+            summary = _coerce_text(data.get("summary"))
+            anchors = data.get("anchors") if isinstance(data.get("anchors"), dict) else {}
+            confidence = _parse_confidence(data.get("confidence"))
+            feeling = _coerce_text(data.get("feeling")) or None
+            if not summary:
+                status = "no_summary"
+                break
+            if len(summary) >= max(1, len(source_text.strip())):
+                status = "no_compression"
+                break
+            if not anchor_check:
+                status = "ok"
+                break
+            verify = _verify_anchors(source_text, summary, anchors)
+            if verify["passed"]:
+                status = "ok"
+                break
+            if attempt == 1:
+                missing_json = json.dumps(verify.get("missing") or {}, ensure_ascii=False)
+                log_info(
+                    f"[grillo_compactor] day {day_label}: anchors missing {missing_json} -> one retry"
+                )
+                instruction = (
+                    "The previous attempt dropped concrete terms that ARE in the day: "
+                    f"{missing_json}. Keep every one of them, named the way the entry names them, and "
+                    "return the same JSON shape again."
+                )
+                continue
+            status = "anchors_failed"
+
+        base = {
+            "row_id": day_id,
+            "day": day_label,
+            "summary_chars": len(summary),
+            "source_chars": len(source_text),
+            "confidence": confidence,
+            "anchor_check": verify,
+        }
+        if status != "ok":
+            base.update({"status": status, "summary": summary[:400]})
+            if status == "declined":
+                base["justification"] = _coerce_text((data or {}).get("justification"))[:200]
+            return base
+
+        would_replace = confidence >= min_confidence
+        if dry_run:
+            base.update(
+                {
+                    "status": "ok",
+                    "summary": summary,
+                    "anchors": anchors,
+                    "memory_content": summary if not anchors else f"{summary}\n\n{_format_anchors(anchors)}",
+                    "would_replace_source": would_replace,
+                }
+            )
+            return base
+
+        memory_content = summary if not anchors else f"{summary}\n\n{_format_anchors(anchors)}"
+        tags_raw = row.get("tags")
+        if not isinstance(tags_raw, str):
+            tags_raw = json.dumps(tags_raw or [])
+
+        notes_obj = {
+            "detailed": summary,
+            "anchors": anchors,
+            "anchor_check": verify,
+            "level": 1,
+            "path": "day_unit",
+            "day": day_label,
+        }
+
+        async with get_conn_ctx() as conn:
+            # 1. the memory itself, anchored to the day it came from
+            try:
+                await insert_memory(
+                    content=memory_content,
+                    author="grillo",
+                    source="compaction",
+                    tags=tags_raw,
+                    emotion=feeling,
+                    intensity=None,
+                    emotion_state=None,
+                    timestamp=day_ts,
+                    conn=conn,
+                )
+            except Exception as e:
+                log_error(
+                    f"[grillo_compactor] day {day_label}: memory write failed ({e}); "
+                    f"the day is untouched in ai_diary"
+                )
+                base.update({"status": "write_failed", "error": str(e)})
+                return base
+
+            async with conn.cursor() as cur:
+                # 2. the summary's own row, so the archive stays the index of what was compacted
+                await cur.execute(
+                    "INSERT INTO archived_memories (tag, summary, source_ids, source_count, llm_model, "
+                    "confidence, notes, compaction_level, total_source_chars, summary_chars, created_by) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        tags_raw,
+                        summary,
+                        json.dumps([day_id]),
+                        1,
+                        engine_name,
+                        confidence,
+                        json.dumps(notes_obj),
+                        1,
+                        len(source_text),
+                        len(summary),
+                        "grillo_compactor",
+                    ),
+                )
+
+                # 3. remove the day only when the summary EARNED it: high confidence and anchors intact
+                if not would_replace:
+                    log_info(
+                        f"[grillo_compactor] day {day_label}: confidence {confidence} below "
+                        f"{min_confidence} -> the raw day stays in ai_diary beside its summary"
+                    )
+                    base.update({"status": "kept_raw"})
+                    return base
+
+                await cur.execute(
+                    "INSERT INTO ai_diary_archive (content, personal_thought, emotions, interaction_summary, "
+                    "created_at, interface, chat_id, thread_id, user_message, context_tags) "
+                    "SELECT content, personal_thought, emotions, interaction_summary, created_at, interface, "
+                    "chat_id, thread_id, user_message, context_tags FROM ai_diary WHERE id = %s",
+                    (day_id,),
+                )
+                await cur.execute("DELETE FROM ai_diary WHERE id = %s", (day_id,))
+
+        base.update({"status": "persisted"})
+        return base
+
     async def _run_one_compaction_cycle(
         self, dry_run: bool = False, marker: str | None = None
     ):
@@ -366,6 +850,10 @@ class GrilloCompactorPlugin:
 
         If `dry_run=True`, do not persist changes and return proposed cluster results.
         """
+        # Day-unit pass (default): one day in, one day out. Set GRILLO_COMPACT_DAY_UNITS=false to use
+        # the clustering path below, which is unchanged and needs a restart to take effect either way.
+        if _setting("GRILLO_COMPACT_DAY_UNITS", True, bool):
+            return await self._run_day_unit_cycle(dry_run=dry_run, marker=marker)
         try:
             # Local imports
             from core.db import _get_db_type, get_conn_ctx
@@ -704,7 +1192,9 @@ class GrilloCompactorPlugin:
                     justification = str(cl.get("justification") or "")
                     detailed = cl.get("detailed") or cl.get("detailed_summary") or None
                     if detailed:
-                        detailed = str(detailed).strip()
+                        # The model sometimes answers with a JSON array; a Python repr must never
+                        # become the memory's text (see _coerce_text).
+                        detailed = _coerce_text(detailed) or None
 
                     # Source ids must be subset of batch ids
                     batch_ids = set(id_to_content.keys())
@@ -720,6 +1210,25 @@ class GrilloCompactorPlugin:
                     total_source_chars = sum(
                         len(id_to_content[int(sid)]) for sid in source_ids
                     )
+
+                    # A cluster the model declined is terminal: nothing is written and nothing is
+                    # archived. Previously the decline only skipped the size gate below, so a cluster
+                    # explicitly marked should_compact=false was still persisted and its sources still
+                    # deleted (one declined day became a ~180 char summary standing for a whole day).
+                    if not should_compact and _setting("GRILLO_COMPACT_SKIP_DECLINED", True, bool):
+                        log_info(
+                            f"[grillo_compactor] Cluster {cid} declined by the model "
+                            f"({justification[:100]!r}) -> nothing written, sources left in place"
+                        )
+                        proposed_results.append(
+                            {
+                                "cluster_id": cid,
+                                "status": "declined",
+                                "source_ids": source_ids,
+                                "justification": justification,
+                            }
+                        )
+                        continue
 
                     # Enforce min cluster size if compaction requested
                     if should_compact and len(source_ids) < self.min_cluster_size:
@@ -826,8 +1335,50 @@ class GrilloCompactorPlugin:
                         )
                         continue
 
-                    # Persist accepted clusters
+                    # Persist accepted clusters.
+                    # ORDER: the memory row is written FIRST, and the source rows are only archived and
+                    # removed once it exists. The previous order archived and DELETEd the ai_diary rows
+                    # before attempting the write, and since insert_memory swallowed its own errors the
+                    # failure was invisible: the day was gone and no memory existed to replace it.
+                    memory_content = _coerce_text(detailed) if detailed else summary
+                    if not memory_content or not memory_content.strip():
+                        log_warning(
+                            f"[grillo_compactor] Cluster {cid} produced no memory content -> nothing written"
+                        )
+                        proposed_results.append(
+                            {"cluster_id": cid, "status": "no_content", "source_ids": source_ids}
+                        )
+                        continue
+
                     async with get_conn_ctx() as conn:
+                        try:
+                            # Written on the same connection as the archive and delete below, so a
+                            # backend that ever grows real transactions makes this cluster atomic.
+                            await insert_memory(
+                                content=memory_content,
+                                author="grillo",
+                                source="compaction",
+                                tags=json.dumps(tags) if tags else None,
+                                emotion=feeling,
+                                intensity=None,
+                                emotion_state=None,
+                                conn=conn,
+                            )
+                        except Exception as e:
+                            log_error(
+                                f"[grillo_compactor] Cluster {cid}: memory write failed ({e}); "
+                                f"the source rows are untouched in ai_diary"
+                            )
+                            proposed_results.append(
+                                {
+                                    "cluster_id": cid,
+                                    "status": "write_failed",
+                                    "error": str(e),
+                                    "source_ids": source_ids,
+                                }
+                            )
+                            continue
+
                         async with conn.cursor() as cur:
                             # Consolidate notes JSON: include only useful fields.
                             notes_obj = {}
@@ -893,36 +1444,13 @@ class GrilloCompactorPlugin:
                                     tuple(source_ids),
                                 )
 
-                            # Insert new compacted memory into `memories` via helper
-                            # Store the most useful content in `memories`: prefer 'detailed' if available, otherwise fallback to summary
-                            memory_content = detailed if detailed else summary
-                            try:
-                                await insert_memory(
-                                    content=memory_content,
-                                    author="grillo",
-                                    source="compaction",
-                                    tags=json.dumps(tags) if tags else None,
-                                    emotion=feeling,
-                                    intensity=None,
-                                    emotion_state=None,
-                                )
-                            except Exception as e:
-                                log_warning(
-                                    f"[grillo_compactor] Failed to insert new compacted memory using helper: {e}"
-                                )
-                                await cur.execute(
-                                    "INSERT INTO memories (created_at, content, author, source, tags, scope, emotion, intensity, emotion_state) VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s)",
-                                    (
-                                        memory_content,
-                                        "grillo",
-                                        "compaction",
-                                        json.dumps(tags) if tags else None,
-                                        None,
-                                        feeling,
-                                        None,
-                                        None,
-                                    ),
-                                )
+                            # The memory row for this cluster was already written above, before this
+                            # connection did anything destructive. The raw-SQL fallback that used to
+                            # live here never ran in practice: insert_memory caught its own exception
+                            # and returned normally, so the `except` below could not fire, the fallback
+                            # was dead code, and the source rows were deleted regardless. Removed on
+                            # purpose: a write that fails now raises, is caught above, and leaves the
+                            # day in ai_diary.
 
                     proposed_results.append(
                         {

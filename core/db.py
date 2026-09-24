@@ -2055,6 +2055,46 @@ async def ensure_plugin_tables() -> None:
 
 
 # 🧠 Insert a new memory into the database
+def _coerce_memory_timestamp(value: object) -> datetime:
+    """Return a timezone-aware datetime for `memories.created_at`.
+
+    This exists because the Postgres backend forwards parameters to asyncpg unchanged
+    (core/db_backends.py), and asyncpg refuses a `str` for TIMESTAMPTZ client-side: the statement is
+    never sent, so the row silently never appears. A `str` here is therefore a data-loss bug, not a
+    formatting preference. Anything unparseable raises instead of falling back to "now".
+    """
+    from datetime import date  # local import: keeps this module's import block untouched
+
+    if value is None:
+        return datetime.now(timezone.utc)
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return datetime.now(timezone.utc)
+        parsed: datetime | None = None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S", "%d.%m.%Y %H:%M:%S"):
+                try:
+                    parsed = datetime.strptime(text, fmt)
+                    break
+                except ValueError:
+                    continue
+        if parsed is None:
+            raise ValueError(f"insert_memory: cannot read timestamp {value!r} as a datetime")
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    raise TypeError(
+        f"insert_memory: timestamp must be datetime, date, str, int or None, got {type(value).__name__}"
+    )
+
+
 async def insert_memory(
     content: str,
     author: str,
@@ -2064,35 +2104,56 @@ async def insert_memory(
     emotion: str | None = None,
     intensity: int | None = None,
     emotion_state: str | None = None,
-    timestamp: str | None = None,
-) -> None:
-    if not timestamp:
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    timestamp: str | datetime | None = None,
+    conn=None,
+) -> bool:
+    """Write one memory row. Returns True when the row was written.
+
+    Raises on failure instead of printing and returning: a swallowed failure here used to leave the
+    caller believing the memory existed (the compactor archived and deleted the source rows after a
+    write that never happened). Pass `conn` to write inside a caller's connection and transaction.
+
+    `timestamp` accepts a datetime (preferred), a date, an ISO-ish string, a UNIX timestamp or None
+    for "now in UTC"; the coercion lives in `_coerce_memory_timestamp`.
+    """
+    if content is None or not str(content).strip():
+        raise ValueError("insert_memory: refusing to write an empty memory")
+
+    when = _coerce_memory_timestamp(timestamp)
 
     await ensure_core_tables()
 
-    async with get_conn_ctx() as conn:
-        try:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    INSERT INTO memories (created_at, content, author, source, tags, scope, emotion, intensity, emotion_state)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        timestamp,
-                        content,
-                        author,
-                        source,
-                        tags,
-                        scope,
-                        emotion,
-                        intensity,
-                        emotion_state,
-                    ),
-                )
-        except Exception as e:
-            print(f"[insert_memory] Error: {e}")
+    params = (
+        when,
+        content,
+        author,
+        source,
+        tags,
+        scope,
+        emotion,
+        intensity,
+        emotion_state,
+    )
+    sql = """
+        INSERT INTO memories (created_at, content, author, source, tags, scope, emotion, intensity, emotion_state)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+
+    async def _run(connection) -> None:
+        async with connection.cursor() as cur:
+            await cur.execute(sql, params)
+
+    try:
+        if conn is not None:
+            # Join the caller's connection: ordering against the caller's other writes is then explicit.
+            await _run(conn)
+        else:
+            async with get_conn_ctx() as own_conn:
+                await _run(own_conn)
+    except Exception as e:
+        log_error(f"[insert_memory] write failed ({type(e).__name__}: {e}); no memory row was stored")
+        raise
+    return True
 
 
 # 💥 Insert a new emotional event
