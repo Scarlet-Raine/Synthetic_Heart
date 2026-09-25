@@ -145,21 +145,42 @@ async def test_db_auto_heal_disabled_raises(monkeypatch):
     assert called["plugin"] == 0
 
 
-def test_no_engine_name_is_seeded_as_the_default_cortex():
-    """A fresh install must not inherit a fixed engine name.
+def test_the_seeded_default_cortex_is_an_engine_this_repository_ships() -> None:
+    """A fresh install must not inherit an engine name that resolves to nothing.
 
     Seeding BASE_CORTEX is how installs came to point at "selenium-llm-engine", a
-    MariaDB-era engine nobody had configured. The heal that followed then substituted
-    whichever engine sorts first alphabetically ("anthropic"), which is unusable
-    without a key, and that name sat in users' databases across reinstalls for months.
-    Left unseeded it resolves to "not configured", which is true and points at the
-    engine selector.
+    MariaDB-era container name nobody had configured; the heal that followed then
+    substituted whichever engine sorted first alphabetically, and that name sat in users'
+    databases across reinstalls for months.
+
+    Upstream's Zen migration seeds a default again on purpose, and that is fine as long as
+    the name is one the repository actually ships: `zen-llm-engine` has a preset in
+    `providers/` (renamed from the old container name, see
+    `core/external_endpoints/registry.py`), so it resolves to a real engine rather than to
+    a name invented at seed time.
     """
+    shipped = {
+        path.stem.replace("_", "-") for path in (REPO_ROOT / "providers").glob("*.json")
+    }
+    assert shipped, (
+        "providers/ holds the engine presets; found none, so this guard cannot speak"
+    )
+
+    retired = {"selenium-llm-engine"}
+    seeded: set[str] = set()
     for source in (REPO_ROOT / "init-db.sql", REPO_ROOT / "core" / "db.py"):
         text = source.read_text(encoding="utf-8")
         # Anchored on VALUES so it cannot match the heal's "config_key IN (...)" list.
-        seeded = set(re.findall(r"VALUES\s*\([^)]*'BASE_CORTEX'\s*,\s*'([^']*)'", text))
-        assert seeded <= {""}, (
-            f"{source.name} seeds BASE_CORTEX with {sorted(seeded)}: a fixed engine "
-            "name is what made every fresh install resolve to an unusable engine"
+        seeded |= set(
+            re.findall(r"VALUES\s*\([^)]*'BASE_CORTEX'\s*,\s*'([^']*)'", text)
+        )
+
+    for name in seeded - {""}:
+        assert name not in retired, (
+            f"BASE_CORTEX is seeded with the retired container-era name {name!r}: it is what "
+            "made every fresh install resolve to an engine nobody had configured"
+        )
+        assert name in shipped, (
+            f"BASE_CORTEX is seeded with {name!r}, which is not one of the {len(shipped)} "
+            "engine presets this repository ships under providers/"
         )
