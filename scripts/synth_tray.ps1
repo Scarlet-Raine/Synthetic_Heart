@@ -29,6 +29,15 @@ param(
     [int]$PollSeconds = 2,
     # Where to append what happened. Defaults to <AppRoot>\logs\tray.log.
     [string]$LogFile = '',
+    # How many checks in a row may go unanswered before SyntH counts as stopped. Two
+    # keeps a WebUI that is busy for one poll from being mistaken for a dead one.
+    [int]$StopMissLimit = 2,
+    # Seconds to wait for a requested stop to take effect before saying it did not.
+    [int]$StopGraceSeconds = 20,
+    # Seconds to wait for a restarted SyntH to answer before giving up on it.
+    [int]$RestartGraceSeconds = 120,
+    # Seconds to wait for a first start before removing an icon nothing will use.
+    [int]$StartupGraceSeconds = 180,
     # Skip the "starting" balloon. The icon and its menu still appear.
     [switch]$NoBalloon
 )
@@ -164,40 +173,32 @@ function Get-PythonPath {
 
 function Invoke-Launcher {
     <#
-        Call the one launcher for start/stop/open, and hand back its exit code when
-        we wait for it.
+        Call the one launcher for start/stop/open.
+
+        Never waits for it. The tray is one thread: a click that waited for
+        ``start_synth.py --stop`` would hold the message loop for as long as it takes
+        the application to die, and for that whole time the icon answers a right-click
+        with a menu that does nothing. The state poll reports what actually happened
+        instead, which is better evidence anyway, and the launcher's own account of the
+        stop is in logs\synth_launch.log.
 
         Always the windowless interpreter: nothing should flash a console window on a
-        desktop launch, and the launcher writes what it did to logs\synth_launch.log
-        rather than to a console nobody is looking at.
+        desktop launch.
     #>
-    param([string[]]$Arguments, [switch]$Wait, [string]$Description = 'launch')
+    param([string[]]$Arguments, [string]$Description = 'launch')
     $python = Get-PythonPath -Console:$false
     if (-not $python) {
         Write-TrayLog "action '$Description': no interpreter under $AppRoot\.venv\Scripts" 'ERROR'
-        return $null
+        return
     }
     $launcher = Join-Path $AppRoot 'scripts\start_synth.py'
     Write-TrayLog "action '$Description': $python $launcher $($Arguments -join ' ')"
-    $params = @{
-        FilePath     = $python
-        ArgumentList = (@($launcher) + $Arguments)
-        WindowStyle  = 'Hidden'
-    }
-    if ($Wait) { $params['Wait'] = $true }
     try {
-        $process = Start-Process @params -PassThru
-        if ($Wait -and $process) {
-            # The launcher reports "nothing was running" and "could not stop" with
-            # different codes, which is the difference between a working button and a
-            # button that lies.
-            Write-TrayLog "action '$Description': exit code $($process.ExitCode)"
-            return $process.ExitCode
-        }
-        return $null
+        Start-Process -FilePath $python `
+            -ArgumentList (@($launcher) + $Arguments) `
+            -WindowStyle Hidden
     } catch {
         Write-TrayLog "action '$Description' failed: $($_.Exception.Message)" 'ERROR'
-        return $null
     }
 }
 
@@ -222,32 +223,102 @@ function Test-SyntHIsUp {
 }
 
 # ---------------------------------------------------------------------------
-# One state check: probe, then follow it with the tooltip and the log. Called on
-# every tick, and again after an action that should have changed the state.
+# One state check: probe, then follow it with the tooltip, the log, and whether
+# this icon should still be here at all. Called on every tick. It is the tray's
+# only clock, so it must never block: a menu click that waited for SyntH to die
+# would freeze the icon that was clicked.
 # ---------------------------------------------------------------------------
+function Set-PollInterval {
+    param([int]$Milliseconds)
+    try { if ($script:timer) { $script:timer.Interval = $Milliseconds } } catch { }
+}
+
+function Stop-Tray {
+    <#
+        Say why, take the icon away, and end the message loop.
+
+        An icon that outlives the application is worse than no icon: Windows still
+        shows it, a right-click still opens the menu, and every entry in that menu is
+        about an application that is not there.
+    #>
+    param([string]$Reason, [string]$Level = 'INFO')
+    Write-TrayLog "removing the icon: $Reason" $Level
+    if (-not $NoBalloon) {
+        try {
+            $notify.ShowBalloonTip(5000, 'SyntH', $Reason, [System.Windows.Forms.ToolTipIcon]::Info)
+        } catch { }
+    }
+    try { $notify.Visible = $false } catch { }
+    [System.Windows.Forms.Application]::ExitThread()
+}
+
 function Update-State {
     try {
         $url = Test-SyntHIsUp
         if ($url) {
+            $script:Misses = 0
+            if ($script:WatchStopUntil) {
+                # A stop was asked for and SyntH is still answering. That is expected for
+                # the few seconds it takes to go down, so the watch keeps running until the
+                # grace is up; only then is it a stop that did not take effect, and the
+                # person who asked has to be told.
+                if ((Get-Date) -gt $script:WatchStopUntil) {
+                    $script:WatchStopUntil = $null
+                    Set-PollInterval ($PollSeconds * 1000)
+                    Write-TrayLog 'the stop did not take effect: the WebUI is still answering' 'ERROR'
+                    $notify.Text = 'SyntH is still running'
+                    if (-not $NoBalloon) {
+                        $notify.ShowBalloonTip(7000, 'SyntH is still running', "The stop request did not take effect. See logs\tray.log and logs\synth_launch.log.", [System.Windows.Forms.ToolTipIcon]::Warning)
+                    }
+                }
+            }
             if ($script:State -ne 'running') {
+                $cameBack = $script:Restarting
+                $script:Restarting = $false
+                $script:EverRunning = $true
                 $script:State = 'running'
                 $script:ReadyUrl = $url
                 $notify.Text = 'SyntH is running'
                 Write-TrayLog "state: running ($url)"
                 if (-not $NoBalloon) {
                     # The install's own reassurance: the launcher window is long gone.
-                    $notify.ShowBalloonTip(5000, 'SyntH is running', "$url`nRight-click this icon for the menu.", [System.Windows.Forms.ToolTipIcon]::Info)
+                    $title = if ($cameBack) { 'SyntH is back' } else { 'SyntH is running' }
+                    $notify.ShowBalloonTip(5000, $title, "$url`nRight-click this icon for the menu.", [System.Windows.Forms.ToolTipIcon]::Info)
                 }
             }
             return
         }
-        # Only a SyntH that was running can be said to have stopped: while it is still
-        # starting, saying "stopped" would be a lie told to the person watching.
+
+        # Not answering.
         if ($script:State -eq 'running') {
-            $script:State = 'stopped'
-            $notify.Text = 'SyntH is stopped'
-            Write-TrayLog 'state: stopped'
+            $script:Misses++
+            Write-TrayLog "no answer from the WebUI ($($script:Misses) check(s) in a row)"
+            if ($script:Misses -ge $StopMissLimit) {
+                $script:State = 'stopped'
+                $notify.Text = 'SyntH is stopped'
+                Write-TrayLog 'state: stopped'
+            }
         }
+        if ($script:State -ne 'stopped') {
+            # Still starting. Nothing to report until either it answers or this gives up.
+            if (-not $script:EverRunning -and (Get-Date) -gt $script:StartedAt.AddSeconds($StartupGraceSeconds)) {
+                Write-TrayLog "SyntH never answered within $StartupGraceSeconds s" 'ERROR'
+                Stop-Tray "SyntH did not start. See logs\tray.log and logs\synth_bootstrap.log." 'ERROR'
+            }
+            return
+        }
+
+        # Stopped, and it was this icon's application: the icon goes with it. A restart
+        # in flight is the one case where that would be wrong, and it has its own grace.
+        if ($script:Restarting) {
+            if ((Get-Date) -gt $script:RestartUntil) {
+                $script:Restarting = $false
+                Write-TrayLog 'the restart never came back' 'ERROR'
+                Stop-Tray "SyntH was restarted but did not come back. See logs\tray.log." 'ERROR'
+            }
+            return
+        }
+        Stop-Tray 'SyntH is not running any more'
     } catch {
         # Never let a failed probe kill the icon; the next check tries again.
         Write-TrayLog "state check failed: $($_.Exception.Message)" 'WARN'
@@ -278,6 +349,16 @@ function Get-TrayIcon {
 
 $script:State = 'starting'
 $script:ReadyUrl = $null
+# Whether this tray has ever seen SyntH answer. Until it has, a silent WebUI is a start
+# in progress; after it has, a silent WebUI is a stopped application.
+$script:EverRunning = $false
+$script:Misses = 0
+$script:StartedAt = Get-Date
+# Set while a requested stop is being watched, and while a restart is in flight: both
+# keep this icon alive through a period where SyntH is legitimately not answering.
+$script:WatchStopUntil = $null
+$script:Restarting = $false
+$script:RestartUntil = $null
 
 $notify = New-Object System.Windows.Forms.NotifyIcon
 $notify.Icon = Get-TrayIcon
@@ -298,11 +379,18 @@ $menu.Items.Add($openItem) | Out-Null
 $restartItem = New-Object System.Windows.Forms.ToolStripMenuItem('Restart')
 $restartItem.Add_Click({
     try {
+        Write-TrayLog 'action: restart'
         $notify.Text = 'SyntH is restarting'
-        Invoke-Launcher -Arguments @('--stop') -Wait -Description 'restart: stop' | Out-Null
-        Invoke-Launcher -Arguments @('--no-browser', '--no-tray') -Description 'restart: start again' | Out-Null
-        Start-Sleep -Seconds 3
-        Update-State
+        # Both of these hand the work to the launcher and return at once. The tray has
+        # one thread, so anything that waited here would freeze the icon and its menu
+        # for as long as the application took to go down and come back.
+        $script:State = 'running'
+        $script:Misses = 0
+        $script:Restarting = $true
+        $script:RestartUntil = (Get-Date).AddSeconds($RestartGraceSeconds)
+        Set-PollInterval 1000
+        Invoke-Launcher -Arguments @('--stop') -Description 'restart: stop'
+        Invoke-Launcher -Arguments @('--no-browser', '--no-tray') -Description 'restart: start again'
     } catch {
         Write-TrayLog "restart failed: $($_.Exception.Message)" 'ERROR'
     }
@@ -312,20 +400,16 @@ $menu.Items.Add($restartItem) | Out-Null
 $shutdownItem = New-Object System.Windows.Forms.ToolStripMenuItem('Shut down')
 $shutdownItem.Add_Click({
     try {
+        Write-TrayLog 'action: shut down'
         $notify.Text = 'SyntH is shutting down'
-        Invoke-Launcher -Arguments @('--stop') -Wait -Description 'shut down' | Out-Null
-        Start-Sleep -Milliseconds 1500
-        # Ask SyntH, instead of taking the launcher's word for it: a stop that did not
-        # take effect has to be visible to the person who asked for it, and is worth a
-        # line in the log either way.
-        Update-State
-        if ($script:State -eq 'running') {
-            Write-TrayLog 'shut down did not take effect: the WebUI is still answering' 'ERROR'
-            $notify.Text = 'SyntH is still running'
-            $notify.ShowBalloonTip(6000, 'SyntH is still running', "The stop request did not take effect. See logs\tray.log and logs\synth_launch.log.", [System.Windows.Forms.ToolTipIcon]::Warning)
-        } else {
-            $notify.Text = 'SyntH is stopped'
-        }
+        $script:State = 'running'
+        $script:Misses = 0
+        $script:WatchStopUntil = (Get-Date).AddSeconds($StopGraceSeconds)
+        Set-PollInterval 1000
+        Invoke-Launcher -Arguments @('--stop') -Description 'shut down'
+        # From here the state poll reports the outcome: the icon is removed once SyntH
+        # stops answering, and if it is still answering after the grace the tooltip and
+        # a balloon say that the stop did not take effect.
     } catch {
         Write-TrayLog "shutdown failed: $($_.Exception.Message)" 'ERROR'
     }
@@ -356,12 +440,14 @@ $notify.Add_MouseDoubleClick({ $openItem.PerformClick() })
 Write-TrayLog 'menu built: open / restart / shut down / check for updates (disabled) / hide'
 
 # ---------------------------------------------------------------------------
-# State poll: the tooltip and the balloon both follow it.
+# State poll: the tooltip, the balloon and whether this icon should still exist
+# all follow it. It is script-scoped so an action can retime it while watching a
+# stop or a restart.
 # ---------------------------------------------------------------------------
-$timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = $PollSeconds * 1000
-$timer.Add_Tick({ Update-State })
-$timer.Start()
+$script:timer = New-Object System.Windows.Forms.Timer
+$script:timer.Interval = $PollSeconds * 1000
+$script:timer.Add_Tick({ Update-State })
+$script:timer.Start()
 
 # Announce the launch straight away: this is the whole point of the icon.
 if (-not $NoBalloon) {
@@ -379,7 +465,7 @@ try {
     [System.Windows.Forms.Application]::Run()
 } finally {
     Write-TrayLog 'message loop ended'
-    try { $timer.Stop() } catch { }
+    try { $script:timer.Stop() } catch { }
     try { $notify.Visible = $false; $notify.Dispose() } catch { }
     try { $mutex.ReleaseMutex(); $mutex.Dispose() } catch { }
 }

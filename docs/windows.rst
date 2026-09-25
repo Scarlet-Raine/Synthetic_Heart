@@ -117,10 +117,15 @@ Notes and caveats
   appears at all, ``logs\tray.log`` names the step it reached and
   ``logs\synth_launch.log`` records whether the launcher tried to start it.
   "Shut down" asks ``start_synth.py --stop`` and then checks the WebUI again, so a
-  stop that did not take effect says so in the tray and in ``logs\tray.log`` instead
+  stop that did not take effect says so in the tray and in ``logs\\tray.log`` instead
   of looking like a success. The launcher decides what to stop from this install's
   own processes as well as from the recorded pid: with only a missing or stale pid
-  file to go on, the button used to do nothing at all.
+  file to go on, the button used to do nothing at all. Nothing in the menu waits for
+  the launcher, because the icon is a single thread: a click that waited for SyntH to
+  die froze the icon and its own menu until it had. The icon also belongs to the
+  application's lifetime: once SyntH has been running and then stops answering, the
+  icon removes itself, rather than staying behind to offer a menu whose every entry
+  is about a process that is gone.
 - Uninstalling keeps ``data\`` and ``.env`` on purpose, so a reinstall resumes the
   same persona, history and keys. The database cluster lives in ``data\pgsql``, so
   a reinstall reuses it rather than creating a new one. Tick "Remove all my data

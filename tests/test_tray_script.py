@@ -18,8 +18,10 @@ import importlib.util
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -31,6 +33,37 @@ TRAY_SCRIPT = REPO_ROOT / "scripts" / "synth_tray.ps1"
 POWERSHELL = shutil.which("powershell") or shutil.which("powershell.exe")
 
 IS_WINDOWS = os.name == "nt"
+
+
+def _strip_comments(text: str) -> str:
+    """The tray's code without its comments (prose reads like code to a regex)."""
+    code = re.sub(r"<#.*?#>", "", text, flags=re.DOTALL)
+    return "\n".join(
+        line.split(" #", 1)[0]
+        for line in code.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+
+
+def _process_exists(pid: int) -> bool:
+    """Ask Windows whether a pid is alive, rather than believing our own child."""
+    completed = subprocess.run(  # noqa: S603
+        ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return str(pid) in completed.stdout
+
+
+def _read_log(path: Path) -> str:
+    """Read a log the tray may be appending to at this instant."""
+    for _ in range(40):
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except (PermissionError, FileNotFoundError):
+            time.sleep(0.05)
+    return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
 
 
 def _load_launcher():
@@ -154,12 +187,7 @@ def test_every_helper_the_tray_calls_is_defined_in_it() -> None:
     body = TRAY_SCRIPT.read_text(encoding="utf-8")
     # Comments are prose, and prose reads like a command name: the help block's
     # "Notification-area (tray) icon" is not a call to anything.
-    code = re.sub(r"<#.*?#>", "", body, flags=re.DOTALL)
-    code = "\n".join(
-        line.split(" #", 1)[0]
-        for line in code.splitlines()
-        if not line.lstrip().startswith("#")
-    )
+    code = _strip_comments(body)
     defined = set(re.findall(r"function\s+([A-Za-z][\w-]*)", code))
     # Command position only: a statement start, straight after an opening brace, or a
     # pipeline stage.
@@ -266,3 +294,147 @@ def test_the_tray_script_reaches_its_message_loop(tmp_path: Path) -> None:
         if process.poll() is None:
             process.kill()
         process.wait(timeout=15)
+
+
+def _click_handler_bodies() -> list[str]:
+    """The body of every ``Add_Click({ ... })`` in the tray, by brace matching."""
+    code = _strip_comments(TRAY_SCRIPT.read_text(encoding="utf-8"))
+    bodies = []
+    for match in re.finditer(r"Add_Click\(\{", code):
+        depth = 1
+        index = match.end()
+        start = index
+        while index < len(code) and depth:
+            if code[index] == "{":
+                depth += 1
+            elif code[index] == "}":
+                depth -= 1
+            index += 1
+        bodies.append(code[start : index - 1])
+    return bodies
+
+
+@pytest.mark.skipif(
+    not (IS_WINDOWS and POWERSHELL),
+    reason="needs a Windows desktop with PowerShell",
+)
+def test_no_menu_entry_waits_for_the_launcher() -> None:
+    """A click must not hold the tray's single thread, or the menu goes dead.
+
+    The tray is one thread running a WinForms message loop, and the handlers run on it.
+    ``Start-Process -Wait`` in the Shut down entry therefore froze the icon and its menu
+    for as long as the application took to die: the menu opened, and nothing in it did
+    anything. The launcher is called and reported on by the state poll instead.
+    """
+    if not TRAY_SCRIPT.is_file():
+        pytest.skip("synth_tray.ps1 is not in this checkout")
+    bodies = _click_handler_bodies()
+    assert len(bodies) >= 4, f"expected the tray's menu handlers, found {len(bodies)}"
+    for body in bodies:
+        assert "-Wait" not in body, f"a menu entry waits for the launcher:\n{body}"
+        assert "Start-Sleep" not in body, (
+            f"a menu entry sleeps in the message loop:\n{body}"
+        )
+
+
+@pytest.mark.skipif(
+    not (IS_WINDOWS and POWERSHELL),
+    reason="needs a Windows desktop with PowerShell",
+)
+def test_the_icon_goes_away_when_the_application_does(tmp_path: Path) -> None:
+    """The icon's lifetime is the application's: nothing else removes a stale one.
+
+    Reported from a real install: after Shut down the icon stayed, its menu kept opening,
+    and every entry in it was about an application that was no longer running. This runs
+    the real script against a stand-in WebUI, takes the stand-in away, and requires the
+    tray to notice, say so, and end by itself.
+    """
+    if not TRAY_SCRIPT.is_file():
+        pytest.skip("synth_tray.ps1 is not in this checkout")
+
+    # A stand-in WebUI: every request gets a 200. That is all the tray asks of it.
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    port = int(listener.getsockname()[1])
+
+    def serve() -> None:
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return  # the socket was closed: that is the shutdown
+            with conn:
+                try:
+                    conn.recv(4096)
+                    conn.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                    )
+                except OSError:
+                    pass
+
+    threading.Thread(target=serve, daemon=True).start()
+
+    (tmp_path / "logs").mkdir(exist_ok=True)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        f"SYNTH_WEBUI_HOST=127.0.0.1\nSYNTH_WEBUI_HTTP_PORT={port}\nSYNTH_WEBUI_TLS=0\n",
+        encoding="utf-8",
+    )
+    log = tmp_path / "logs" / "tray.log"
+
+    process = subprocess.Popen(  # noqa: S603
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(TRAY_SCRIPT),
+            "-AppRoot",
+            str(tmp_path),
+            "-EnvFile",
+            str(env_file),
+            "-LogFile",
+            str(log),
+            "-NoBalloon",
+            "-PollSeconds",
+            "1",
+            "-StartupGraceSeconds",
+            "30",
+            "-StopGraceSeconds",
+            "3",
+        ],
+        # No stdio redirection: the tray keeps its own account in tray.log, and the
+        # subprocess stubs do not accept DEVNULL in this call shape.
+        creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
+    )
+    try:
+        deadline = time.time() + 40.0
+        while time.time() < deadline and "state: running" not in _read_log(log):
+            time.sleep(0.25)
+        text = _read_log(log)
+        assert "state: running" in text, (
+            f"the tray never saw the WebUI answering:\n{text}"
+        )
+
+        # This is what a Shut down looks like from outside: the port stops answering.
+        listener.close()
+
+        deadline = time.time() + 30.0
+        while time.time() < deadline and _process_exists(process.pid):
+            time.sleep(0.25)
+        text = _read_log(log)
+        assert "removing the icon" in text, f"the tray kept a stale icon:\n{text}"
+        assert not _process_exists(process.pid), (
+            f"the tray outlived the application:\n{text}"
+        )
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=15)
+        try:
+            listener.close()
+        except Exception:  # noqa: BLE001 - cleanup must never mask the test result
+            pass
