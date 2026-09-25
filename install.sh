@@ -101,7 +101,10 @@ uninstall() {
     ok "application files removed"
     say ""
     say "Your database and your Synth's memory were left untouched."
-    say "To remove them too:  sudo -u postgres dropdb synth && sudo -u postgres dropuser synth"
+    say "The .env in the install directory went with it, and it held the generated"
+    say "database credentials and any API keys you added. Keep a copy beforehand if"
+    say "you set your own; the Windows uninstaller asks about this instead."
+    say "To remove the database too:  sudo -u postgres dropdb synth && sudo -u postgres dropuser synth"
     exit 0
 }
 [ "$UNINSTALL" -eq 1 ] && uninstall

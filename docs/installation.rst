@@ -36,7 +36,8 @@ should think with. Those are the only questions, and they are asked once.
 
 Nothing is installed system-wide, no Windows service is created, and
 uninstalling removes everything except your ``data`` folder and ``.env``, so a
-later reinstall resumes with the same history, persona and keys.
+later reinstall resumes with the same history, persona and keys. The uninstaller
+asks whether to delete those as well, and keeps them unless you say otherwise.
 
 **Linux**
 
