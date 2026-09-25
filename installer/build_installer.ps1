@@ -47,7 +47,13 @@ function Resolve-Version {
 
     try {
         $tag = (& git -C $repoRoot describe --tags --abbrev=0 2>$null)
-        if ($LASTEXITCODE -eq 0 -and $tag) { return ($tag -replace '^v', '') }
+        # A tag is not necessarily a version: this repository has one called "legacy", and
+        # it is the newest. Passing it on made ISCC fail on VersionInfoVersion - "Value of
+        # [Setup] section directive VersionInfoVersion is invalid" - with nothing pointing
+        # at the tag as the cause. Only something version-shaped is accepted.
+        if ($LASTEXITCODE -eq 0 -and $tag -match '^v?\d+(\.\d+){1,3}') {
+            return ($tag -replace '^v', '')
+        }
     } catch { }
 
     return '0.0.0-dev'

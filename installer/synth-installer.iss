@@ -132,7 +132,8 @@ Name: "{group}\{#AppShortName}"; Filename: "{app}\.venv\Scripts\pythonw.exe"; \
 Name: "{group}\{#AppShortName} setup page"; Filename: "{app}\.venv\Scripts\pythonw.exe"; \
   Parameters: """{app}\scripts\start_synth.py"" --setup"; WorkingDir: "{app}"; \
   IconFilename: "{app}\installer\synth.ico"; Comment: "Open the setup page"
-Name: "{group}\Uninstall {#AppShortName}"; Filename: "{uninstallexe}"
+Name: "{group}\Uninstall {#AppShortName}"; Filename: "{uninstallexe}"; \
+  Parameters: "/SILENT /SYNTHASK=1"
 Name: "{autodesktop}\{#AppShortName}"; Filename: "{app}\.venv\Scripts\pythonw.exe"; \
   Parameters: """{app}\scripts\start_synth.py"""; WorkingDir: "{app}"; \
   IconFilename: "{app}\installer\synth.ico"; Tasks: desktopicon
@@ -205,6 +206,25 @@ var
   UvExe: String;
   Powershell: String;
 begin
+  if CurStep = ssDone then
+  begin
+    { Add/Remove Programs runs whatever is in UninstallString, and the uninstaller skips
+      its own confirmation whenever it is launched silently. Pointing the entry at
+      /SILENT is therefore what leaves this script's window as the only one the user
+      sees: without it, Inno asks "are you sure" *after* that window, so the same
+      question arrives twice. /SYNTHASK=1 marks this as the ask-anyway path, because a
+      silent run is normally a scripted one that must not block on a dialog.
+      Rewritten at ssDone, when the uninstaller and its key certainly exist. }
+    { The uninstall key is Inno's own: AppId with its escaped braces written out, because
+      a script cannot read a [Setup] directive back as raw text. tests/test_installer_
+      payload.py asserts this GUID and the AppId directive carry the same GUID. }
+    RegWriteStringValue(HKCU,
+      'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8F3A4B2C-9D1E-4F7A-B5C6-2E8D0A3F1B9E}_is1',
+      'UninstallString',
+      '"' + ExpandConstant('{app}') + '\unins000.exe" /SILENT /SYNTHASK=1');
+    exit;
+  end;
+
   if CurStep <> ssPostInstall then
     exit;
 
@@ -269,7 +289,12 @@ begin
     the comment early. }
   DeleteDataOnUninstall := False;
   Result := True;
-  if not UninstallSilent() then
+  { Shown only when the caller asks for it with /SYNTHASK=1. Add/Remove Programs and the
+    Start-menu entry both pass that alongside /SILENT, which is what makes Inno skip its
+    own confirmation and leave this as the single window. Without the flag - a scripted
+    run, or unins000.exe by hand - this script never shows a dialog, and the data is
+    kept, because an unattended uninstall must not block and must not destroy. }
+  if ExpandConstant('{param:SYNTHASK|0}') = '1' then
   begin
     Form := CreateCustomForm(ScaleX(480), ScaleY(300), False, True);
     try

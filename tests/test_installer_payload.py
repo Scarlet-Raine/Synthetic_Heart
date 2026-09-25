@@ -211,9 +211,44 @@ def test_the_data_question_is_asked_by_the_uninstaller(iss_text: str) -> None:
     code = iss_text.split("[Code]", 1)[1]
     assert "function InitializeUninstall(): Boolean;" in code
     assert "procedure CurUninstallStepChanged(" in code
-    # Keeping is the default, and a silent uninstall is never asked.
+    # Keeping is the default, and the question is asked only when a caller asks for it.
     assert "DeleteDataOnUninstall := False;" in code
-    assert "if not UninstallSilent() then" in code
+    assert "ExpandConstant('{param:SYNTHASK|0}') = '1'" in code
+    # One window, on every path a user can actually take. Inno's confirmation cannot be
+    # suppressed from script (there is no directive for it, and UninstallSilent is a
+    # read-only function), so the paths a user clicks launch the uninstaller *silently*,
+    # which is what makes Inno skip its own confirmation, and carry /SYNTHASK=1, which is
+    # what makes this script's window appear in its place. Without that pairing the same
+    # question arrives twice, which is the bug being fixed.
+    assert "if not UninstallSilent() then" not in code, (
+        "the window is gated on silent mode again, which would both hide it from the "
+        "Add/Remove Programs path and show it to a scripted uninstall"
+    )
+    assert 'Parameters: "/SILENT /SYNTHASK=1"' in iss_text, (
+        "the Start-menu uninstall entry must launch uninstaller silently, so Inno's own "
+        "confirmation does not appear after ours"
+    )
+    assert "UninstallString" in code and "/SILENT /SYNTHASK=1" in code, (
+        "Add/Remove Programs still runs the uninstaller interactively, so it asks twice"
+    )
+    assert "RegWriteStringValue(HKCU," in code, (
+        "a per-user install (PrivilegesRequired=lowest) has its entry under HKCU"
+    )
+    # Built from {app} rather than {uninstallexe}. They are the same path - the constant
+    # is {app}\unins000.exe - but the probe showed that what it resolves to follows {app},
+    # so naming the install directory directly is what keeps the entry tied to where the
+    # application actually is. {uninstallexe} is not used anywhere in this write.
+    assert r"ExpandConstant('{app}') + '\unins000.exe" in code
+    assert "ExpandConstant('{uninstallexe}')" not in code
+    # The key is spelled out because a script cannot read AppId back, so the GUID must be
+    # proven to stay in step: Inno hangs its uninstall entry off AppId, and a mismatch
+    # would rewrite a key that does not exist, silently.
+    appid = next(line for line in iss_text.splitlines() if line.startswith("AppId="))
+    guid = appid.split("=", 1)[1].strip().strip("{}").strip()
+    assert guid in code, (
+        f"the rewritten uninstall key does not carry the AppId GUID ({guid}), so it "
+        "would write to a key Inno never created"
+    )
     # The question is one window, with a checkbox that starts clear. It used to be a
     # message box whose default button was Yes, so the way most people leave a dialog -
     # clicking through it - deleted the persona, the chats and the database. A clear

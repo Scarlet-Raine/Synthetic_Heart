@@ -139,3 +139,76 @@ def test_the_first_location_wins_when_several_exist(tmp_path: Path) -> None:
 def test_a_machine_without_inno_setup_says_so(tmp_path: Path) -> None:
     """Not a path and not a crash: the caller prints its install instructions."""
     assert _run_find_iscc(tmp_path, locations=[]) == ""
+
+
+def _run_resolve_version(tmp_path: Path, repo: Path) -> str:
+    """Resolve-Version on its own, run against a repository of our own making."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    start = text.index("function Resolve-Version")
+    body = text[start : text.index("\n}", start) + 2]
+    probe = tmp_path / "resolve.ps1"
+    probe.write_text(
+        f"$repoRoot = '{repo}'\n{body}\nWrite-Output (Resolve-Version)\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(probe),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout.strip()
+
+
+def _tagged_repo(tmp_path: Path, *tags: str) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, timeout=120)
+    for tag in tags:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=test",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ],
+            check=True,
+            timeout=120,
+        )
+        subprocess.run(["git", "-C", str(repo), "tag", tag], check=True, timeout=120)
+    return repo
+
+
+def test_a_tag_that_is_not_a_version_is_not_used_as_one(tmp_path: Path) -> None:
+    """This repository's newest tag is "legacy", and it was passed to ISCC as the version.
+
+    ISCC answered "Value of [Setup] section directive VersionInfoVersion is invalid",
+    which names the field and not the cause: the build died pointing at a line of the .iss
+    that was perfectly correct. A tag is only a version when it looks like one.
+    """
+    repo = _tagged_repo(tmp_path, "legacy")
+    assert _run_resolve_version(tmp_path, repo) == "0.0.0-dev", (
+        "a tag that is not a version was used as one"
+    )
+
+
+def test_a_version_tag_is_used_as_the_version(tmp_path: Path) -> None:
+    """And the ordinary case still works, with or without the leading v."""
+    assert _run_resolve_version(tmp_path, _tagged_repo(tmp_path, "v1.2.3")) == "1.2.3"
