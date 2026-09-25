@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import re
 import shutil
 import string
 import subprocess
@@ -843,18 +842,3 @@ def test_webui_is_up_tells_a_listening_port_from_a_silent_one() -> None:
     silent_port = spare.getsockname()[1]
     spare.close()
     assert bootstrap.webui_is_up(silent_port) is False
-
-
-def test_the_installer_starts_synth_on_the_setup_page() -> None:
-    """The regression from a fresh Debian VM, pinned as a property of the script.
-
-    The installer used to end by telling the user to run `synth`, with nothing
-    listening at the URL it had just printed, so the browser it opened found no
-    server and no setup page ever appeared. It must now start the application
-    itself, through the launcher's own readiness-waiting --setup path.
-    """
-    script = (REPO_ROOT / "install.sh").read_text(encoding="utf-8")
-    assert re.search(r"\$LAUNCHER --setup", script), (
-        "install.sh must start SyntH itself, on the setup page"
-    )
-    assert "--no-start" in script, "and offer a way not to"

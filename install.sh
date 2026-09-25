@@ -19,7 +19,8 @@
 #   ./install.sh --portable          no sudo: private PostgreSQL cluster
 #   ./install.sh --extra local-voice add offline TTS/STT (large, ~2 GB with torch)
 #   ./install.sh --no-start          install only; do not start SyntH afterwards
-#   ./install.sh --uninstall         remove the app (the database is left alone)
+#   ./install.sh --uninstall         remove the app; your Synth's database is kept
+#   ./install.sh --uninstall --purge remove everything, database included
 #   ./install.sh --dry-run           print what would happen
 #
 set -euo pipefail
@@ -37,6 +38,7 @@ DO_DESKTOP=1
 PORTABLE=0
 DRY_RUN=0
 UNINSTALL=0
+PURGE=0
 SKIP_PACKAGES=0
 START_AFTER=1
 
@@ -79,6 +81,7 @@ while [ $# -gt 0 ]; do
         --skip-packages) SKIP_PACKAGES=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
+        --purge) PURGE=1; UNINSTALL=1; shift ;;
         -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option: $1 (try --help)" ;;
     esac
@@ -95,6 +98,21 @@ esac
 # ---------------------------------------------------------------------------
 uninstall() {
     step "Removing $APP_NAME"
+
+    # Read the database identity while .env still exists: removing the folder is what
+    # this does, and --purge needs to know what to drop afterwards.
+    local ENV_FILE="$INSTALL_DIR/.env"
+    local DB_NAME="synth" DB_USER="synth" DB_HOST="" DB_PORT="5432"
+    if [ -f "$ENV_FILE" ]; then
+        DB_NAME="$(sed -n 's/^DB_NAME=//p' "$ENV_FILE" | head -1 | tr -d '"'\'' \r')"
+        DB_USER="$(sed -n 's/^DB_USER=//p' "$ENV_FILE" | head -1 | tr -d '"'\'' \r')"
+        DB_HOST="$(sed -n 's/^DB_HOST=//p' "$ENV_FILE" | head -1 | tr -d '"'\'' \r')"
+        DB_PORT="$(sed -n 's/^DB_PORT=//p' "$ENV_FILE" | head -1 | tr -d '"'\'' \r')"
+        [ -n "$DB_NAME" ] || DB_NAME="synth"
+        [ -n "$DB_USER" ] || DB_USER="synth"
+        [ -n "$DB_PORT" ] || DB_PORT="5432"
+    fi
+
     if [ -x "$INSTALL_DIR/.venv/bin/python" ]; then
         run "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/scripts/start_synth.py" --stop || true
     fi
@@ -102,12 +120,44 @@ uninstall() {
     run rm -f "$DESKTOP_DIR/synth.desktop"
     run rm -rf "$INSTALL_DIR"
     ok "application files removed"
+
+    # Everything under the folder went with it: the .env that held the generated database
+    # credentials and any API keys, and everything in data/. That is not recoverable, so
+    # it is said plainly whether or not --purge was asked for.
+    if [ "$PURGE" -eq 1 ]; then
+        step "Deleting the database"
+        local PG_SUDO=""
+        if [ "$(id -u)" -ne 0 ]; then PG_SUDO="sudo"; fi
+        case "$DB_HOST" in
+            ""|localhost|127.0.0.1|::1)
+                run $PG_SUDO -n -u postgres dropdb --if-exists "$DB_NAME" \
+                    || warn "could not drop the database $DB_NAME; it is still there"
+                run $PG_SUDO -n -u postgres dropuser --if-exists "$DB_USER" \
+                    || warn "could not drop the database user $DB_USER"
+                ;;
+            *)
+                warn "the database is on $DB_HOST, not this machine, so it was not touched"
+                note "on that host, run:  dropdb --if-exists $DB_NAME && dropuser --if-exists $DB_USER"
+                ;;
+        esac
+    fi
+
     say ""
-    say "Your database and your Synth's memory were left untouched."
-    say "The .env in the install directory went with it, and it held the generated"
-    say "database credentials and any API keys you added. Keep a copy beforehand if"
-    say "you set your own; the Windows uninstaller asks about this instead."
-    say "To remove the database too:  sudo -u postgres dropdb synth && sudo -u postgres dropuser synth"
+    if [ "$PURGE" -eq 1 ]; then
+        say "Your database is gone as well. ${APP_NAME} lived there, so there is nothing"
+        say "left: the persona, the chat history, the memories and the diary were all in it."
+    else
+        say "Your database was left alone, and that is where your Synth lives: the persona,"
+        say "the chat history, the memories and the diary. Installing again brings them back"
+        say "exactly as they were."
+        say ""
+        say "To delete that too:   sudo -u postgres dropdb --if-exists $DB_NAME && \\"
+        say "                      sudo -u postgres dropuser --if-exists $DB_USER"
+        say "or run this again with --purge."
+    fi
+    say ""
+    say "Removed with the folder, and not recoverable: settings, credentials and API keys"
+    say "in .env, and everything under data/ (uploads included)."
     exit 0
 }
 [ "$UNINSTALL" -eq 1 ] && uninstall

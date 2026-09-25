@@ -93,6 +93,14 @@ ReadyLabel1={#AppName} is ready to install.
 ReadyLabel2a=Click Install to begin.
 SelectDirLabel3=Setup will install {#AppName} into the following folder.
 
+; The confirmation Inno shows after the uninstaller's own window. The stock text says
+; "all of its components" and "successfully removed", which is not what happens here: the
+; data is kept unless the user ticked the box. Both are reworded to say so. Note Inno's
+; dialog defaults to No, so a click-through leaves the install alone.
+ConfirmUninstall={#AppName} will be removed now.%n%nYour data is kept unless you ticked the box on the previous window.%n%nClick Yes to continue, or No to leave it installed.
+UninstalledAll={#AppName} was removed.%n%nIf you kept your data, installing again resumes from where you left off.
+UninstalledMost={#AppName} was removed, except for a few files that could not be deleted.%n%nIf you kept your data, installing again resumes from where you left off.
+
 [Tasks]
 ; Unchecked by default: the Start Menu entry is enough for most people.
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
@@ -237,7 +245,10 @@ var
 
 function InitializeUninstall(): Boolean;
 var
-  Answer: Integer;
+  Form: TSetupForm;
+  Heading, Body: TNewStaticText;
+  DataCheck: TNewCheckBox;
+  RemoveButton, CancelButton: TNewButton;
 begin
   { Asked here, at uninstall, where it is a decision about something that is actually
     happening. Setup used to carry it as an unchecked task, which asked the user to
@@ -246,24 +257,101 @@ begin
 
     Keeping the data is the default and the only silent answer: a silent uninstall has
     nobody to ask, and keeping is the direction that can be undone afterwards by
-    deleting two paths, while deleting is not.
+    deleting the paths again, while deleting is not.
+
+    This replaced a message box whose default button was Yes. Clicking through a dialog
+    is how most people leave one, so the click-through deleted the persona, the chat
+    history and the database. A checkbox that starts clear cannot do that: the window
+    says what stays and what goes before anything is removed, and the default answer is
+    the recoverable one. One window, like the installer.
 
     No braces in these comments: Inno comments do not nest, and an inner one would end
     the comment early. }
   DeleteDataOnUninstall := False;
+  Result := True;
   if not UninstallSilent() then
   begin
-    Answer := MsgBox(ExpandConstant('{#AppName} can also delete your data: the persona, '
-      + 'the chat history, the memories and the database cluster in data\, plus the '
-      + 'generated credentials in .env.')
-      + #13#10#13#10
-      + 'Keeping them means a later reinstall resumes from where this one left off.'
-      + #13#10#13#10
-      + 'Delete your data as well?',
-      mbConfirmation, MB_YESNO);
-    DeleteDataOnUninstall := (Answer = IDYES);
+    Form := CreateCustomForm(ScaleX(480), ScaleY(300), False, True);
+    try
+      Form.Caption := ExpandConstant('{#AppName} uninstall');
+      Form.BorderStyle := bsDialog;
+      Form.ClientWidth := ScaleX(480);
+      Form.ClientHeight := ScaleY(300);
+      Form.Position := poScreenCenter;
+
+      Heading := TNewStaticText.Create(Form);
+      Heading.Parent := Form;
+      Heading.Left := ScaleX(20);
+      Heading.Top := ScaleY(20);
+      Heading.Width := Form.ClientWidth - ScaleX(40);
+      Heading.AutoSize := False;
+      Heading.Font.Style := [fsBold];
+      Heading.Font.Size := Form.Font.Size + 3;
+      Heading.Caption := 'Remove {#AppName}?';
+
+      Body := TNewStaticText.Create(Form);
+      Body.Parent := Form;
+      Body.Left := ScaleX(20);
+      Body.Top := ScaleY(56);
+      Body.Width := Form.ClientWidth - ScaleX(40);
+      Body.Height := ScaleY(104);
+      Body.AutoSize := False;
+      Body.WordWrap := True;
+      Body.Caption := 'The application, its private database engine and the Python '
+        + 'environment it runs in are removed.'
+        + #13#10 + #13#10
+        + 'Your own things stay, unless you tick the box below: the persona, the chat '
+        + 'history, the memories, your uploaded files, the database in data and the '
+        + 'credentials and API keys in .env. Installing again later picks up where this '
+        + 'one left off.';
+
+      DataCheck := TNewCheckBox.Create(Form);
+      DataCheck.Parent := Form;
+      DataCheck.Left := ScaleX(20);
+      DataCheck.Top := ScaleY(170);
+      DataCheck.Width := Form.ClientWidth - ScaleX(40);
+      DataCheck.Height := ScaleY(42);
+      DataCheck.Caption := 'Also delete all of my data and settings'
+        + #13#10
+        + 'The persona, chats, memories, uploads, database and .env. Cannot be undone.';
+      DataCheck.Checked := False;
+      DataCheck.TabOrder := 0;
+
+      RemoveButton := TNewButton.Create(Form);
+      RemoveButton.Parent := Form;
+      RemoveButton.Width := ScaleX(110);
+      RemoveButton.Height := ScaleY(25);
+      RemoveButton.Left := Form.ClientWidth - ScaleX(20) - RemoveButton.Width;
+      RemoveButton.Top := Form.ClientHeight - ScaleY(20) - RemoveButton.Height;
+      RemoveButton.Caption := 'Uninstall';
+      RemoveButton.ModalResult := mrOk;
+      RemoveButton.Default := True;
+      RemoveButton.TabOrder := 2;
+
+      CancelButton := TNewButton.Create(Form);
+      CancelButton.Parent := Form;
+      CancelButton.Width := RemoveButton.Width;
+      CancelButton.Height := RemoveButton.Height;
+      CancelButton.Left := RemoveButton.Left - ScaleX(8) - CancelButton.Width;
+      CancelButton.Top := RemoveButton.Top;
+      CancelButton.Caption := 'Cancel';
+      CancelButton.ModalResult := mrCancel;
+      CancelButton.Cancel := True;
+      CancelButton.TabOrder := 1;
+
+      Form.ActiveControl := RemoveButton;
+      { Cancel, or closing the window, leaves everything installed: the uninstall has not
+        touched anything at this point. }
+      if Form.ShowModal() <> mrOk then
+      begin
+        Result := False;
+        exit;
+      end;
+      DeleteDataOnUninstall := DataCheck.Checked;
+    finally
+      Form.Free;
+    end;
   end;
-  Result := True;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
@@ -275,5 +363,10 @@ begin
   begin
     DelTree(ExpandConstant('{app}\data'), True, True, True);
     DeleteFile(ExpandConstant('{app}\.env'));
+    { Then the rest of the folder, because "delete all of my data" cannot leave a folder
+      of leftovers behind for the next install to inherit. Inno has finished its own
+      removal by this step and the uninstaller runs from a copy in TEMP, so wiping the
+      folder it was launched from is safe. }
+    DelTree(ExpandConstant('{app}'), True, True, True);
   end;
 end;

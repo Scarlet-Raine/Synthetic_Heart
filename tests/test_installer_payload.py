@@ -214,7 +214,17 @@ def test_the_data_question_is_asked_by_the_uninstaller(iss_text: str) -> None:
     # Keeping is the default, and a silent uninstall is never asked.
     assert "DeleteDataOnUninstall := False;" in code
     assert "if not UninstallSilent() then" in code
-    assert "MB_YESNO" in code and "IDYES" in code
+    # The question is one window, with a checkbox that starts clear. It used to be a
+    # message box whose default button was Yes, so the way most people leave a dialog -
+    # clicking through it - deleted the persona, the chats and the database. A clear
+    # checkbox cannot do that, and the default answer is the recoverable one.
+    assert "CreateCustomForm" in code, "the uninstaller must ask in its own window"
+    assert "DataCheck.Checked := False;" in code
+    assert "Form.ShowModal() <> mrOk" in code, "Cancel must leave everything installed"
+    assert "MB_YESNO" not in code, (
+        "the data question is a message box again: its default button is what made a "
+        "click-through delete everything"
+    )
     # Deleted only after the app and its cluster have been stopped: a running cluster
     # holds its files open, which would leave the install half deleted. The whole
     # condition is asserted, not the token, because the comment above it names the step
@@ -224,6 +234,18 @@ def test_the_data_question_is_asked_by_the_uninstaller(iss_text: str) -> None:
     )
     assert "DelTree(ExpandConstant('{app}\\data'), True, True, True);" in code
     assert "DeleteFile(ExpandConstant('{app}\\.env'));" in code
+    # "Delete all of my data" has to mean the folder, not two paths: leftovers would be
+    # inherited by the next install.
+    assert "DelTree(ExpandConstant('{app}'), True, True, True);" in code
+    # Inno's own confirmation runs after that window, and its stock wording claims "all
+    # of its components" and "successfully removed", neither of which is true here. Only
+    # the message values are checked: the comment above them quotes the stock wording.
+    messages = iss_text.split("[Messages]", 1)[1].split("\n[", 1)[0]
+    message_values = "\n".join(
+        line for line in messages.splitlines() if not line.lstrip().startswith(";")
+    )
+    assert "ConfirmUninstall={#AppName} will be removed now." in message_values
+    assert "all of its components" not in message_values
 
 
 def test_both_provisioning_steps_leave_a_log(iss_text: str) -> None:
