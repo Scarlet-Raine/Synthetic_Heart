@@ -7,6 +7,8 @@ on:
       - "develop"
       - "fix/**"
       - "feat/**"
+    tags:
+      - "v*"
   pull_request:
     branches:
       - "main"
@@ -14,6 +16,11 @@ on:
       - "fix/**"
       - "feat/**"
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Attach the Windows installer to a GitHub Release"
+        type: boolean
+        default: false
 
 jobs:
   prepare:
@@ -22,6 +29,7 @@ jobs:
       contents: read
     outputs:
       semver: ${{ steps.gitversion.outputs.majorMinorPatch }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -35,6 +43,28 @@ jobs:
         uses: gittools/actions/gitversion/execute@v0.9.14
         with:
           useConfigFile: true
+      # The installer needs one version, and two sources can disagree about it: a tag
+      # is a person stating what this build is called, while GitVersion guesses the
+      # next version from the commits. On a tag push the tag wins, so a release can
+      # never be tagged v1.0.16 and hand out SyntH-Setup-1.1.0.exe.
+      - name: Decide the version this run builds
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="${{ steps.gitversion.outputs.majorMinorPatch }}"
+          fi
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "::error::$version from ${GITHUB_REF_NAME} is not a semantic version"
+              exit 1
+              ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "ref ${GITHUB_REF_NAME} -> SyntH-Setup-$version.exe"
 
   build-images:
     needs: prepare
@@ -415,18 +445,74 @@ jobs:
       - name: Build the installer
         shell: pwsh
         env:
-          SEMVER: ${{ needs.prepare.outputs.semver }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          Write-Host "building SyntH $env:SEMVER"
-          ./installer/build_installer.ps1 -Version $env:SEMVER -SkipVendorWarning
+          Write-Host "building SyntH $env:VERSION"
+          ./installer/build_installer.ps1 -Version $env:VERSION -SkipVendorWarning
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload the installer
         uses: actions/upload-artifact@v4
         with:
-          name: SyntH-Setup-${{ needs.prepare.outputs.semver }}-windows-x64
+          name: SyntH-Setup-${{ needs.prepare.outputs.version }}-windows-x64
           path: installer/Output/*.exe
           if-no-files-found: error
           retention-days: 30
-          # Attaching this to a GitHub Release (softprops/action-gh-release on a
-          # tag) is the obvious next step; nothing here does that yet.
+
+  release:
+    # The step that was missing: every push already builds the installer and leaves it
+    # as a workflow artifact, where it expires and nobody can find it. This attaches
+    # that same executable to a GitHub Release.
+    #
+    # Only for a version tag (v1.0.16) or a manual run that asked for it: a release on
+    # every push to develop would be noise. A manual run has no tag yet, so the release
+    # creates v<version> at the commit the run was dispatched on.
+    if: >-
+      startsWith(github.ref, 'refs/tags/v')
+      || (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+    needs: [prepare, windows-installer]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Fetch the installer this run built
+        uses: actions/download-artifact@v4
+        with:
+          name: SyntH-Setup-${{ needs.prepare.outputs.version }}-windows-x64
+          path: dist
+
+      - name: Check it is a complete installer before publishing it
+        run: |
+          set -euo pipefail
+          ls -l dist
+          shopt -s nullglob
+          installers=(dist/*.exe)
+          if [ ${#installers[@]} -eq 0 ]; then
+            echo "::error::no installer was downloaded, so there is nothing to publish"
+            exit 1
+          fi
+          for exe in "${installers[@]}"; do
+            size=$(stat -c%s "$exe")
+            echo "$exe is $size bytes"
+            # A published asset is what strangers download, and it cannot be quietly
+            # corrected afterwards, so refuse anything obviously truncated.
+            if [ "$size" -lt 20000000 ]; then
+              echo "::error::$exe is only $size bytes, which is not a whole installer"
+              exit 1
+            fi
+          done
+          # Bare file names, so downloading the installer and this file into one folder
+          # leaves a plain `sha256sum -c SHA256SUMS` working.
+          (cd dist && sha256sum -- *.exe > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', needs.prepare.outputs.version) }}
+          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', needs.prepare.outputs.version) }}
+          files: |
+            dist/*.exe
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
