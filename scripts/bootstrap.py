@@ -1392,7 +1392,14 @@ def main(argv: list[str] | None = None) -> int:
             print("           synth                 (launcher, opens the WebUI)")
 
     if not args.no_browser and not args.dry_run and not args.quiet:
-        _open_browser(url)
+        # Only open a browser at something that answers. Nothing starts the
+        # application at this point, so opening one here produced a connection
+        # error and made a finished install look broken: measured on a fresh
+        # Debian VM, where the browser opened and the WebUI was never running.
+        if webui_is_up(plan.webui_port):
+            _open_browser(url)
+        else:
+            print(f"  Then open:  {url}/setup")
     return 0
 
 
@@ -1404,6 +1411,15 @@ def _open_browser(url: str) -> None:
         webbrowser.open(url)
     except Exception:
         pass
+
+
+def webui_is_up(port: int, host: str = "127.0.0.1", timeout: float = 0.75) -> bool:
+    """Whether something is listening on the WebUI port right now."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 if __name__ == "__main__":

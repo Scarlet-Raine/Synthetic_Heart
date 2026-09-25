@@ -18,6 +18,7 @@
 #   ./install.sh --dir ~/SyntH       choose the install directory
 #   ./install.sh --portable          no sudo: private PostgreSQL cluster
 #   ./install.sh --extra local-voice add offline TTS/STT (large, ~2 GB with torch)
+#   ./install.sh --no-start          install only; do not start SyntH afterwards
 #   ./install.sh --uninstall         remove the app (the database is left alone)
 #   ./install.sh --dry-run           print what would happen
 #
@@ -37,6 +38,7 @@ PORTABLE=0
 DRY_RUN=0
 UNINSTALL=0
 SKIP_PACKAGES=0
+START_AFTER=1
 
 # ---------------------------------------------------------------------------
 # output
@@ -73,6 +75,7 @@ while [ $# -gt 0 ]; do
         --extra) EXTRAS+=("$2"); shift 2 ;;
         --portable) PORTABLE=1; shift ;;
         --no-desktop) DO_DESKTOP=0; shift ;;
+        --no-start) START_AFTER=0; shift ;;
         --skip-packages) SKIP_PACKAGES=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
@@ -279,6 +282,30 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
+# 6. start it, on the setup page
+# ---------------------------------------------------------------------------
+# The installer used to stop here and leave the user to run `synth`, with nothing
+# listening at the URL it printed: the browser that was opened as part of the
+# bootstrap found no server. Starting it here is what makes the install one action,
+# and `--setup` is the launcher's own path: it starts the application detached,
+# waits for the WebUI to answer, and only then opens the browser - on the setup
+# page, which is the one thing a native install still asks the user for.
+if [ "$DRY_RUN" -eq 1 ]; then
+    step "Starting $APP_NAME"
+    note "would start it and open the setup page"
+elif [ "$START_AFTER" -eq 0 ]; then
+    step "Not starting $APP_NAME (--no-start)"
+else
+    step "Starting $APP_NAME"
+    LAUNCHER="$BIN_DIR/synth"
+    if [ ! -x "$LAUNCHER" ]; then
+        LAUNCHER="$INSTALL_DIR/.venv/bin/python $INSTALL_DIR/scripts/start_synth.py"
+    fi
+    # shellcheck disable=SC2086
+    $LAUNCHER --setup || warn "SyntH did not start; try 'synth --setup' and see $INSTALL_DIR/logs/synth.log"
+fi
+
+# ---------------------------------------------------------------------------
 # done
 # ---------------------------------------------------------------------------
 case ":$PATH:" in
@@ -291,11 +318,15 @@ if [ "$DRY_RUN" -eq 1 ]; then
     say "${BOLD}Dry run complete.${RESET} Nothing was changed."
 else
     say "${BOLD}$APP_NAME is installed.${RESET}"
-    say "  Start it:   synth"
+    if [ "$START_AFTER" -eq 1 ]; then
+        say "  Your browser is opening the setup page: give your SyntH a name, your"
+        say "  own name, your location and timezone, and the engine + API key they"
+        say "  should think with. Nothing else is needed."
+        say ""
+    else
+        say "  Start it:   synth --setup   (opens the setup page)"
+    fi
     say "  Status:     synth --status"
     say "  Stop it:    synth --stop"
-    say ""
-    say "The first page in your browser is the setup page: it asks for your SyntH's"
-    say "name, your name, your location and timezone, and the engine + API key they"
-    say "should think with. Nothing else is needed."
+    say "  Logs:       $INSTALL_DIR/logs/"
 fi

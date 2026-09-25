@@ -101,6 +101,31 @@ LOG_PREFIX = "[synth_webui]"
 LOCAL_CLIENT_HOSTS = ("127.0.0.1", "::1", "localhost")
 
 
+def _endpoint_looks_configured(endpoint: object) -> bool:
+    """Whether an endpoint is one the user set up and that works.
+
+    A fresh database seeds an endpoint for the container build whose host exists
+    only inside Docker, with no API key and ``probe_status='never'``. Counting that
+    preset as "configured" retired the setup page on a clean install and left that
+    same preset as the only engine, so the first thing a new user met was an avatar
+    scene and a connection error.
+
+    Resolution was tried as a signal first and rejected: measured on a fresh Debian
+    VM, the container hostname *does* resolve, because a single-label name is
+    answered by the local resolver. The probe verdict the application already keeps
+    is the honest one - ``never`` and ``pending`` have not been shown to work,
+    ``failed`` has been shown not to, and only ``success`` means an engine that
+    answered. A key the user typed counts on its own, since it is their own
+    endpoint whatever its host resolves to.
+    """
+    if str(getattr(endpoint, "api_key", "") or "").strip():
+        return True
+    status = getattr(endpoint, "probe_status", None)
+    if status is None:
+        return True  # cannot tell: do not change behaviour on a guess
+    return str(status).strip().lower() == "success"
+
+
 def as_flag(raw: object) -> bool:
     """Read a configuration value as a boolean, whatever type it arrives as.
 
@@ -3120,9 +3145,9 @@ class SynthWebUIInterface:
     # browser. It is a plain page over the existing config and endpoint APIs.
     #
     # The page is only *offered* (the root redirects to it) while the install
-    # looks untouched: no enabled external endpoint yet and SETUP_COMPLETED
-    # unset. An existing deployment never sees it, and "Skip for now" sets the
-    # flag so it cannot nag.
+    # looks untouched: no external endpoint of the user's own yet and
+    # SETUP_COMPLETED unset. An existing deployment never sees it, and "Skip for
+    # now" sets the flag so it cannot nag.
 
     def _setup_completed(self) -> bool:
         """Whether the first-run page has been dealt with."""
@@ -3150,8 +3175,14 @@ class SynthWebUIInterface:
     async def _first_run_pending(self) -> bool:
         """True only when this install looks brand new.
 
-        Any configured external endpoint counts as "already set up": someone who
-        has been running SyntH for months must never be pushed at a setup page.
+        An external endpoint counts as "already set up" only when it looks like the
+        user's own: it carries an API key, or the application's own probe has
+        recorded that it answered. A fresh native install seeds an endpoint for the
+        container build whose host exists only inside Docker, with no key and
+        probe_status='never', and counting that preset as "configured" retired this
+        page on a clean install while leaving it as the only engine, which then
+        answered nothing but a connection error.
+
         Any doubt resolves to False, because a wrong redirect is worse than a
         missing one. Every decline is logged, because a wrong redirect shows up
         as a bug report while a missing one looks exactly like a feature nobody
@@ -3171,12 +3202,20 @@ class SynthWebUIInterface:
                 f"{LOG_PREFIX} setup page not offered: endpoints unreadable ({exc})"
             )
             return False
-        if endpoints:
+        configured = [
+            endpoint for endpoint in endpoints if _endpoint_looks_configured(endpoint)
+        ]
+        if configured:
             log_info(
                 f"{LOG_PREFIX} setup page not offered: "
-                f"{len(endpoints)} enabled endpoint(s) already configured"
+                f"{len(configured)} enabled endpoint(s) already configured"
             )
             return False
+        if endpoints:
+            log_info(
+                f"{LOG_PREFIX} setup page offered: {len(endpoints)} enabled "
+                "endpoint(s) are shipped presets that have never answered a probe"
+            )
         return True
 
     async def setup_page(self, request: Request):

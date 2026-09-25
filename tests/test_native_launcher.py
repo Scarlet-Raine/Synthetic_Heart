@@ -524,3 +524,16 @@ def test_a_python_child_really_runs_with_the_launchers_flags(tmp_path: Path) -> 
         if process.poll() is None:
             process.kill()
         process.wait(timeout=15)
+
+
+def test_status_reports_that_nothing_is_running(capsys, tmp_path) -> None:
+    """`synth --status` printed nothing at all, which reads as a broken command.
+
+    Reported from a fresh Debian VM: `synth --status` showed nothing and `--stop`
+    said not running, and there was no way to tell the silent case from the failed
+    one.
+    """
+    code = start_synth.main(["--status", "--env-file", str(tmp_path / "absent.env")])
+    out = capsys.readouterr().out
+    assert "not running" in out.lower(), f"--status printed {out!r}"
+    assert code == 1

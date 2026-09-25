@@ -625,7 +625,14 @@ def main(argv: list[str] | None = None) -> int:
     env_file = Path(args.env_file).expanduser()
 
     if args.status:
-        return 0 if check(env_file).get("ok") else 1
+        report = check(env_file)
+        if report.get("ok"):
+            print(f"SyntH is running: {report.get('url')}")
+            return 0
+        # Silence is how a status command looks broken. A user who is told nothing
+        # cannot tell "not running" from "the command did not work".
+        print("SyntH is not running.")
+        return 1
 
     if args.stop:
         return stop()

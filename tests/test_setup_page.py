@@ -161,6 +161,101 @@ def test_a_local_request_on_a_fresh_install_is_offered_the_page(
     assert _pending() is True
 
 
+class _Endpoint:
+    """An endpoint with just the fields the gate reads."""
+
+    def __init__(
+        self,
+        base_url: str = "",
+        api_key: str = "",
+        probe_status: str | None = "never",
+    ) -> None:
+        self.base_url = base_url
+        self.api_key = api_key
+        if probe_status is not None:
+            self.probe_status = probe_status
+
+
+def _pending_with_endpoints(monkeypatch: pytest.MonkeyPatch, endpoints: list) -> bool:
+    class _Registry:
+        async def list_endpoints(self, enabled_only: bool = False):
+            return endpoints
+
+    monkeypatch.setattr(
+        webui_module.SynthWebUIInterface, "_setup_completed", lambda self: False
+    )
+    monkeypatch.setattr(
+        "core.external_endpoints.registry.get_external_endpoint_registry",
+        lambda: _Registry(),
+    )
+    return _pending()
+
+
+def test_a_shipped_container_preset_does_not_retire_the_setup_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regression that shipped: a clean native install met no setup page.
+
+    A fresh database seeds an enabled endpoint for the container build, whose host
+    exists only inside Docker, with no key and ``probe_status='never'``. Counting
+    that as "configured" both retired this page and left that preset as the only
+    engine, so the first thing a new user saw was an avatar scene and a connection
+    error. Measured on a fresh Debian VM, that hostname even resolves, so the probe
+    verdict - not reachability - is the signal that works.
+    """
+    endpoints = [
+        _Endpoint(base_url="http://synth-zen-llm-engine:8000", probe_status="never")
+    ]
+    assert _pending_with_endpoints(monkeypatch, endpoints) is True
+
+
+def test_an_endpoint_that_has_answered_a_probe_retires_the_setup_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local keyless engine that works must not keep sending anyone to setup."""
+    endpoints = [_Endpoint(base_url="http://127.0.0.1:11434", probe_status="success")]
+    assert _pending_with_endpoints(monkeypatch, endpoints) is False
+
+
+def test_a_preset_that_has_only_ever_failed_still_offers_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A probe that failed is not a working engine, and setup is where it is fixed."""
+    assert (
+        _pending_with_endpoints(monkeypatch, [_Endpoint(probe_status="failed")]) is True
+    )
+
+
+def test_an_endpoint_with_an_api_key_retires_the_setup_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A key the user typed is their own endpoint, whatever the probe says."""
+    endpoints = [
+        _Endpoint(
+            base_url="http://10.9.9.9:8000", api_key="sk-real", probe_status="never"
+        )
+    ]
+    assert _pending_with_endpoints(monkeypatch, endpoints) is False
+
+
+def test_an_endpoint_we_cannot_inspect_retires_the_setup_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No probe_status at all is doubt, and doubt must not redirect anyone."""
+    endpoints = [_Endpoint(base_url="http://127.0.0.1:11434", probe_status=None)]
+    assert _pending_with_endpoints(monkeypatch, endpoints) is False
+
+
+def test_one_real_endpoint_is_enough_among_several_presets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    endpoints = [
+        _Endpoint(base_url="http://synth-zen-llm-engine:8000", probe_status="never"),
+        _Endpoint(base_url="http://192.168.1.13:8000", probe_status="success"),
+    ]
+    assert _pending_with_endpoints(monkeypatch, endpoints) is False
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import shutil
 import string
 import subprocess
@@ -816,3 +817,44 @@ def test_sudo_psql_is_never_attempted_on_windows() -> None:
 
     if os.name == "nt":
         assert bootstrap.sudo_psql_available("/usr/bin/psql") is False
+
+
+def test_webui_is_up_tells_a_listening_port_from_a_silent_one() -> None:
+    """The probe that decides whether opening a browser is a lie.
+
+    Nothing starts the application during bootstrap, so a port with no listener
+    must answer False or the install opens a browser on a connection error.
+    """
+    import socket as _socket
+
+    bootstrap = _load_bootstrap()
+
+    listener = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    live_port = listener.getsockname()[1]
+    try:
+        assert bootstrap.webui_is_up(live_port) is True
+    finally:
+        listener.close()
+
+    spare = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    spare.bind(("127.0.0.1", 0))
+    silent_port = spare.getsockname()[1]
+    spare.close()
+    assert bootstrap.webui_is_up(silent_port) is False
+
+
+def test_the_installer_starts_synth_on_the_setup_page() -> None:
+    """The regression from a fresh Debian VM, pinned as a property of the script.
+
+    The installer used to end by telling the user to run `synth`, with nothing
+    listening at the URL it had just printed, so the browser it opened found no
+    server and no setup page ever appeared. It must now start the application
+    itself, through the launcher's own readiness-waiting --setup path.
+    """
+    script = (REPO_ROOT / "install.sh").read_text(encoding="utf-8")
+    assert re.search(r"\$LAUNCHER --setup", script), (
+        "install.sh must start SyntH itself, on the setup page"
+    )
+    assert "--no-start" in script, "and offer a way not to"
