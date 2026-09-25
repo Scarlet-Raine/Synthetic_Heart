@@ -906,10 +906,19 @@ class OpenAICompatAdapter(BaseProtocolAdapter):
             return ["/audio/transcriptions"]
         return ["/v1/audio/transcriptions", "/audio/transcriptions"]
 
-    async def _list_models_via_http(self) -> list[ModelInfo]:
+    async def _list_models_via_http(self) -> list[ModelInfo] | None:
+        """Fetch the model listing over HTTP.
+
+        Returns ``None`` when the endpoint never answered at all (DNS failure,
+        connection refused, timeout) and ``[]`` when it answered but offers no
+        usable listing. Callers must keep the two apart: the probe decides whether
+        an endpoint is healthy from this result, so collapsing them lets a host
+        that cannot be reached look like a working engine.
+        """
         import aiohttp
 
         effective_timeout = float(self._timeout or 300.0)
+        answered = False
 
         def _parse_list(data: Any) -> list[ModelInfo]:
             if data is None:
@@ -939,6 +948,10 @@ class OpenAICompatAdapter(BaseProtocolAdapter):
                             sock_read=effective_timeout,
                         ),
                     ) as resp:
+                        # Reaching this point means an HTTP response arrived, however
+                        # unusable it turns out to be: the endpoint is reachable. Only
+                        # an exception below means it never answered at all.
+                        answered = True
                         if resp.status != 200:
                             log_warning(
                                 f"[openai_compat] GET {url} returned HTTP {resp.status}"
@@ -954,10 +967,16 @@ class OpenAICompatAdapter(BaseProtocolAdapter):
                 log_warning(
                     f"[openai_compat] list_models HTTP fallback failed (url={url}): {repr(exc)}"
                 )
-        return []
+        return [] if answered else None
 
     async def list_models(self) -> list[ModelInfo]:
         models = await self._list_models_via_http()
+        if models is None:
+            # The endpoint never answered. Do not invent a model here: the probe reads
+            # a non-empty listing as evidence that the endpoint is alive, so a
+            # placeholder hatched on a connection error made an unreachable host
+            # report as a successfully probed engine while every real call failed.
+            return []
         # Fallback for endpoints that don't expose a /models list (or return empty):
         # return a sensible default so the probe can still test connectivity via ping_test.
         # This allows Zen LLM Engine and similar proxies to be probed successfully even

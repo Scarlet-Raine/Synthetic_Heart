@@ -295,10 +295,14 @@ async def probe_endpoint(endpoint: ExternalEndpoint, api_key: str = "") -> Probe
 
     if not models and not any(capabilities.values()):
         # Nothing was gathered: every step failed or timed out.  Reporting
-        # "success" here would let an empty result overwrite usable stored data.
+        # "success" here would let an empty result overwrite usable stored data, and
+        # would call an endpoint healthy on the strength of a placeholder model the
+        # adapter invents when its listing call cannot connect at all.
         return ProbeResult(
             status="failed",
-            error_message="; ".join(errors) or "No data returned",
+            error_message="; ".join(errors)
+            or "no answer from the endpoint (it did not resolve, refused the "
+            "connection, or timed out before sending a response)",
         )
 
     log_info(

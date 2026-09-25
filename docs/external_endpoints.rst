@@ -317,6 +317,15 @@ Troubleshooting
   - use container DNS such as ``host.docker.internal`` when needed
   - verify the endpoint exposes ``/.well-known/openai-configuration`` and
     ``/v1/models``
+- If *every* probe fails or times out at once, suspect the host rather than the
+  endpoints. A machine whose DNS returns IPv6 (``AAAA``) records while its IPv6
+  route goes nowhere hangs each request: the HTTP client takes the first resolved
+  address and does not fall back to IPv4 on its own. Confirm with
+  ``curl -6 https://api.venice.ai/api/v1/models`` (times out) against ``curl -4``
+  (answers), then prefer IPv4 on that host by uncommenting
+  ``precedence ::ffff:0:0/96  100`` in ``/etc/gai.conf``. Restart Synthetic Heart
+  afterwards: the setting is read once per process, so a running instance keeps
+  the old order.
 - If the model list is missing:
   - ensure the provider returns valid ``data[]`` objects with ``id`` fields
   - check whether an API key or provider-specific permission is required

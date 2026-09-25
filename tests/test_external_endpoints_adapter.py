@@ -122,6 +122,59 @@ async def test_openai_compat_list_models_prefers_v1_path(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_openai_compat_list_models_is_empty_when_the_endpoint_never_answers(
+    monkeypatch,
+):
+    """An unreachable endpoint must not come back with a model.
+
+    The probe treats a non-empty listing as evidence that an endpoint is alive, so
+    the placeholder this method used to hatch on a connection error made a host
+    that does not even resolve report as a successfully probed engine, while every
+    real request to it failed.
+    """
+
+    class UnreachableSession(FakeAiohttpSession):
+        def get(self, url: str, *args, **kwargs):
+            self.calls.append(url)
+            raise OSError("Name or service not known")
+
+    adapter = OpenAICompatAdapter(base_url="http://nowhere.invalid", api_key="x")
+    session = UnreachableSession()
+
+    import aiohttp
+
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda: session)
+
+    models = await adapter.list_models()
+
+    assert models == []
+    assert not any(m.id == "default" for m in models)
+
+
+@pytest.mark.asyncio
+async def test_openai_compat_list_models_still_defaults_when_the_endpoint_answers_empty(
+    monkeypatch,
+):
+    """The reachable-but-empty case keeps its placeholder (Zen-style proxies).
+
+    This is the other half of the distinction: the endpoint answered, it simply has
+    no usable model list, so the probe may still try to reach it with ping_test.
+    """
+    adapter = OpenAICompatAdapter(base_url="http://localhost:14848", api_key="x")
+
+    session = FakeAiohttpSession()
+    session.responses = [FakeAiohttpResponse(status=200, payload={"data": []})]
+
+    import aiohttp
+
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda: session)
+
+    models = await adapter.list_models()
+
+    assert [m.id for m in models] == ["default"]
+
+
+@pytest.mark.asyncio
 async def test_openai_compat_http_chat_urls_include_api_v1_paths():
     adapter = OpenAICompatAdapter(base_url="http://localhost:14848")
     urls = adapter._http_chat_urls()

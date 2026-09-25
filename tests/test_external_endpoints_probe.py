@@ -170,3 +170,71 @@ async def test_probe_endpoint_reports_failure_when_nothing_gathered(monkeypatch)
     assert "models: no catalogue" in result.error_message
     assert "capabilities: no capabilities" in result.error_message
     assert "ping: no ping" in result.error_message
+
+
+@pytest.mark.asyncio
+async def test_probe_endpoint_reports_failure_for_a_host_that_never_answers(
+    monkeypatch,
+):
+    """The shape an unreachable endpoint really has, as the adapters now report it.
+
+    A host that does not resolve gives an empty listing (the adapter no longer
+    invents a placeholder model for it) plus failing capability and ping steps, so
+    nothing at all is gathered. The probe must call that failed rather than let an
+    invented listing speak for a host it never reached.
+    """
+
+    class Unreachable(FakeAdapter):
+        def __init__(self):
+            super().__init__(models=[])
+
+        async def probe_capabilities(self, models=None):
+            self.caps_models = models
+            raise OSError("Name or service not known")
+
+        async def ping_test(self, model=None, timeout=None, models=None):
+            self.ping_model_arg = model
+            raise ConnectionError("Connection refused")
+
+    monkeypatch.setattr(
+        "core.external_endpoints.probe.get_adapter_for_endpoint",
+        lambda endpoint, api_key: Unreachable(),
+    )
+
+    result = await probe_endpoint(_endpoint(), "key")
+
+    assert result.status == "failed"
+    assert "Name or service not known" in result.error_message
+
+
+@pytest.mark.asyncio
+async def test_probe_endpoint_failure_names_a_silent_endpoint(monkeypatch):
+    """Step failures that raise nothing still must not read as a success.
+
+    An adapter can swallow its own connection errors, which leaves the probe with an
+    empty listing, all-false capabilities and no error text at all. Reporting "No
+    data returned" there sent the reader looking for a data problem when the
+    endpoint had simply never answered.
+    """
+
+    class Silent(FakeAdapter):
+        def __init__(self):
+            super().__init__(models=[])
+
+        async def probe_capabilities(self, models=None):
+            self.caps_models = models
+            return {}
+
+        async def ping_test(self, model=None, timeout=None, models=None):
+            self.ping_model_arg = model
+            return False, ""
+
+    monkeypatch.setattr(
+        "core.external_endpoints.probe.get_adapter_for_endpoint",
+        lambda endpoint, api_key: Silent(),
+    )
+
+    result = await probe_endpoint(_endpoint(), "key")
+
+    assert result.status == "failed"
+    assert "no answer from the endpoint" in result.error_message
