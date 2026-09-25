@@ -53,13 +53,25 @@ if ($PollSeconds -lt 1) { $PollSeconds = 1 }
 function Write-TrayLog {
     param([string]$Message, [string]$Level = 'INFO')
     $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-    try {
-        $dir = Split-Path -Parent $LogFile
-        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
-            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $line = "[$stamp] [$Level] $Message"
+    $dir = Split-Path -Parent $LogFile
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            }
+            Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8 -ErrorAction Stop
+            return
+        } catch {
+            # A reader holding the file open, an editor, a backup: any of them can
+            # refuse the append for a moment. Swallowing the line entirely is how a
+            # tray that reached its message loop looked like one that never got there,
+            # so retry, and if the file stays unwritable put the line on stdout, which
+            # the launcher captures into logs\tray.out.log.
+            Start-Sleep -Milliseconds 40
         }
-        Add-Content -LiteralPath $LogFile -Value "[$stamp] [$Level] $Message" -Encoding UTF8
-    } catch { }
+    }
+    Write-Output $line
 }
 
 Write-TrayLog "--- tray start: pid=$PID app=$AppRoot ps=$($PSVersionTable.PSVersion) ---"
@@ -152,15 +164,18 @@ function Get-PythonPath {
 
 function Invoke-Launcher {
     <#
-        Call the one launcher for start/stop/open. These can take a little while,
-        so the waiting ones use the console interpreter (which can be waited on)
-        and the rest use the windowless one.
+        Call the one launcher for start/stop/open, and hand back its exit code when
+        we wait for it.
+
+        Always the windowless interpreter: nothing should flash a console window on a
+        desktop launch, and the launcher writes what it did to logs\synth_launch.log
+        rather than to a console nobody is looking at.
     #>
     param([string[]]$Arguments, [switch]$Wait, [string]$Description = 'launch')
-    $python = Get-PythonPath -Console:(-not $Wait)
+    $python = Get-PythonPath -Console:$false
     if (-not $python) {
         Write-TrayLog "action '$Description': no interpreter under $AppRoot\.venv\Scripts" 'ERROR'
-        return
+        return $null
     }
     $launcher = Join-Path $AppRoot 'scripts\start_synth.py'
     Write-TrayLog "action '$Description': $python $launcher $($Arguments -join ' ')"
@@ -171,9 +186,18 @@ function Invoke-Launcher {
     }
     if ($Wait) { $params['Wait'] = $true }
     try {
-        Start-Process @params
+        $process = Start-Process @params -PassThru
+        if ($Wait -and $process) {
+            # The launcher reports "nothing was running" and "could not stop" with
+            # different codes, which is the difference between a working button and a
+            # button that lies.
+            Write-TrayLog "action '$Description': exit code $($process.ExitCode)"
+            return $process.ExitCode
+        }
+        return $null
     } catch {
         Write-TrayLog "action '$Description' failed: $($_.Exception.Message)" 'ERROR'
+        return $null
     }
 }
 
@@ -195,6 +219,39 @@ function Test-SyntHIsUp {
         }
     }
     return $null
+}
+
+# ---------------------------------------------------------------------------
+# One state check: probe, then follow it with the tooltip and the log. Called on
+# every tick, and again after an action that should have changed the state.
+# ---------------------------------------------------------------------------
+function Update-State {
+    try {
+        $url = Test-SyntHIsUp
+        if ($url) {
+            if ($script:State -ne 'running') {
+                $script:State = 'running'
+                $script:ReadyUrl = $url
+                $notify.Text = 'SyntH is running'
+                Write-TrayLog "state: running ($url)"
+                if (-not $NoBalloon) {
+                    # The install's own reassurance: the launcher window is long gone.
+                    $notify.ShowBalloonTip(5000, 'SyntH is running', "$url`nRight-click this icon for the menu.", [System.Windows.Forms.ToolTipIcon]::Info)
+                }
+            }
+            return
+        }
+        # Only a SyntH that was running can be said to have stopped: while it is still
+        # starting, saying "stopped" would be a lie told to the person watching.
+        if ($script:State -eq 'running') {
+            $script:State = 'stopped'
+            $notify.Text = 'SyntH is stopped'
+            Write-TrayLog 'state: stopped'
+        }
+    } catch {
+        # Never let a failed probe kill the icon; the next check tries again.
+        Write-TrayLog "state check failed: $($_.Exception.Message)" 'WARN'
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -242,8 +299,10 @@ $restartItem = New-Object System.Windows.Forms.ToolStripMenuItem('Restart')
 $restartItem.Add_Click({
     try {
         $notify.Text = 'SyntH is restarting'
-        Invoke-Launcher -Arguments @('--stop') -Wait -Description 'restart: stop'
-        Invoke-Launcher -Arguments @('--no-browser', '--no-tray') -Description 'restart: start again'
+        Invoke-Launcher -Arguments @('--stop') -Wait -Description 'restart: stop' | Out-Null
+        Invoke-Launcher -Arguments @('--no-browser', '--no-tray') -Description 'restart: start again' | Out-Null
+        Start-Sleep -Seconds 3
+        Update-State
     } catch {
         Write-TrayLog "restart failed: $($_.Exception.Message)" 'ERROR'
     }
@@ -254,8 +313,19 @@ $shutdownItem = New-Object System.Windows.Forms.ToolStripMenuItem('Shut down')
 $shutdownItem.Add_Click({
     try {
         $notify.Text = 'SyntH is shutting down'
-        Invoke-Launcher -Arguments @('--stop') -Wait -Description 'shut down'
-        $script:State = 'stopped'
+        Invoke-Launcher -Arguments @('--stop') -Wait -Description 'shut down' | Out-Null
+        Start-Sleep -Milliseconds 1500
+        # Ask SyntH, instead of taking the launcher's word for it: a stop that did not
+        # take effect has to be visible to the person who asked for it, and is worth a
+        # line in the log either way.
+        Update-State
+        if ($script:State -eq 'running') {
+            Write-TrayLog 'shut down did not take effect: the WebUI is still answering' 'ERROR'
+            $notify.Text = 'SyntH is still running'
+            $notify.ShowBalloonTip(6000, 'SyntH is still running', "The stop request did not take effect. See logs\tray.log and logs\synth_launch.log.", [System.Windows.Forms.ToolTipIcon]::Warning)
+        } else {
+            $notify.Text = 'SyntH is stopped'
+        }
     } catch {
         Write-TrayLog "shutdown failed: $($_.Exception.Message)" 'ERROR'
     }
@@ -290,30 +360,7 @@ Write-TrayLog 'menu built: open / restart / shut down / check for updates (disab
 # ---------------------------------------------------------------------------
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = $PollSeconds * 1000
-$timer.Add_Tick({
-    try {
-        $url = Test-SyntHIsUp
-        if ($url) {
-            if ($script:State -ne 'running') {
-                $script:State = 'running'
-                $script:ReadyUrl = $url
-                $notify.Text = 'SyntH is running'
-                Write-TrayLog "state: running ($url)"
-                # The install's own reassurance: the launcher window is long gone.
-                $notify.ShowBalloonTip(5000, 'SyntH is running', "$url`nRight-click this icon for the menu.", [System.Windows.Forms.ToolTipIcon]::Info)
-            }
-            return
-        }
-        if ($script:State -eq 'running') {
-            $script:State = 'stopped'
-            $notify.Text = 'SyntH is stopped'
-            Write-TrayLog 'state: stopped'
-        }
-    } catch {
-        # Never let a failed probe kill the icon; the next tick tries again.
-        Write-TrayLog "state check failed: $($_.Exception.Message)" 'WARN'
-    }
-})
+$timer.Add_Tick({ Update-State })
 $timer.Start()
 
 # Announce the launch straight away: this is the whole point of the icon.

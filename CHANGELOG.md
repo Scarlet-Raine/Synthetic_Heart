@@ -4,6 +4,31 @@
 **Fix:** a non-mapping value is no longer collected as a history candidate, `_is_internal_noise` returns True for a non-mapping instead of raising, and the final candidate filter requires a dict; the swallow is now a WARNING naming the exception type, so a future failure here cannot be silent.
 **Notes:** reproduced against the live DB before touching the code (`HistoryEngine().build_context` with the beat's real context shape returned `history_recent: 0`; with an empty `grillo_snippets` it returned 8 lines; the swallowed line read `[history_engine] Failed building UNIFIED history: 'str' object has no attribute 'get'`). Pinned in `tests/test_history_engine.py::test_cross_chat_history_survives_non_dict_context_values` (the observer-beat shape and the `attachment_paths` shape on an ordinary chat turn); reverting the one-line `continue` makes it fail. 64 passed across the history, current-chat-history, beat-routing and observer suites; the single failure in that set (`test_diary_entry_renders_created_at_timestamp`, a local-TZ render against an asserted UTC hour) fails identically at HEAD. Grillo's *internal* reflection beats (relationship, curiosity, ...) still receive no chat history: they set `skip_history: True` and are scoped `is_grillo_internal` on purpose, and changing that changes what the synth reflects on, so it is left alone here. `core/history_engine.py` is imported at boot, so the fix is not live until the instance is restarted.
 
+### fix(tray): a lost log line, and a menu entry that called a helper that did not exist  <!-- 2026-09-25 -->
+
+**Why:** while fixing Shut down, the tray itself turned out to have two smaller faults, both found by testing rather than by using it.
+
+**A log line could vanish.** `Write-TrayLog` wrapped its append in `try { … } catch { }`, and a reader holding the file open — a test watching for a line, an editor, a backup — can refuse it. The result was a tray that reached its message loop while its log said it never got there, which is the opposite of what the log exists for. The append now retries briefly and, if the file stays unwritable, writes the line to stdout, which the launcher captures into ``logs\tray.out.log``.
+
+**Two menu entries called ``Update-State``, which was never defined.** PowerShell reports that when the entry is clicked, in a window that does not exist on a desktop launch, so Shut down would have failed with a message nobody could read. The state check is now a real function used by both the poll timer and the actions that need to re-check after doing something. `tests/test_tray_script.py` gained two guards: the script must parse, and every helper it calls must either be defined in it or be a command PowerShell provides (judged by PowerShell itself) — proven to fail when a helper is removed.
+
+**Validation:** 140 tests across the tray, launcher, payload, bootstrap, endpoint-model and message-queue suites; the tray was run exactly as the launcher runs it and logged `notification icon created and made visible` → `entering the message loop (icon visible: True)` → `state: running`.
+
+### fix(launcher): "Shut down" did nothing, because the check for "is it running?" needed a console  <!-- 2026-09-25 -->
+
+**Why:** on a real install the tray's Shut down left SyntH running. Its log showed the action firing twice, and the application kept serving both times.
+
+**The liveness check could not answer its own question.** `pid_alive()` used `os.kill(pid, 0)`. Measured on the machine that reported this: from a process with no console — which is exactly how the launcher runs on a desktop install, `pythonw.exe` — that call raises for a process that is very much alive (`WinError 6 "The handle is invalid"` with a pipe for stdout, `WinError 87` with `DEVNULL`), while the same call from a console interpreter returns quietly. So `stop()` decided SyntH was not running, printed "SyntH is not running." to a console that does not exist, and returned success without touching anything. Liveness and termination now use `OpenProcess`/`GetExitCodeProcess`/`TerminateProcess` through `ctypes` on Windows, which do not care whether the caller has a console; `tests/test_native_launcher.py` runs the real check from a windowless child and fails if a live process is reported dead again.
+
+**A pid file is not the truth.** It goes missing, it goes stale, and Windows recycles pids — and with the check fixed, a stale pid would still have meant a silent no-op. `stop()` now combines the recorded pid with the processes that are actually this install's application (an interpreter from its own `.venv` running its own `main.py`, found through PowerShell, `/proc` or `ps`), scoped to the install root so a second SyntH on the same machine is never touched. It also writes what it did to `logs\synth_launch.log`, and reports failure with a non-zero code when a process survives the request.
+
+**The tray no longer takes the launcher's word for it.** `Invoke-Launcher` returns the exit code, the Shut down and Restart entries log it, and after a stop the tray re-checks the WebUI: if it still answers, the icon says "SyntH is still running" and the log records that the stop did not take effect.
+
+**Validation:** 138 tests across the launcher, tray, payload, bootstrap, endpoint-model and message-queue suites; the stop path verified three ways on Windows with a stand-in process — recorded pid, no pid file at all (found and stopped by the sweep), and nothing running — each confirmed by asking the OS directly rather than by `Popen.poll()`, which reports a child killed through this process's own Win32 calls as still running inside pytest; ruff and `ty` clean on the launcher; installer rebuilt.
+
+**Not verified:** the button on the reporter's own machine, which his next install settles.
+
+
 ### fix(branding): one logo on transparency, and a starting model that is the fast one  <!-- 2026-09-25 -->
 
 **Why:** two small things a real install showed, after the tray icon started working.

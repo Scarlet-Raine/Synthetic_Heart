@@ -102,6 +102,207 @@ def venv_python(*, windowed: bool) -> Path | None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Processes: is it alive, stop it, and find our own
+# ---------------------------------------------------------------------------
+#
+# On Windows, os.kill(pid, 0) cannot answer "is this alive?" from a process that has
+# no console, which is exactly how this launcher is started on a desktop install
+# (pythonw.exe, and the tray calls --stop with it). Measured here:
+#
+#     console interpreter:      os.kill(live_pid, 0)  -> no exception
+#     windowless child:         os.kill(live_pid, 0)  -> OSError 22 (WinError 87)
+#     pythonw, piped stdio:     os.kill(live_pid, 0)  -> OSError 9  (WinError 6)
+#
+# So pid_alive() called a running SyntH dead, stop() therefore reported "SyntH is not
+# running." into a console nobody has, and the tray's Shut down did nothing at all
+# while Synth kept serving. The Win32 calls below do not care whether the caller has
+# a console.
+
+_IS_WINDOWS = os.name == "nt"
+
+if _IS_WINDOWS:  # pragma: no cover - exercised on Windows only
+    import ctypes
+    from ctypes import wintypes
+
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    _PROCESS_TERMINATE = 0x0001
+    _STILL_ACTIVE = 259
+    _ERROR_INVALID_PARAMETER = 87
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    _kernel32.GetExitCodeProcess.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    _kernel32.TerminateProcess.restype = wintypes.BOOL
+    _kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+
+def pid_alive(pid: int) -> bool:
+    """Return True when a process with ``pid`` is running.
+
+    Deliberately not ``os.kill(pid, 0)`` on Windows: from a process without a console
+    that raises for a live process, which is how a running SyntH came to be reported
+    as stopped.
+    """
+    if pid <= 0:
+        return False
+    if _IS_WINDOWS:  # pragma: no cover - exercised on Windows only
+        handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            # ERROR_INVALID_PARAMETER means there is no such process. Anything else
+            # (access denied, for instance) means it exists but is not ours to query.
+            return ctypes.get_last_error() != _ERROR_INVALID_PARAMETER
+        try:
+            code = wintypes.DWORD()
+            if not _kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == _STILL_ACTIVE
+        finally:
+            _kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    except Exception:
+        # Windows raises a PermissionError-shaped error for a live system process we
+        # do not own; treat anything non-OSError as "exists".
+        return True
+    return True
+
+
+def terminate_pid(pid: int) -> tuple[bool, str]:
+    """Stop one process. Returns ``(asked, detail)``, with an empty detail on success.
+
+    Windows again skips ``os.kill``: TerminateProcess is what it ends up calling
+    anyway, and this way a caller with no console gets the same behaviour as one with.
+    """
+    if pid <= 0:
+        return False, "not a process id"
+    if _IS_WINDOWS:  # pragma: no cover - exercised on Windows only
+        handle = _kernel32.OpenProcess(_PROCESS_TERMINATE, False, pid)
+        if not handle:
+            return False, f"OpenProcess failed (WinError {ctypes.get_last_error()})"
+        try:
+            if not _kernel32.TerminateProcess(handle, 1):
+                error = ctypes.get_last_error()
+                return False, f"TerminateProcess failed (WinError {error})"
+            return True, ""
+        finally:
+            _kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def owns_app(command_line: str) -> bool:
+    """Whether a command line is this install's application.
+
+    Structural: an interpreter from this install's virtual environment running this
+    install's ``main.py``. Scoped to the install root on purpose, so a second SyntH on
+    the same machine (another checkout, another install) is never touched.
+    """
+    if not command_line:
+        return False
+    normalised = command_line.replace("\\", "/").lower()
+    root = str(REPO_ROOT).replace("\\", "/").lower().rstrip("/")
+    return root in normalised and "main.py" in normalised
+
+
+def _windows_processes() -> list[tuple[int, str]]:
+    """Every process as ``(pid, command line)``, via PowerShell.
+
+    PowerShell ships with Windows and the tray already depends on it, so this needs no
+    extra library. Run windowless: this may be called from pythonw.
+    """
+    powershell = shutil.which("powershell") or shutil.which("powershell.exe")
+    if not powershell:
+        return []
+    script = (
+        "Get-CimInstance Win32_Process | "
+        'ForEach-Object { "$($_.ProcessId)`t$($_.CommandLine)" }'
+    )
+    kwargs: dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "timeout": 30,
+    }
+    if _IS_WINDOWS:
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    completed = subprocess.run(  # noqa: S603
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", script], **kwargs
+    )
+    pairs: list[tuple[int, str]] = []
+    for line in completed.stdout.splitlines():
+        pid_text, _, command_line = line.partition("\t")
+        try:
+            pairs.append((int(pid_text.strip()), command_line.strip()))
+        except ValueError:
+            continue
+    return pairs
+
+
+def _proc_processes() -> list[tuple[int, str]]:
+    """Every process as ``(pid, command line)``, from ``/proc`` (Linux)."""
+    pairs: list[tuple[int, str]] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes().decode("utf-8", "replace")
+        except Exception:
+            continue
+        pairs.append((int(entry.name), raw.replace("\x00", " ").strip()))
+    return pairs
+
+
+def _ps_processes() -> list[tuple[int, str]]:
+    """Every process as ``(pid, command line)``, from ``ps`` (other POSIX)."""
+    completed = subprocess.run(  # noqa: S603
+        ["ps", "-eo", "pid=,args="],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    pairs: list[tuple[int, str]] = []
+    for line in completed.stdout.splitlines():
+        pid_text, _, command_line = line.strip().partition(" ")
+        try:
+            pairs.append((int(pid_text), command_line.strip()))
+        except ValueError:
+            continue
+    return pairs
+
+
+def app_pids() -> list[int]:
+    """Every pid that is this install's application, ignoring the pid file.
+
+    The pid file is a convenience, not the truth: it goes missing, it goes stale, and
+    Windows recycles process ids. Asking what is actually running is what makes
+    "Shut down" work even when the file is wrong.
+    """
+    try:
+        if _IS_WINDOWS:
+            pairs = _windows_processes()
+        elif Path("/proc").is_dir():
+            pairs = _proc_processes()
+        else:
+            pairs = _ps_processes()
+    except Exception as exc:
+        _launch_log(f"stop: could not list processes ({exc!r})")
+        return []
+    mine = os.getpid()
+    return [pid for pid, line in pairs if pid != mine and owns_app(line)]
+
+
 def read_pid() -> int | None:
     path = pid_path()
     if not path.is_file():
@@ -110,21 +311,6 @@ def read_pid() -> int | None:
         return int(path.read_text(encoding="utf-8").strip())
     except Exception:
         return None
-
-
-def pid_alive(pid: int) -> bool:
-    """Return True when a process with ``pid`` exists."""
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    except Exception:
-        # Windows raises a PermissionError-shaped error for a live system
-        # process we do not own; treat anything non-OSError as "exists".
-        return True
-    return True
 
 
 def write_pid(pid: int) -> None:
@@ -301,24 +487,55 @@ def wants_tray(args: argparse.Namespace) -> bool:
 
 
 def stop(quiet: bool = False) -> int:
-    """Stop the background instance recorded in the pid file."""
-    pid = read_pid()
-    if not pid or not pid_alive(pid):
+    """Stop the background instance, and say honestly whether it stopped.
+
+    The pid file is a fast path, never the whole answer: it can be missing, stale, or
+    name a pid Windows has recycled. The application's own processes are therefore
+    consulted as well, scoped to this install, and the outcome is written to the
+    launcher's log either way. A "Shut down" that silently did nothing is what this
+    replaces.
+    """
+    recorded = read_pid()
+    targets: list[int] = []
+    if recorded and pid_alive(recorded):
+        targets.append(recorded)
+    for pid in app_pids():
+        if pid not in targets:
+            targets.append(pid)
+
+    if not targets:
         clear_pid()
+        _launch_log(f"stop: nothing was running (pid file said {recorded!r})")
         if not quiet:
             print("SyntH is not running.")
         return 0
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except Exception as exc:  # noqa: BLE001 - reported verbatim
-        if not quiet:
-            print(f"could not stop process {pid}: {exc}")
-        return 1
+
+    _launch_log(f"stop: stopping {targets} (pid file said {recorded!r})")
+    failures: list[str] = []
+    for pid in targets:
+        asked, detail = terminate_pid(pid)
+        if not asked:
+            failures.append(f"{pid}: {detail}")
+
     for _ in range(30):
-        if not pid_alive(pid):
+        if not any(pid_alive(pid) for pid in targets):
             break
         time.sleep(0.5)
+
+    remaining = [pid for pid in targets if pid_alive(pid)]
     clear_pid()
+
+    if remaining:
+        _launch_log(
+            f"stop: still running after the request: {remaining}"
+            + (f"; failures: {failures}" if failures else "")
+        )
+        if not quiet:
+            detail = f" ({'; '.join(failures)})" if failures else ""
+            print(f"could not stop {remaining}{detail}")
+        return 1
+
+    _launch_log(f"stop: stopped {targets}")
     if not quiet:
         print("SyntH stopped.")
     return 0

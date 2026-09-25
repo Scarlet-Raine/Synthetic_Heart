@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -38,6 +39,59 @@ def _load(name: str, relative: str) -> object:
 
 healthcheck = _load("_synth_healthcheck_under_test", "scripts/healthcheck.py")
 start_synth = _load("_synth_start_under_test", "scripts/start_synth.py")
+
+
+def _windowless_python() -> str:
+    """The interpreter a desktop shortcut and the tray actually use: no console.
+
+    Falls back to the running interpreter where there is no separate windowed one
+    (Linux), which is itself always console-backed.
+    """
+    return str(start_synth.venv_python(windowed=True) or sys.executable)
+
+
+def _spawn_windowless(command: list[str]) -> subprocess.Popen:
+    """Start a child the way the launcher starts SyntH: no console, own group."""
+    flags = 0
+    if os.name == "nt":
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    return subprocess.Popen(  # noqa: S603
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=flags,
+    )
+
+
+def _process_exists(pid: int) -> bool:
+    """Ask the OS whether ``pid`` is running, independently of the launcher.
+
+    Deliberately not ``Popen.poll()``: inside a pytest process, polling a child that
+    was terminated through this process's own Win32 calls keeps reporting it as
+    running while the OS says it is gone, so the poll would hide a working stop.
+    """
+    if os.name == "nt":
+        done = subprocess.run(  # noqa: S603
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                f"Get-Process -Id {pid} -ErrorAction SilentlyContinue | "
+                "Select-Object -ExpandProperty Id",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return bool(done.stdout.strip())
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -159,15 +213,124 @@ def test_pid_alive_for_an_impossible_pid() -> None:
     assert start_synth.pid_alive(999_999_999) is False
 
 
+def test_pid_alive_is_right_from_a_process_with_no_console(tmp_path: Path) -> None:
+    """A live SyntH must not be reported as stopped by a console-less caller.
+
+    The tray calls ``--stop`` through ``pythonw.exe``. Measured before this test
+    existed: from a process with no console, ``os.kill(live_pid, 0)`` raises
+    ``OSError`` (WinError 6 "The handle is invalid", or 87 "The parameter is
+    incorrect" with DEVNULL stdio), so ``pid_alive`` answered False for a running
+    SyntH, ``stop()`` printed "SyntH is not running." into a console nobody has, and
+    the tray's Shut down did nothing at all.
+    """
+    answer_file = tmp_path / "answer.json"
+    script = tmp_path / "liveness.py"
+    script.write_text(
+        "import importlib.util, json, os, sys\n"
+        "from pathlib import Path\n"
+        f"root = Path(r'{REPO_ROOT}')\n"
+        "spec = importlib.util.spec_from_file_location(\n"
+        "    'ss', root / 'scripts' / 'start_synth.py'\n"
+        ")\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "sys.modules['ss'] = module\n"
+        "spec.loader.exec_module(module)\n"
+        "answer = {\n"
+        "    'self': module.pid_alive(os.getpid()),\n"
+        "    'impossible': module.pid_alive(999999999),\n"
+        "}\n"
+        f"Path(r'{answer_file}').write_text(json.dumps(answer), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    _spawn_windowless([_windowless_python(), str(script)]).wait(timeout=60)
+
+    assert answer_file.is_file(), "the console-less child produced no answer"
+    answer = json.loads(answer_file.read_text(encoding="utf-8"))
+    assert answer["self"] is True, (
+        "a live process was reported as dead without a console"
+    )
+    assert answer["impossible"] is False
+
+
+def test_the_sweep_only_claims_this_installs_application(tmp_path: Path) -> None:
+    """Finding the app by what it is must not reach another install on the machine."""
+    outside = tmp_path / "elsewhere"
+    lines = {
+        f"{REPO_ROOT}\\.venv\\Scripts\\pythonw.exe {REPO_ROOT}\\main.py": True,
+        f'"{REPO_ROOT}\\.venv\\Scripts\\python.exe" {REPO_ROOT}\\main.py --setup': True,
+        f"{REPO_ROOT}/.venv/bin/python {REPO_ROOT}/main.py": True,
+        f"{outside}\\.venv\\Scripts\\python.exe {outside}\\main.py": False,
+        r"D:\dev\D18\.venv\Scripts\python.exe main.py": False,
+        f"{REPO_ROOT}\\scripts\\start_synth.py --stop": False,
+        f"powershell.exe -AppRoot {REPO_ROOT}": False,
+        "": False,
+    }
+    for command_line, expected in lines.items():
+        assert start_synth.owns_app(command_line) is expected, command_line
+
+
+def test_stop_ends_the_process_it_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(start_synth, "pid_path", lambda: tmp_path / "synth.pid")
+    # Hermetic: the sweep is exercised by its own test, not against whatever happens
+    # to be running on this machine.
+    monkeypatch.setattr(start_synth, "app_pids", lambda: [])
+    stand_in = _spawn_windowless([sys.executable, "-c", "import time; time.sleep(120)"])
+    try:
+        time.sleep(0.5)
+        start_synth.write_pid(stand_in.pid)
+        assert start_synth.stop(quiet=True) == 0
+        assert not _process_exists(stand_in.pid), (
+            "the recorded process survived the stop"
+        )
+        assert start_synth.read_pid() is None
+    finally:
+        if stand_in.poll() is None:
+            stand_in.kill()
+            stand_in.wait(timeout=10)
+
+
+def test_stop_finds_the_application_without_a_pid_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing or stale pid file must not turn Shut down into a no-op."""
+    monkeypatch.setattr(start_synth, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(start_synth, "pid_path", lambda: tmp_path / "absent.pid")
+    fake_main = tmp_path / "main.py"
+    fake_main.write_text(
+        "import time\nwhile True:\n    time.sleep(1)\n", encoding="utf-8"
+    )
+    orphan = _spawn_windowless([sys.executable, str(fake_main)])
+    try:
+        time.sleep(0.5)
+        assert orphan.pid in start_synth.app_pids(), (
+            "the sweep did not recognise this install's own application"
+        )
+        assert start_synth.stop(quiet=True) == 0
+        assert not _process_exists(orphan.pid), "the application survived the stop"
+    finally:
+        start_synth.clear_pid()
+        if orphan.poll() is None:
+            orphan.kill()
+            orphan.wait(timeout=10)
+
+
 def test_stop_is_a_no_op_without_a_pid_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The shortcut must never kill something it did not start."""
+    """The shortcut must never kill something it did not start.
+
+    ``app_pids`` is stubbed out here on purpose: the sweep looks at the real machine,
+    and a test run from a checkout that happens to have a SyntH running would
+    otherwise stop it.
+    """
     monkeypatch.setattr(start_synth, "pid_path", lambda: tmp_path / "synth.pid")
     called: list[tuple[int, int]] = []
     monkeypatch.setattr(start_synth, "read_pid", lambda: None)
+    monkeypatch.setattr(start_synth, "app_pids", lambda: [])
     monkeypatch.setattr(
-        start_synth.os, "kill", lambda pid, sig: called.append((pid, sig))
+        start_synth, "terminate_pid", lambda pid: called.append(pid) or (True, "")
     )
     assert start_synth.stop() == 0
     assert called == []

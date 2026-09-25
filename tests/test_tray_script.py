@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -111,6 +112,79 @@ def test_a_refused_tray_records_its_reason(
     assert "tray:" in text
     if IS_WINDOWS:
         assert "is missing" in text
+
+
+@pytest.mark.skipif(
+    not (IS_WINDOWS and POWERSHELL),
+    reason="needs a Windows desktop with PowerShell",
+)
+def test_the_tray_script_is_syntactically_valid() -> None:
+    """A parse error in the tray is an icon that never appears, with no other symptom."""
+    if not TRAY_SCRIPT.is_file() or not POWERSHELL:
+        pytest.skip("no tray script or no PowerShell in this checkout")
+    parser = (
+        "$errors = $null; "
+        "[System.Management.Automation.Language.Parser]::ParseFile("
+        f"'{TRAY_SCRIPT}', [ref]$null, [ref]$errors) | Out-Null; "
+        "if ($errors) { $errors | ForEach-Object { $_.Message }; exit 1 } else { 'ok' }"
+    )
+    completed = subprocess.run(  # noqa: S603
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", parser],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.skipif(
+    not (IS_WINDOWS and POWERSHELL),
+    reason="needs a Windows desktop with PowerShell",
+)
+def test_every_helper_the_tray_calls_is_defined_in_it() -> None:
+    """A missing helper is a menu entry that fails only when someone clicks it.
+
+    The Shut down and Restart entries called ``Update-State`` for a while without it
+    existing anywhere: PowerShell reports that at click time, in a window that is not
+    open, which is exactly the kind of silence this file exists to prevent. PowerShell
+    itself is the judge of which commands are its own.
+    """
+    if not TRAY_SCRIPT.is_file() or not POWERSHELL:
+        pytest.skip("no tray script or no PowerShell in this checkout")
+    body = TRAY_SCRIPT.read_text(encoding="utf-8")
+    # Comments are prose, and prose reads like a command name: the help block's
+    # "Notification-area (tray) icon" is not a call to anything.
+    code = re.sub(r"<#.*?#>", "", body, flags=re.DOTALL)
+    code = "\n".join(
+        line.split(" #", 1)[0]
+        for line in code.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    defined = set(re.findall(r"function\s+([A-Za-z][\w-]*)", code))
+    # Command position only: a statement start, straight after an opening brace, or a
+    # pipeline stage.
+    candidates = set(
+        re.findall(r"(?:^\s*|\{\s*)([A-Z][A-Za-z]*-[A-Za-z][\w]*)", code, re.MULTILINE)
+    ) | set(re.findall(r"\|\s*([A-Z][A-Za-z]*-[A-Za-z][\w]*)", code))
+    unknown = sorted(candidates - defined)
+    if not unknown:
+        return
+    probe = "; ".join(
+        f"if (Get-Command -Name '{name}' -ErrorAction SilentlyContinue) {{ '{name}' }}"
+        for name in unknown
+    )
+    known = subprocess.run(  # noqa: S603
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", probe],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    ).stdout
+    builtin = {name for name in unknown if name in known}
+    missing = sorted(set(unknown) - builtin)
+    assert not missing, (
+        f"the tray calls {missing}, which it does not define and PowerShell does not "
+        "provide"
+    )
 
 
 @pytest.mark.skipif(
