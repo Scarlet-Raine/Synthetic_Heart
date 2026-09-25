@@ -208,6 +208,19 @@ def test_the_tray_script_reaches_its_message_loop(tmp_path: Path) -> None:
     shutil.copy(icon, tmp_path / "installer" / "synth-tray.ico")
     log = tmp_path / "logs" / "tray.log"
 
+    def read_log() -> str:
+        """Read the log, tolerating the instant the tray has it open to append.
+
+        Windows can refuse the read while the writer holds it, which is a collision
+        between watching and writing, not a tray that failed.
+        """
+        for _ in range(20):
+            try:
+                return log.read_text(encoding="utf-8", errors="replace")
+            except PermissionError:
+                time.sleep(0.05)
+        return log.read_text(encoding="utf-8", errors="replace")
+
     command = [
         POWERSHELL,
         "-NoProfile",
@@ -236,7 +249,7 @@ def test_the_tray_script_reaches_its_message_loop(tmp_path: Path) -> None:
         deadline = time.time() + 60.0
         while time.time() < deadline:
             if log.is_file():
-                text = log.read_text(encoding="utf-8", errors="replace")
+                text = read_log()
                 if "entering the message loop" in text or "FATAL" in text:
                     break
             time.sleep(0.25)
