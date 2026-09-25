@@ -219,3 +219,35 @@ def test_the_installer_version_is_the_one_that_was_decided() -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_no_fork_run_is_failed_by_a_missing_docker_hub_secret() -> None:
+    """A fork does not inherit this repository's secrets.
+
+    A job that pushes to or pulls from Docker Hub with those credentials fails there for a
+    reason that has nothing to do with the code, and if it carries no `continue-on-error`
+    it turns the whole run red: `manifest` did exactly that, and it was the only reason a
+    fork's run could never be green. Every job that touches those credentials must
+    therefore either ignore its own failure or be gated on the secret being present.
+    """
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    gate = "have-dockerhub"
+    unguarded: list[str] = []
+
+    for name, job in workflow["jobs"].items():
+        if name == gate:
+            continue  # this job exists to answer that question without ever failing
+        if "DOCKERHUB" not in yaml.safe_dump(job):
+            continue
+        if job.get("continue-on-error") is True:
+            continue
+        needs = job.get("needs") or []
+        needs = [needs] if isinstance(needs, str) else list(needs)
+        if gate in needs and gate in str(job.get("if", "")):
+            continue
+        unguarded.append(name)
+
+    assert not unguarded, (
+        f"these jobs need Docker Hub credentials and may not fail: {unguarded}. A fork has "
+        "no such secret, so the run goes red there for a reason that is not code."
+    )

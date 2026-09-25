@@ -1,3 +1,15 @@
+### fix(ci): a fork's run can be green again, and the jobs that need uv install it  <!-- 2026-09-25 -->
+
+**Why:** the Windows installer job went green and the run still went red. `manifest` is the only job that carries no `continue-on-error` and needs `DOCKERHUB_USERNAME`, a secret a forked repository does not inherit, so it failed on every fork run with `Username and password required` and took the whole run with it.
+
+**Fix:** a `have-dockerhub` job answers whether the secret exists, `manifest` is gated on that answer, and where the secret is present nothing about the run changes. The two jobs that called `uv sync` without installing uv (`agent-integration`, `agent-e2e`; `unit-tests` does install it) now install it first, which is what exit 127 was.
+
+**Measured, not assumed:** fork run `36115281779` at `a7844c07`: `prepare`, `windows-installer` and `unit-tests` green, `release` skipped by design (publishing is a `v*` tag or a manual run with `publish_release`), `manifest` red on credentials. Upstream's own successful run `35634094737` shows `mypy-check`, `agent-integration` and `agent-e2e` already failing there, all three marked `continue-on-error`, so they cannot fail a run: `mypy-check` is `mypy . --strict` over the whole repository, a report rather than a gate.
+
+**Still red on a fork, on purpose:** `build-images` (it logs in to Docker Hub; gating it would skip `unit-tests`, which needs it, so it stays red-but-ignored) and `agent-e2e` (its `services` pull a private image, and a service is pulled before any step can log in).
+
+**Validation:** `tests/test_release_workflow.py` now asserts that every job touching Docker Hub credentials either carries `continue-on-error` or is gated on the secret being present; removing the gate from `manifest` makes it fail naming the job. `actionlint` is clean and 12 workflow tests pass.
+
 ### fix(installer): the Windows installer was never built, because the script handed Inno Setup "C"  <!-- 2026-09-25 -->
 
 **Why:** the `windows-installer` job on CI failed on every run with `The term 'C' is not recognized as a name of a cmdlet`, right after printing `compiler: C`. It is not a CI problem: the same command fails identically on an ordinary Windows machine, and Inno Setup was never run at all.
