@@ -96,11 +96,10 @@ SelectDirLabel3=Setup will install {#AppName} into the following folder.
 [Tasks]
 ; Unchecked by default: the Start Menu entry is enough for most people.
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"; Flags: unchecked
-; Opt-in clean slate. data\ and .env are kept by default so a reinstall resumes the
-; same persona, history and keys; this is for someone who wants the install gone for
-; good, and it is offered here because the installer is the only place a user is
-; asked about the install at all.
-Name: "cleanslate"; Description: "Remove all my data when uninstalling (&persona, history, keys, database)"; GroupDescription: "Uninstall:"; Flags: unchecked
+; Nothing is asked here about what an uninstall should do with the data. That question
+; belongs in the uninstaller, where it is a decision about something that is actually
+; happening; asked during setup it is a question about a hypothetical future, and the
+; answer is stored for months before it is used. See InitializeUninstall in [Code].
 
 [Files]
 ; The application tree. Generated and personal things are deliberately excluded:
@@ -150,9 +149,9 @@ Filename: "{app}\.venv\Scripts\pythonw.exe"; \
   Flags: runhidden waituntilterminated; RunOnceId: "StopSyntHDatabase"
 
 [UninstallDelete]
-; Only what the installer created or the app generated. data\ and .env are kept
-; deliberately: reinstalling then resumes with the same persona, history and
-; keys instead of starting over. Delete them by hand for a clean slate.
+; Only what the installer created or the app generated. data\ and .env are not in this
+; list at all: whether they survive is decided in the uninstaller, where the user is
+; asked, and answered by InitializeUninstall/CurUninstallStepChanged in [Code].
 Type: filesandordirs; Name: "{app}\.venv"
 Type: filesandordirs; Name: "{app}\logs"
 Type: filesandordirs; Name: "{app}\pgsql"
@@ -161,12 +160,6 @@ Type: filesandordirs; Name: "{app}\.pytest_cache"
 Type: filesandordirs; Name: "{app}\.ruff_cache"
 Type: filesandordirs; Name: "{app}\__pycache__"
 Type: files; Name: "{app}\uv.lock"
-; Only when the user asked for a clean slate at install time: data\ holds the
-; persona, the history, the encrypted endpoint secret and the database cluster,
-; and .env holds the generated credentials. Keeping them is what lets a reinstall
-; resume where the last one left off, so removing them is opt-in.
-Type: filesandordirs; Name: "{app}\data"; Tasks: cleanslate
-Type: files; Name: "{app}\.env"; Tasks: cleanslate
 
 [Code]
 const
@@ -236,5 +229,51 @@ begin
     StepFailed('The database or the Python environment could not be set up.',
       'bootstrap.py exited with code ' + IntToStr(ResultCode) + '.', BootstrapLog);
     exit;
+  end;
+end;
+
+var
+  DeleteDataOnUninstall: Boolean;
+
+function InitializeUninstall(): Boolean;
+var
+  Answer: Integer;
+begin
+  { Asked here, at uninstall, where it is a decision about something that is actually
+    happening. Setup used to carry it as an unchecked task, which asked the user to
+    imagine a future uninstall while they were still installing and then stored the
+    answer for months.
+
+    Keeping the data is the default and the only silent answer: a silent uninstall has
+    nobody to ask, and keeping is the direction that can be undone afterwards by
+    deleting two paths, while deleting is not.
+
+    No braces in these comments: Inno comments do not nest, and an inner one would end
+    the comment early. }
+  DeleteDataOnUninstall := False;
+  if not UninstallSilent() then
+  begin
+    Answer := MsgBox(ExpandConstant('{#AppName} can also delete your data: the persona, '
+      + 'the chat history, the memories and the database cluster in data\, plus the '
+      + 'generated credentials in .env.')
+      + #13#10#13#10
+      + 'Keeping them means a later reinstall resumes from where this one left off.'
+      + #13#10#13#10
+      + 'Delete your data as well?',
+      mbConfirmation, MB_YESNO);
+    DeleteDataOnUninstall := (Answer = IDYES);
+  end;
+  Result := True;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  { usPostUninstall, not usUninstall: the two [UninstallRun] entries have stopped the
+    application and its PostgreSQL cluster by then, and a cluster that is still running
+    holds its files open, which would leave the install half deleted. }
+  if (CurUninstallStep = usPostUninstall) and DeleteDataOnUninstall then
+  begin
+    DelTree(ExpandConstant('{app}\data'), True, True, True);
+    DeleteFile(ExpandConstant('{app}\.env'));
   end;
 end;

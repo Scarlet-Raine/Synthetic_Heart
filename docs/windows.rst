@@ -128,9 +128,10 @@ Notes and caveats
   is about a process that is gone.
 - Uninstalling keeps ``data\`` and ``.env`` on purpose, so a reinstall resumes the
   same persona, history and keys. The database cluster lives in ``data\pgsql``, so
-  a reinstall reuses it rather than creating a new one. Tick "Remove all my data
-  when uninstalling" during setup if you want the install gone for good, or delete
-  those two paths by hand afterwards.
+  a reinstall reuses it rather than creating a new one. The uninstaller asks
+  whether to delete them as well, and keeps them unless you say otherwise: a
+  silent uninstall (``/SILENT``, ``/VERYSILENT``) keeps them, because there is
+  nobody to ask and keeping is the direction you can undo afterwards.
 - Selenium-based engines are being replaced by other engines; if you still use
   them, install Chrome and ``undetected-chromedriver``.
 - Some tests assume a database or other services; point them at local ones with

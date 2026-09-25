@@ -186,26 +186,44 @@ def test_no_local_draft_at_the_root_can_be_shipped(iss_text: str) -> None:
         )
 
 
-def test_a_clean_slate_uninstall_is_opt_in(iss_text: str) -> None:
-    """data\\ and .env survive an uninstall unless the user asked otherwise.
+def test_the_data_question_is_asked_by_the_uninstaller(iss_text: str) -> None:
+    """The uninstaller asks; setup asks nothing about a hypothetical uninstall.
 
-    Keeping them is deliberate: a reinstall then resumes the same persona, history
-    and keys. Removing them is the thing that must be opt-in, and it has to be
-    offered somewhere, because the installer is the only place a user is asked
-    anything about the install at all.
+    Setup used to carry it as an unchecked task, which asked the user to decide about a
+    future uninstall while they were still installing, and then stored the answer until
+    it was needed. The question is asked when it is a decision about something that is
+    actually happening. Keeping the data stays the default and is what a silent
+    uninstall does, because keeping is the recoverable direction: deleting it is not.
     """
-    tasks = iss_text.split("[Tasks]", 1)[1].split("[", 1)[0]
-    task_lines = [line for line in tasks.splitlines() if "cleanslate" in line]
-    assert task_lines, "there is no clean-slate option to offer"
-    assert "Flags: unchecked" in task_lines[0], "a clean slate must not be the default"
+    tasks = iss_text.split("[Tasks]", 1)[1].split("\n[", 1)[0]
+    assert "cleanslate" not in tasks, (
+        "setup still asks about a future uninstall; that question belongs in the "
+        "uninstaller, not in the install"
+    )
 
-    uninstall = iss_text.split("[UninstallDelete]", 1)[1].split("\n[", 1)[0]
+    uninstall_delete = iss_text.split("[UninstallDelete]", 1)[1].split("\n[", 1)[0]
     for name in ("{app}\\data", "{app}\\.env"):
-        entry = [line for line in uninstall.splitlines() if f'Name: "{name}"' in line]
-        assert entry, f"{name} is not handled at uninstall"
-        assert "Tasks: cleanslate" in entry[0], (
-            f"{name} would be deleted on every uninstall, not just a clean slate"
+        assert f'Name: "{name}"' not in uninstall_delete, (
+            f"{name} is an unconditional uninstall delete, so it would be removed "
+            "without ever asking"
         )
+
+    code = iss_text.split("[Code]", 1)[1]
+    assert "function InitializeUninstall(): Boolean;" in code
+    assert "procedure CurUninstallStepChanged(" in code
+    # Keeping is the default, and a silent uninstall is never asked.
+    assert "DeleteDataOnUninstall := False;" in code
+    assert "if not UninstallSilent() then" in code
+    assert "MB_YESNO" in code and "IDYES" in code
+    # Deleted only after the app and its cluster have been stopped: a running cluster
+    # holds its files open, which would leave the install half deleted. The whole
+    # condition is asserted, not the token, because the comment above it names the step
+    # too and a token would be satisfied by prose.
+    assert (
+        "if (CurUninstallStep = usPostUninstall) and DeleteDataOnUninstall then" in code
+    )
+    assert "DelTree(ExpandConstant('{app}\\data'), True, True, True);" in code
+    assert "DeleteFile(ExpandConstant('{app}\\.env'));" in code
 
 
 def test_both_provisioning_steps_leave_a_log(iss_text: str) -> None:
