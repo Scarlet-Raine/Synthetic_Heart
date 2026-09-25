@@ -1,3 +1,13 @@
+### fix(install): uninstall asks about the database before it removes anything  <!-- 2026-09-25 -->
+
+**Symptom (reported from a real run):** the uninstaller mentioned `--purge` only after the folder had been deleted, so the script that could have purged the database no longer existed and it had to be dropped by hand.
+
+**Fix:** `install.sh --uninstall` and `uninstall.sh` now ask first, while there is still something to protect. A run in a terminal offers "the application only, keeping your Synth's database" as the default and, below it, "everything, database included - this cannot be undone". Anything that is not an explicit 2 keeps the database, so the destructive branch has to be meant, and a mis-typed answer cannot take the persona with it. With no terminal (a pipe, a script, cron) nothing is asked and the database is kept, which is the only safe default for an unattended run; `--purge` and `SYNTH_UNINSTALL_CHOICE=2` answer the same question without a prompt. The closing message no longer points at the deleted script: it prints the `dropdb` and `dropuser` commands, which stand on their own now that the application is gone.
+
+**Second defect, found by running it as root rather than by reading it:** the purge built its command as `$PG_SUDO -n -u postgres dropdb ...`, and `$PG_SUDO` is emptied out for root, so a root run tried to execute `-n -u postgres dropdb`, which is not a command - the purge failed while the output said the database was gone. Root now uses `runuser -u postgres --` (util-linux, always present), and an unprivileged run keeps `sudo -n -u postgres`.
+
+**Validation:** 33 tests pass (Linux uninstall + installer payload), covering the option order, the safe default, the scripted path, and a static check that no emptied sudo prefix remains. Run for real on a Linux VM as root: choosing 2 prints the well-formed `runuser -u postgres -- dropdb ...`, pressing Enter keeps the database, and a piped run asks nothing and keeps it.
+
 ### fix(external_endpoints): a probe no longer calls an unreachable endpoint healthy  <!-- 2026-09-25 -->
 
 **Symptom (reported as "probing endpoints doesn't work"):** on a fresh native Linux install every probe failed, and the shipped Zen preset showed `probe_status = success` although its hostname does not resolve on that host and nothing was listening on its port.

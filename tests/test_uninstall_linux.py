@@ -31,10 +31,24 @@ def fake_uname(tmp_path: Path) -> str:
 
 
 def _run_uninstall(
-    fake_uname: str, install_dir: Path, *extra: str
+    fake_uname: str,
+    install_dir: Path,
+    *extra: str,
+    answer: str | None = None,
+    env_extra: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["PATH"] = fake_uname + os.pathsep + env.get("PATH", "")
+    if env_extra:
+        env.update(env_extra)
+    kwargs: dict = {}
+    if answer is None:
+        # Deterministic stdin: a test must not pick up the terminal it was started from,
+        # or "is there a terminal?" would answer itself differently depending on where the
+        # suite runs.
+        kwargs["stdin"] = subprocess.DEVNULL
+    else:
+        kwargs["input"] = answer
     return subprocess.run(
         [
             "bash",
@@ -50,6 +64,7 @@ def _run_uninstall(
         cwd=str(REPO_ROOT),
         env=env,
         timeout=120,
+        **kwargs,
     )
 
 
@@ -74,7 +89,13 @@ def test_a_plain_uninstall_removes_the_app_and_says_the_database_stays(
         "a plain uninstall must not touch the database: that is the user's Synth, and "
         "nothing asked for it to go"
     )
-    assert "run this again with --purge" in result.stdout
+    # Nothing points at the deleted script: by this point the installer is gone, so advice
+    # to "run this again with --purge" names a file that is not there any more. The
+    # commands have to stand on their own.
+    assert "sudo -u postgres dropdb --if-exists" in result.stdout
+    assert "run this again with --purge" not in result.stdout
+    # And with no terminal, nothing asked: an unattended run keeps the database silently.
+    assert "How much should be removed?" not in result.stdout
     # Not recoverable, so it is stated whether or not --purge was asked for.
     assert ".env" in result.stdout
     assert "data/" in result.stdout
@@ -122,6 +143,108 @@ def test_purge_does_not_drop_a_database_on_another_machine(
     executed = [line for line in result.stdout.splitlines() if "would run:" in line]
     assert not [line for line in executed if "dropdb" in line or "dropuser" in line], (
         f"a remote database must not be dropped from here: {executed}"
+    )
+
+
+def test_a_terminal_uninstall_asks_before_removing_anything(
+    fake_uname: str, tmp_path: Path
+) -> None:
+    """The question is asked while there is still something to protect.
+
+    Reported from a real run: the advice about purging arrived only after the folder had
+    gone, so the script that could have done it was already deleted. Asking first is the
+    fix, so this pins that the question precedes the removal, that the destructive answer is
+    listed second and says it cannot be undone, and that choosing it does purge.
+    """
+    install_dir = tmp_path / "SyntH"
+    install_dir.mkdir(parents=True)
+    (install_dir / ".env").write_text(
+        "DB_NAME=my_synth\nDB_USER=my_synth\nDB_HOST=127.0.0.1\n", encoding="utf-8"
+    )
+
+    result = _run_uninstall(
+        fake_uname,
+        install_dir,
+        answer="2\n",
+        env_extra={"SYNTH_UNINSTALL_PROMPT": "1"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "How much should be removed?" in result.stdout
+    keep_line = result.stdout.find("the application only")
+    purge_line = result.stdout.find("everything, database included")
+    assert keep_line != -1 and purge_line != -1
+    assert keep_line < purge_line, (
+        "the destructive option must not be the easy one to hit"
+    )
+    assert "cannot be undone" in result.stdout
+    assert "dropdb --if-exists my_synth" in result.stdout
+
+
+def test_the_safe_answer_is_the_default(fake_uname: str, tmp_path: Path) -> None:
+    """Pressing Enter, or answering anything unexpected, keeps the database.
+
+    The destructive branch has to be something the user has to mean: it is the one step that
+    takes the persona, the chat history, the memories and the diary with it.
+    """
+    install_dir = tmp_path / "SyntH"
+    install_dir.mkdir(parents=True)
+    (install_dir / ".env").write_text(
+        "DB_NAME=my_synth\nDB_USER=my_synth\nDB_HOST=127.0.0.1\n", encoding="utf-8"
+    )
+
+    result = _run_uninstall(
+        fake_uname,
+        install_dir,
+        answer="\n",
+        env_extra={"SYNTH_UNINSTALL_PROMPT": "1"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "How much should be removed?" in result.stdout
+    assert "Deleting the database" not in result.stdout
+    assert "left alone" in result.stdout
+
+
+def test_a_scripted_uninstall_answers_without_a_prompt(
+    fake_uname: str, tmp_path: Path
+) -> None:
+    """Automation gets the same choice without a dialog, and never blocks on one.
+
+    SYNTH_UNINSTALL_CHOICE is the non-interactive half of that question, so a script can ask
+    for the purge explicitly while a plain piped run keeps the data.
+    """
+    install_dir = tmp_path / "SyntH"
+    install_dir.mkdir(parents=True)
+    (install_dir / ".env").write_text(
+        "DB_NAME=my_synth\nDB_USER=my_synth\nDB_HOST=127.0.0.1\n", encoding="utf-8"
+    )
+
+    result = _run_uninstall(
+        fake_uname, install_dir, env_extra={"SYNTH_UNINSTALL_CHOICE": "2"}
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "How much should be removed?" not in result.stdout, (
+        "a scripted run must not stop to ask"
+    )
+    assert "dropdb --if-exists my_synth" in result.stdout
+
+
+def test_the_purge_runs_as_postgres_however_the_script_was_started() -> None:
+    """A root run must produce a command, not a stray flag.
+
+    Seen in a live --dry-run as root: the sudo prefix was emptied out for root, leaving
+    "-n -u postgres dropdb" as the command line, which is not something a shell can run - so
+    a purge as root would have failed while claiming to have deleted the database. Root now
+    goes through runuser, which a Linux install has, so the command is well formed either
+    way. Static because the suite does not run as root.
+    """
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    assert "runuser -u postgres --" in text, "root has no safe way to run the drop"
+    assert "sudo -n -u postgres" in text, "an unprivileged run lost its sudo prefix"
+    assert "$PG_SUDO" not in text, (
+        "an emptied sudo prefix leaves a command that starts with -n, which no shell can run"
     )
 
 

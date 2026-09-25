@@ -19,9 +19,15 @@
 #   ./install.sh --portable          no sudo: private PostgreSQL cluster
 #   ./install.sh --extra local-voice add offline TTS/STT (large, ~2 GB with torch)
 #   ./install.sh --no-start          install only; do not start SyntH afterwards
-#   ./install.sh --uninstall         remove the app; your Synth's database is kept
+#   ./install.sh --uninstall         remove the app and ask what to do with the database
 #   ./install.sh --uninstall --purge remove everything, database included
 #   ./install.sh --dry-run           print what would happen
+#
+# A plain --uninstall asks (when run in a terminal) whether to remove the application
+# alone or everything including the database, so the choice is made before anything is
+# deleted. With no terminal - a script, a pipe, cron - it keeps the database and prints
+# the commands that drop it. SYNTH_UNINSTALL_CHOICE=2 answers the question without a
+# prompt; --purge does the same.
 #
 set -euo pipefail
 
@@ -113,6 +119,34 @@ uninstall() {
         [ -n "$DB_PORT" ] || DB_PORT="5432"
     fi
 
+    # Ask before anything is removed, because the answer decides whether the database
+    # outlives this run. The folder being deleted holds .env and data/, so once it is gone
+    # there is nothing left to ask and no script left to pass --purge to, which is how the
+    # hint about purging used to arrive too late to be useful. --purge skips the question;
+    # a run with no terminal (a pipe, a script, cron) never blocks on one and keeps the
+    # database, which is the only safe default.
+    if [ "$PURGE" -eq 0 ] && [ -n "${SYNTH_UNINSTALL_CHOICE:-}" ]; then
+        case "$(printf '%s' "$SYNTH_UNINSTALL_CHOICE" | tr -d '[:space:]')" in
+            2|p|purge|full) PURGE=1 ;;
+            *) PURGE=0 ;;
+        esac
+    elif [ "$PURGE" -eq 0 ] && { [ -t 0 ] || [ "${SYNTH_UNINSTALL_PROMPT:-0}" = "1" ]; }; then
+        say ""
+        say "How much should be removed?"
+        say ""
+        say "  1  the application only, keeping your Synth's database   (default)"
+        say "  2  everything, database included - this cannot be undone"
+        say ""
+        printf "Choose 1 or 2 [1]: "
+        local answer=""
+        read -r answer || answer=""
+        case "$(printf '%s' "$answer" | tr -d '[:space:]')" in
+            2|p|purge|full) PURGE=1 ;;
+            *) PURGE=0 ;;
+        esac
+        say ""
+    fi
+
     if [ -x "$INSTALL_DIR/.venv/bin/python" ]; then
         run "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/scripts/start_synth.py" --stop || true
     fi
@@ -126,13 +160,21 @@ uninstall() {
     # it is said plainly whether or not --purge was asked for.
     if [ "$PURGE" -eq 1 ]; then
         step "Deleting the database"
-        local PG_SUDO=""
-        if [ "$(id -u)" -ne 0 ]; then PG_SUDO="sudo"; fi
+        # Run the drop as the postgres superuser, whichever way this script was started. A
+        # bare "sudo" prefix that is emptied out for root leaves "-n -u postgres dropdb" as
+        # the command, which is not one; and a minimal system may have no sudo at all, so
+        # root uses runuser (util-linux) instead.
+        local -a PG=()
+        if [ "$(id -u)" -eq 0 ]; then
+            PG=(runuser -u postgres --)
+        else
+            PG=(sudo -n -u postgres)
+        fi
         case "$DB_HOST" in
             ""|localhost|127.0.0.1|::1)
-                run $PG_SUDO -n -u postgres dropdb --if-exists "$DB_NAME" \
+                run ${PG[@]+"${PG[@]}"} dropdb --if-exists "$DB_NAME" \
                     || warn "could not drop the database $DB_NAME; it is still there"
-                run $PG_SUDO -n -u postgres dropuser --if-exists "$DB_USER" \
+                run ${PG[@]+"${PG[@]}"} dropuser --if-exists "$DB_USER" \
                     || warn "could not drop the database user $DB_USER"
                 ;;
             *)
@@ -151,9 +193,10 @@ uninstall() {
         say "the chat history, the memories and the diary. Installing again brings them back"
         say "exactly as they were."
         say ""
-        say "To delete that too:   sudo -u postgres dropdb --if-exists $DB_NAME && \\"
-        say "                      sudo -u postgres dropuser --if-exists $DB_USER"
-        say "or run this again with --purge."
+        say "To delete that too, now that the application is gone:"
+        say ""
+        say "  sudo -u postgres dropdb --if-exists $DB_NAME"
+        say "  sudo -u postgres dropuser --if-exists $DB_USER"
     fi
     say ""
     say "Removed with the folder, and not recoverable: settings, credentials and API keys"

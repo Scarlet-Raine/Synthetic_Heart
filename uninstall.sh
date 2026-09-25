@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Synthetic Heart — uninstaller for Linux.
 #
-#   ./uninstall.sh            remove the application; your Synth's database is kept
-#   ./uninstall.sh --purge    remove everything, including the database
+#   ./uninstall.sh            remove it, and ask what to do with your Synth's database
+#   ./uninstall.sh --purge    remove everything, including the database, without asking
 #
 # A thin wrapper so the command is where people look for it. The work happens in
 # install.sh's --uninstall path, which is kept as the single copy of that logic.
