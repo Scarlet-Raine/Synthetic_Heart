@@ -57,12 +57,19 @@ $version = Resolve-Version -Explicit $Version
 $output = Join-Path $PSScriptRoot "Output\SyntH-Setup-$version.exe"
 
 function Find-Iscc {
-    $candidates = @(
+    $possible = @(
         (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
         (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe'),
         (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')
-    ) | Where-Object { $_ -and (Test-Path $_) }
-    if ($candidates) { return $candidates[0] }
+    )
+    # The @() around the pipeline is load-bearing. Piping a list through Where-Object
+    # unwraps a single match out of the array into a bare string, and indexing a string
+    # gives its first character, so $candidates[0] was "C" and Inno Setup was never
+    # actually run: the script printed "compiler: C" and died on
+    # "The term 'C' is not recognized". One match is the ordinary case, because a
+    # machine has one Inno Setup installed.
+    $candidates = @($possible | Where-Object { $_ -and (Test-Path $_) })
+    if ($candidates.Count -gt 0) { return $candidates[0] }
     return $null
 }
 

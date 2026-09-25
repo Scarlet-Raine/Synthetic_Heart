@@ -1,0 +1,141 @@
+"""The installer build script's compiler lookup.
+
+`Find-Iscc` returning the first character of the path instead of the path is not a
+theoretical failure: it is what shipped, and it is why the Windows installer job on CI
+died with "The term 'C' is not recognized" while the script cheerfully printed
+"compiler: C". PowerShell unwraps a single pipeline result out of its array, and indexing
+a string gives a character. These tests pin the lookup itself, with the candidate
+locations pointed at temporary directories so they do not depend on what is installed on
+the machine running them.
+
+Two of the three locations can be pointed elsewhere and one cannot: Windows re-derives
+`ProgramFiles` for every new process, so a child handed a fake one still reports the real
+path (verified for python, cmd and powershell children alike). `ProgramFiles(x86)` and
+`LOCALAPPDATA` are ordinary named variables and do take the value they are given, which is
+enough, because the failure was positional: exercising one candidate at a time finds it.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+SCRIPT = Path(__file__).resolve().parents[1] / "installer" / "build_installer.ps1"
+POWERSHELL = shutil.which("pwsh") or shutil.which("powershell")
+REAL_INNO_ELSEWHERE = (
+    Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    / "Inno Setup 6"
+    / "ISCC.exe"
+)
+
+pytestmark = pytest.mark.skipif(
+    POWERSHELL is None,
+    reason="build_installer.ps1 is PowerShell, and there is no PowerShell here",
+)
+
+
+def _find_iscc_function() -> str:
+    text = SCRIPT.read_text(encoding="utf-8")
+    match = re.search(r"^function Find-Iscc \{.*?^\}", text, re.MULTILINE | re.DOTALL)
+    assert match, "installer/build_installer.ps1 no longer defines Find-Iscc"
+    return match.group(0)
+
+
+def _env_with(overrides: dict[str, str]) -> dict[str, str]:
+    """An environment where each override replaces its existing name regardless of case.
+
+    Windows environment names are case-insensitive but a Python dict is not, so adding
+    "LOCALAPPDATA" next to an existing "LocalAppData" would leave two entries in the env
+    block and Windows could read either.
+    """
+    environment = dict(os.environ)
+    for key, value in overrides.items():
+        for existing in [k for k in environment if k.lower() == key.lower()]:
+            del environment[existing]
+        environment[key] = value
+    return environment
+
+
+def _run_find_iscc(tmp_path: Path, *, locations: list[str]) -> str:
+    """Run the real Find-Iscc with the fakeable roots pointed at temporary directories.
+
+    `locations` names which locations hold an Inno Setup, as the script sees them: "x86"
+    or "localappdata". "programs" is deliberately not among them, see the module docstring.
+    """
+    roots = {
+        "x86": (tmp_path / "pf86", Path("Inno Setup 6") / "ISCC.exe"),
+        "localappdata": (
+            tmp_path / "la",
+            Path("Programs") / "Inno Setup 6" / "ISCC.exe",
+        ),
+    }
+    for name, (root, relative) in roots.items():
+        root.mkdir(parents=True, exist_ok=True)
+        if name in locations:
+            iscc = root / relative
+            iscc.parent.mkdir(parents=True, exist_ok=True)
+            iscc.write_text("stub")
+
+    script = tmp_path / "find.ps1"
+    script.write_text(
+        f"{_find_iscc_function()}\nWrite-Output (Find-Iscc)\n", encoding="utf-8"
+    )
+    environment = {
+        "ProgramFiles(x86)": str(roots["x86"][0]),
+        "LOCALAPPDATA": str(roots["localappdata"][0]),
+    }
+    result = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=_env_with(environment),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout.strip()
+
+
+def test_one_installed_inno_setup_yields_its_full_path(tmp_path: Path) -> None:
+    """The ordinary case, and the one that broke: a machine has one Inno Setup.
+
+    Returning "C" here means Inno Setup is never run at all, so the build always fails.
+    """
+    found = _run_find_iscc(tmp_path, locations=["x86"])
+    assert found == str(tmp_path / "pf86" / "Inno Setup 6" / "ISCC.exe"), (
+        f"Find-Iscc returned {found!r} for a single installed Inno Setup, which is not a usable path"
+    )
+
+
+def test_a_single_match_in_the_last_location_is_also_a_full_path(
+    tmp_path: Path,
+) -> None:
+    """The unwrapping happens for whichever location matched, not only the first one."""
+    found = _run_find_iscc(tmp_path, locations=["localappdata"])
+    assert found == str(tmp_path / "la" / "Programs" / "Inno Setup 6" / "ISCC.exe")
+
+
+def test_the_first_location_wins_when_several_exist(tmp_path: Path) -> None:
+    found = _run_find_iscc(tmp_path, locations=["x86", "localappdata"])
+    assert found == str(tmp_path / "pf86" / "Inno Setup 6" / "ISCC.exe")
+
+
+@pytest.mark.skipif(
+    REAL_INNO_ELSEWHERE.exists(),
+    reason="this machine really does have a second Inno Setup, which Find-Iscc is meant to find",
+)
+def test_a_machine_without_inno_setup_says_so(tmp_path: Path) -> None:
+    """Not a path and not a crash: the caller prints its install instructions."""
+    assert _run_find_iscc(tmp_path, locations=[]) == ""
