@@ -1384,9 +1384,20 @@ class CoreInitializer:
                                     self._pending_async_plugins.append(
                                         (module_name, instance)
                                     )
-                                log_info(
-                                    f"[core_initializer] Queued async plugin for startup: {module_name}"
-                                )
+                                    log_info(
+                                        f"[core_initializer] Queued async plugin for startup: {module_name}"
+                                    )
+                                else:
+                                    # Say so: the log used to claim "queued" for
+                                    # every module whether or not it was, so a
+                                    # plugin re-exported by two module files
+                                    # looked like two queued plugins when only
+                                    # one was.
+                                    log_debug(
+                                        f"[core_initializer] {module_name} is the same "
+                                        "plugin instance as one already queued for "
+                                        "startup; not queuing it twice"
+                                    )
                             else:
                                 instance.start()
                                 log_info(
