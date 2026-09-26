@@ -25,13 +25,17 @@
   #define AppVersion "0.0.0-dev"
 #endif
 
-; Windows version resources must be numeric, so a pre-release tag
-; ("1.2.3-feat.4") is trimmed to "1.2.3" for VersionInfoVersion only. AppVersion
-; keeps the full string everywhere the user sees it.
-#if Pos("-", AppVersion) > 0
-  #define AppVersionNumeric Copy(AppVersion, 1, Pos("-", AppVersion) - 1)
-#else
-  #define AppVersionNumeric AppVersion
+; Windows version resources must be numeric, so the caller passes the numeric
+; run explicitly: "1.0.0" for both "1.0.0a" (a revision of 1.0.0) and
+; "1.2.3-feat.4" (a pre-release). Falling back to the hyphen rule keeps an older
+; caller working, and AppVersion keeps the full string everywhere the user sees
+; it (the installer's own name, its title bar and Add/Remove Programs).
+#ifndef AppVersionNumeric
+  #if Pos("-", AppVersion) > 0
+    #define AppVersionNumeric Copy(AppVersion, 1, Pos("-", AppVersion) - 1)
+  #else
+    #define AppVersionNumeric AppVersion
+  #endif
 #endif
 
 ; The default persona (skins\Rei) always ships, because the avatar has to work

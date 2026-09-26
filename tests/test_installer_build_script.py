@@ -212,3 +212,73 @@ def test_a_tag_that_is_not_a_version_is_not_used_as_one(tmp_path: Path) -> None:
 def test_a_version_tag_is_used_as_the_version(tmp_path: Path) -> None:
     """And the ordinary case still works, with or without the leading v."""
     assert _run_resolve_version(tmp_path, _tagged_repo(tmp_path, "v1.2.3")) == "1.2.3"
+
+
+def _run_version_info_version(tmp_path: Path, app_version: str) -> str:
+    """Resolve-VersionInfoVersion on its own, for one AppVersion."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    start = text.index("function Resolve-VersionInfoVersion")
+    body = text[start : text.index("\n}", start) + 2]
+    probe = tmp_path / "versioninfo.ps1"
+    probe.write_text(
+        f"{body}\nWrite-Output (Resolve-VersionInfoVersion -AppVersion '{app_version}')\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(probe),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout.strip()
+
+
+def test_a_letter_suffix_keeps_the_windows_version_numeric(tmp_path: Path) -> None:
+    """`v1.0.0a` is a build of the 1.0.0 line: the asset is named 1.0.0a, the property says 1.0.0.
+
+    Windows version resources are numeric x.y.z, and the .iss passed the string through
+    unchanged when it carried no hyphen, so the tag that names this release could not build.
+    """
+    assert _run_version_info_version(tmp_path, "1.0.0a") == "1.0.0", (
+        "a letter suffix reached VersionInfoVersion unchanged, which ISCC refuses"
+    )
+
+
+def test_a_gitversion_prerelease_is_still_trimmed_at_the_hyphen(tmp_path: Path) -> None:
+    """The rule the .iss used to own, now in one place and still applied to pre-releases."""
+    assert _run_version_info_version(tmp_path, "1.2.3-feat.4") == "1.2.3"
+
+
+def test_an_ordinary_version_is_passed_through(tmp_path: Path) -> None:
+    assert _run_version_info_version(tmp_path, "1.2.3") == "1.2.3"
+
+
+def test_something_that_is_not_a_version_falls_back_to_zero(tmp_path: Path) -> None:
+    """Resolve-Version already refuses a tag like "legacy"; this is the last line of defence."""
+    assert _run_version_info_version(tmp_path, "legacy") == "0.0.0"
+
+
+def test_the_script_actually_passes_the_numeric_define() -> None:
+    """The .iss falls back to the hyphen rule, so an unpassed define is a silent partial fix."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert '"/DAppVersionNumeric=$versionInfoVersion"' in text, (
+        "build_installer.ps1 derives the numeric version and then does not pass it to ISCC"
+    )
+
+
+def test_the_iss_accepts_the_numeric_define_and_keeps_the_fallback() -> None:
+    """Both halves of the pairing: the override, and the rule it replaces."""
+    iss = (
+        Path(__file__).resolve().parents[1] / "installer" / "synth-installer.iss"
+    ).read_text(encoding="utf-8")
+    assert "#ifndef AppVersionNumeric" in iss
+    assert "VersionInfoVersion={#AppVersionNumeric}" in iss

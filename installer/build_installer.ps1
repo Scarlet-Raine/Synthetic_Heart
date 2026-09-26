@@ -59,7 +59,22 @@ function Resolve-Version {
     return '0.0.0-dev'
 }
 
+function Resolve-VersionInfoVersion {
+    # Windows version resources are numeric x.y.z only, while a build version may
+    # carry a suffix the file properties cannot: "1.0.0a" (a revision of 1.0.0)
+    # or "1.2.3-feat.4" (a GitVersion pre-release). ISCC refuses anything else
+    # with "Value of [Setup] section directive VersionInfoVersion is invalid",
+    # which names the field and never the suffix, so the leading numeric run is
+    # derived here and passed to the .iss explicitly. This script is the single
+    # place that knows the rule.
+    param([string]$AppVersion)
+
+    if ($AppVersion -match '^\d+(\.\d+){1,3}') { return $Matches[0] }
+    return '0.0.0'
+}
+
 $version = Resolve-Version -Explicit $Version
+$versionInfoVersion = Resolve-VersionInfoVersion -AppVersion $version
 $output = Join-Path $PSScriptRoot "Output\SyntH-Setup-$version.exe"
 
 function Find-Iscc {
@@ -103,7 +118,7 @@ Write-Host "  compiler: $iscc"
 Write-Host "  script:   $iss"
 Write-Host ''
 
-& $iscc "/DAppVersion=$version" $iss
+& $iscc "/DAppVersion=$version" "/DAppVersionNumeric=$versionInfoVersion" $iss
 $code = $LASTEXITCODE
 if ($code -ne 0) {
     Write-Host ''

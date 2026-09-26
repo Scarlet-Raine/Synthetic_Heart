@@ -1,3 +1,11 @@
+### fix(install): a version with a letter suffix could not build, so `1.0.0a` never made an installer  <!-- 2026-09-26 -->
+
+**Symptom:** the release tag decides the build's version (`SyntH-Setup-<version>.exe`), and Inno Setup refuses a `VersionInfoVersion` that is not numeric `x.y.z`. The build script's own comment records the first encounter with this ("Passing it on made ISCC fail on VersionInfoVersion - `Value of [Setup] section directive VersionInfoVersion is invalid`"), and `synth-installer.iss` worked around it by trimming at a **hyphen** only. That covers GitVersion's `1.2.3-feat.4` and not a revision like `1.0.0a`, which the tag path feeds straight through: the tag `v1.0.0a` could be pushed and the workflow would start, but the installer job would die on a line of the .iss that is perfectly correct.
+
+**Fix:** the numeric run is derived in one place - `build_installer.ps1::Resolve-VersionInfoVersion` (`^\d+(\.\d+){1,3}`) - and passed to ISCC as `/DAppVersionNumeric=`, which the .iss now prefers through an `#ifndef` guard. The hyphen rule stays as the fallback, so an older caller is unaffected. `AppVersion` keeps the full string everywhere a person sees it: the asset is `SyntH-Setup-1.0.0a.exe`, the installer's title bar and Add/Remove entry read `1.0.0a`, and only the Windows file property is numeric.
+
+**Measured after:** six new tests in `tests/test_installer_build_script.py`, which the suite now runs against the real script under PowerShell: `1.0.0a` -> `1.0.0`, `1.2.3-feat.4` -> `1.2.3`, `1.2.3` unchanged, something that is not a version falls back to `0.0.0`, plus one test per half of the pairing (the script passes the define; the .iss accepts it). 36 pass with the change and 6 of them fail without it.
+
 ### fix(prompt): the upcoming-events block was the third key built every turn and never rendered  <!-- 2026-09-26 -->
 
 **Symptom:** the same shape as the dream and expression blocks fixed above, one key later: `plugins/event_plugin` builds the `upcoming_events` block on every turn ("upcoming events (next N days) (informational only, do not act unless relevant)" plus one line per event), and no renderer consumed the key, so it never reached the model. The plugin's own guide already documented that "upcoming events are injected into the prompt context so Synth stays aware of what's coming".
