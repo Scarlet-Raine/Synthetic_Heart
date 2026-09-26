@@ -1096,8 +1096,9 @@ def _build_current_turn_anchor(context_section: dict[str, Any]) -> str:
 # ``get_static_injection()`` merges a plugin's dict into ``context_section``, but
 # a key is only visible to the model if a renderer consumes it: anything nothing
 # reads is dropped silently. A live Home Assistant block was built on every turn
-# and never reached the prompt that way, and ``upcoming_events``
-# (plugins/event_plugin) is still in that state.
+# and never reached the prompt that way, and the same happened to her dream, the
+# avatar's expression protocol and the upcoming-events block; all three are
+# rendered below now.
 # Add a plugin's key here when its block must appear in the ordinary chat and
 # beat prompt, and pin it in tests/test_plugin_context_blocks.py.
 #
@@ -1120,6 +1121,12 @@ _PLUGIN_CONTEXT_BLOCKS: tuple[tuple[str, str, str | None], ...] = (
     # protocol that drives the avatar's face through the Karada state server.
     ("todays_dream", "[Today's dream]", None),
     ("facial_expression_guidance", "[Facial expressions]", None),
+    # ``upcoming_events`` (plugins/event_plugin) is the third block in that state:
+    # the plugin writes "upcoming events (next N days) (informational only, do not
+    # act unless relevant)", which is addressed to the model, and nothing rendered
+    # it. Its own action path is unaffected; only the ordinary prompt gains the
+    # lines, and only while an event falls inside the lookahead window.
+    ("upcoming_events", "[Upcoming events]", None),
 )
 
 # Injected keys that some renderer already consumes. The drop detector in

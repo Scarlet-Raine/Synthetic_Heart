@@ -1,3 +1,13 @@
+### fix(prompt): the upcoming-events block was the third key built every turn and never rendered  <!-- 2026-09-26 -->
+
+**Symptom:** the same shape as the dream and expression blocks fixed above, one key later: `plugins/event_plugin` builds the `upcoming_events` block on every turn ("upcoming events (next N days) (informational only, do not act unless relevant)" plus one line per event), and no renderer consumed the key, so it never reached the model. The plugin's own guide already documented that "upcoming events are injected into the prompt context so Synth stays aware of what's coming".
+
+**Fix:** declared in `_PLUGIN_CONTEXT_BLOCKS` and rendered under `[Upcoming events]` on the ordinary chat and beat prompts. Vessel turns still drop it (`core/prompt_engine.py::_compact_prompt_for_vessel`).
+
+**Measured after:** `tests/test_plugin_context_blocks.py` - the block renders on both routes, the key is declared and considered rendered, and the drop-detector test now uses only a synthetic key. Dormant in her store today (the `scheduled_events` table is empty, so the plugin correctly returns `{}`), which is why this could not be observed live.
+
+**Notes:** with this, every key the drop detector ever named is rendered. Two pre-existing failures remain in `tests/test_event_static_injection.py` (they fail at HEAD too): the fixture builds the plugin with `object.__new__` and hands `_fetch_upcoming_event_rows` two synthetic rows, and the block path returns `{}` before the collector, so the producer half of this block is not currently covered by a passing test.
+
 ### fix(prompt): her dream and the avatar's expression protocol were built on every turn and silently dropped  <!-- 2026-09-26 -->
 
 **Symptom (live):** every prompt build logged `injected context keys with no renderer, so they never reach the prompt: ['todays_dream']`, and after 12:00 the same warning named `['facial_expression_guidance']`. Both blocks were built on every turn; neither reached the model.

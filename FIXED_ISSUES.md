@@ -6,6 +6,12 @@
 ---
 
 
+### The upcoming-events block was built every turn and never rendered  <!-- 2026-09-26 -->
+**Symptom:** `plugins/event_plugin` produced the `upcoming_events` block every turn and the model never saw it - the last of the three keys the drop detector named, after `todays_dream` and `facial_expression_guidance`.
+**Location:** `core/prompt_engine.py` (`_PLUGIN_CONTEXT_BLOCKS`); `plugins/event_plugin/event_plugin.py::get_static_injection`.
+**Status:** fixed (2026-09-26).
+**Notes:** the block is preformatted text addressed to the model ("informational only, do not act unless relevant"), and the plugin's guide already claimed it reached the prompt. Declared it in the block table so it renders under `[Upcoming events]` on the chat/beat prompts; vessel turns still drop it. Live impact today is nil because her `scheduled_events` table is empty and the plugin correctly returns `{}`; the change matters the first time she schedules something. **Tests:** `tests/test_plugin_context_blocks.py` (renders on both routes, declared, detector clean). **Related:** the producer's own tests, `tests/test_event_static_injection.py`, fail at HEAD (2 of 3) - the fixture's synthetic rows reach the block path but produce no occurrences, so nothing pins the producer half today.
+
 ### Her dream and the avatar's expression protocol were built every turn and silently dropped  <!-- 2026-09-26 -->
 **Symptom:** every prompt build logged `injected context keys with no renderer, so they never reach the prompt: ['todays_dream']`, later the same warning named `['facial_expression_guidance']`. She never saw her own dream, and the model never learned the `[em_NAME:intensity]` tag protocol that drives the avatar's face - the face only moved when `emotion_manager` set it.
 **Location:** `core/prompt_engine.py` (`_PLUGIN_CONTEXT_BLOCKS`, the table both prompt renderers read, and the drop detector above it); `plugins/grillo/grillo_dream/grillo_dream.py` (`_fetch_todays_dream`, `_fetch_last_dream`).

@@ -96,7 +96,7 @@ def test_drop_detector_names_keys_with_no_renderer():
             "some_plugin_key_nobody_renders",
         }
     )
-    assert unrendered == ["some_plugin_key_nobody_renders", "upcoming_events"]
+    assert unrendered == ["some_plugin_key_nobody_renders"]
     assert _unrendered_injection_keys({"home", "memories", "location"}) == []
     assert _unrendered_injection_keys(None) == []
 
@@ -137,8 +137,36 @@ def test_dream_and_facial_blocks_are_declared_and_considered_rendered():
     keys = [key for key, _heading, _legacy in _PLUGIN_CONTEXT_BLOCKS]
     assert "todays_dream" in keys
     assert "facial_expression_guidance" in keys
+    assert "upcoming_events" in keys
     assert (
         _unrendered_injection_keys({"todays_dream", "facial_expression_guidance"}) == []
+    )
+    assert _unrendered_injection_keys({"upcoming_events"}) == []
+
+
+def test_upcoming_events_block_renders_on_chat_and_beat_routes():
+    # The event plugin writes this block "informational only, do not act unless
+    # relevant" - it is addressed to the model.
+    block = (
+        "upcoming events (next 3 days) (informational only, do not act unless relevant):\n"
+        "- 2026-09-27 10:00 - dentist appointment"
+    )
+    for is_grillo_internal in (False, True):
+        summary = _build_context_summary(
+            {"upcoming_events": block, "date": "2026-09-26"},
+            is_grillo_internal=is_grillo_internal,
+        )
+        assert "[Upcoming events]" in summary
+        assert "dentist appointment" in summary
+
+
+def test_every_injected_plugin_block_is_now_rendered():
+    # The detector's live warning named exactly three keys; all three are declared.
+    assert (
+        _unrendered_injection_keys(
+            {"todays_dream", "facial_expression_guidance", "upcoming_events"}
+        )
+        == []
     )
 
 
