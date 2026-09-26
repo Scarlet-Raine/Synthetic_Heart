@@ -2181,11 +2181,6 @@ async def handle_incoming_message(
                         "response",
                     )
                     if ctx_interface_path:
-                        interface_prefix = (
-                            ctx_interface_path.split("/")[0]
-                            if "/" in ctx_interface_path
-                            else ctx_interface_path
-                        )
                         # A generic message action emitted during a Vessel
                         # embodiment turn must be spoken IN-WORLD, not routed to
                         # the WebUI fallback. The resolver returns
@@ -2194,9 +2189,18 @@ async def handle_incoming_message(
                         # Without this, a generic "message_send" is misrouted to
                         # message_synth_webui and the in-world player never hears
                         # the reply.
-                        resolved_message_type = (
+                        #
+                        # The action type resolves per action: from the path THAT
+                        # action targets, then from the turn's own path. A generic
+                        # action that already carries an explicit
+                        # ``interface_path`` in its payload must be typed after it
+                        # (an observer beat targets a chat that is not its own
+                        # origin), and a turn whose origin resolves to no chat
+                        # interface keeps the unified ``send_message`` instead of
+                        # being relabelled as a WebUI action it never was.
+                        default_message_type = (
                             _resolve_message_action_for_path(ctx_interface_path)
-                            or "message_synth_webui"
+                            or "send_message"
                         )
                         rewrote_generic_message_action = False
                         for act in actions:
@@ -2204,6 +2208,16 @@ async def handle_incoming_message(
                                 isinstance(act, dict)
                                 and act.get("type") in _GENERIC_MSG_TYPES
                             ):
+                                act_payload = act.get("payload")
+                                act_path = (
+                                    act_payload.get("interface_path")
+                                    if isinstance(act_payload, dict)
+                                    else None
+                                )
+                                resolved_message_type = (
+                                    _resolve_message_action_for_path(act_path)
+                                    or default_message_type
+                                )
                                 act["type"] = resolved_message_type
                                 rewrote_generic_message_action = True
 

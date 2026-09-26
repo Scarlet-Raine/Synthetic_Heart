@@ -1388,6 +1388,7 @@ class ConfigRegistry:
         # This avoids exhausting the DB pool during startup when many components
         # are initializing concurrently.
         config_rows: Dict[str, str] = {}
+        store_readable = False
         try:
             from core.db import get_conn_ctx, ensure_core_tables
 
@@ -1399,6 +1400,7 @@ class ConfigRegistry:
                     config_rows = {
                         row[0]: row[1] for row in rows if row and len(row) >= 2
                     }
+            store_readable = True
         except Exception as exc:
             log_warning(f"[config] Failed to batch-load config from DB: {exc}")
 
@@ -1472,6 +1474,19 @@ class ConfigRegistry:
                 else:
                     # Use default value if not in DB. Avoid persisting defaults here to keep
                     # startup light on DB writes; defaults can be persisted later via UI edits.
+                    if store_readable:
+                        # The store answered and this key has no row: it is on its
+                        # default because it was never stored, not because it could
+                        # not be read. Dropping it from the pending set keeps the
+                        # end-of-pass warning meaningful - without this, every key
+                        # that was read before the store was up and never persisted
+                        # stayed "pinned to default" forever, and the warning grew
+                        # to 133 keys that were all behaving correctly.
+                        if self._deferred_keys.pop(definition.key, None) is not None:
+                            log_debug(
+                                f"[config] '{definition.key}' has no stored value; "
+                                "keeping its default"
+                            )
                     if not definition.loaded:
                         definition.value = definition.default
                         definition.raw_value = self._serialize_value(

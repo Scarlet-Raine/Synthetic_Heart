@@ -18,10 +18,22 @@ instead of only ever replying.
 
 On each run the plugin looks at conversations active within
 `GRILLO_OBSERVER_ACTIVITY_WINDOW_DAYS` and builds snippets from the human lines
-in them (the synth's own lines are never surfaced as snippets). Proactive
-outreach is then governed by exactly one gate: **a live conversation**. A chat
-whose most recent message — from the human *or* from the synth — is younger than
-`GRILLO_OUTREACH_QUIET_MINUTES` is marked `LIVE-CONVERSATION` and skipped for
+in them (the synth's own lines are never surfaced as reply targets). A human line
+is offered as a **reply target** only while the conversation is still pending: a
+chat that is *live* (some message younger than `GRILLO_OUTREACH_QUIET_MINUTES`)
+**and** already answered (the synth's own newest line is newer than the newest
+line from anyone else) contributes its lines as **context** instead, tagged
+`you already answered this, not a reply target`. Those lines are rendered into
+the prompt but never enter `grillo_snippets`, so the routing guard cannot route a
+reply into a conversation that is already up to date — the failure mode being a
+beat "answering" a line the synth had just replied to and, in the reported case,
+re-sending its own previous reply verbatim. An answered but *idle* chat still
+offers its human lines: reaching out there later with something new is what the
+run is for, and delivery is protected separately (below).
+
+Proactive outreach is governed by exactly one gate: **a live conversation**. A
+chat whose most recent message — from the human *or* from the synth — is younger
+than `GRILLO_OUTREACH_QUIET_MINUTES` is marked `LIVE-CONVERSATION` and skipped for
 that run. Every other conversation is offered to the model, and reaching out to
 one of them is what the run is for: what has to be genuine is the *content*
 (a new, grounded message — never a canned opener, never a restatement of its own
@@ -32,6 +44,13 @@ everything is the newest speaker in every chat it takes part in, so any "you
 spoke last, stay away" rule would silence outreach permanently. Cadence belongs
 to `GRILLO_OBSERVER_INTERVAL`; the last run is tracked in
 `GRILLO_OBSERVER_LAST_RUN_TS`. Discovery is automatic via the plugin registry.
+
+Independently of where a snippet came from, `message_plugin` refuses at delivery
+any beat message whose text repeats the synth's own recent line in that chat
+(`GRILLO_DUP_SIMILARITY_THRESHOLD`), for every beat type and every chat type,
+private DMs included. Outbound beats stay exempt from the *public-chat* gates —
+reaching out is their purpose — but never from that repeat gate: a duplicate is a
+duplicate wherever it lands.
 
 Freshness is judged in wall-clock terms, not against the last-run cursor. A run
 that finds a message newer than its cursor but older than one full interval is

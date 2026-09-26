@@ -189,6 +189,43 @@ def _should_cancel_low_priority_on_user_message(context: object) -> bool:
     )
 
 
+def _is_beat_message(context: object) -> bool:
+    """Return True when a queued message is a Grillo beat, not a user message.
+
+    A beat must never pre-empt another beat. The diary consolidator and the
+    observer beat both run on ``grillo/-1`` seconds apart, and the observer's
+    arrival used to cancel the consolidator mid model call: observed live, the
+    consolidation was cancelled ~12s in on every run, so the day was never
+    merged and its ``update_diary_entry`` never ran. Only a real user message
+    pre-empts a running background beat.
+    """
+    if not isinstance(context, dict):
+        return False
+    context_dict = cast(dict[str, object], context)
+    return bool(context_dict.get("grillo_beat"))
+
+
+def _should_cancel_background_task(
+    entry: object,
+    *,
+    context: object,
+) -> bool:
+    """Whether an incoming item should cancel a running background task.
+
+    Three conditions, all structural: the task must be flagged cancellable, it
+    must still be running, and the incoming item must be a real user message —
+    a Grillo beat never pre-empts another Grillo beat (see ``_is_beat_message``).
+    """
+    if entry is None:
+        return False
+    task = getattr(entry, "task", None)
+    if task is None or getattr(task, "done", lambda: True)():
+        return False
+    if not bool(getattr(entry, "cancel_on_user_message", False)):
+        return False
+    return not _is_beat_message(context)
+
+
 def _extract_grillo_activity_log_id(message: object) -> int | None:
     """Recover a Grillo activity id from a synthetic message id when needed."""
     message_id = getattr(message, "message_id", None)
@@ -1923,6 +1960,14 @@ async def _consumer_loop() -> None:
                             )
 
                     try:
+                        # A Grillo beat must never pre-empt another Grillo beat:
+                        # they share the ``grillo/-1`` path, and cancelling the
+                        # in-flight one silently discards its model call (the
+                        # diary consolidator was cancelled by the observer beat
+                        # on every run, so its day was never merged). Only a real
+                        # user message pre-empts a running background beat.
+                        _incoming_is_beat = _is_beat_message(context)
+
                         # Cancel any running LOW_PRIORITY background task for the
                         # same interface_path IMMEDIATELY — before any event-loop
                         # yields — so the Grillo task cannot make further progress
@@ -1933,9 +1978,10 @@ async def _consumer_loop() -> None:
                             _bg_tasks.pop(interface_path, None)
                             _existing_bg = None
                         if (
-                            _existing_bg is not None
-                            and _existing_bg.cancel_on_user_message
-                            and not _existing_bg.task.done()
+                            _should_cancel_background_task(
+                                _existing_bg, context=context
+                            )
+                            and _existing_bg is not None
                         ):
                             _bg_tasks.pop(interface_path, None)
                             _existing_bg.task.cancel()
@@ -1951,7 +1997,9 @@ async def _consumer_loop() -> None:
                         # handle_incoming_message. Direct user requests always
                         # take priority over background Grillo beats.
                         for _gk in [
-                            k for k in list(_bg_tasks) if k.startswith("grillo/")
+                            k
+                            for k in list(_bg_tasks)
+                            if k.startswith("grillo/") and not _incoming_is_beat
                         ]:
                             _gt = _bg_tasks.get(_gk)
                             if _gt is not None and _gt.task.done():

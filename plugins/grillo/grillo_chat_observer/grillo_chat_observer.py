@@ -653,14 +653,52 @@ class GrilloChatObserverPlugin:
             f"not a reply target) {snippet}"
         )
 
+    @classmethod
+    def _render_answered_line(
+        cls, chat_path: str, sender: str, text: Any, timestamp: Any
+    ) -> str:
+        """Render a line the synth has ALREADY answered as CONTEXT, not a target.
+
+        Same tag shape as every other snippet, plus the fact a small model gets
+        wrong about a conversation it just handled: that this line is already
+        answered, so there is nothing left to reply to here. Whether a chat
+        counts as answered is decided structurally by the caller, from message
+        timestamps (the synth's newest line is newer than the newest line from
+        the other person) together with the live-conversation window — never
+        from message text.
+
+        Live 2026-09-25 04:31: the DM had been answered two minutes earlier, the
+        beat was still handed the human's line as a reply target, and it re-sent
+        the synth's own previous reply verbatim into Telegram. Lines rendered
+        here never enter ``snippets``/``grillo_snippets``, so a reply aimed at
+        them is dropped as misrouted instead of being delivered twice.
+        """
+        snippet = " ".join(str(text or "").split())
+        if len(snippet) > 300:
+            snippet = snippet[:300] + "..."
+        age_label = cls._relative_age_label(timestamp)
+        return (
+            f"(chat:{chat_path} | sender:{sender} | {age_label} | you already "
+            f"answered this, not a reply target) {snippet}"
+        )
+
     async def _collect_recent_snippets(self, limit: int) -> tuple[List[str], List[str]]:
-        """Collect ``(snippets from other people, the synth's own recent lines)``.
+        """Collect ``(snippets from other people, context lines)``.
 
         The two lists are deliberately separate. ``snippets`` is what the beat may
         answer and what ``grillo_snippets`` carries into the routing guard; the
-        second is context only — what the conversation already holds from the
-        synth's side — and is rendered into the prompt without ever widening the
-        set of reachable chats.
+        second is context only — what each conversation already holds, from the
+        synth's side and from lines it has already answered — and is rendered
+        into the prompt without ever widening the set of reachable chats.
+
+        A chat counts as *already answered* when the synth's own newest line is
+        newer than the newest line from anyone else there, and as *live* while
+        any message in it is younger than ``GRILLO_OUTREACH_QUIET_MINUTES``. In
+        that combination — the conversation is happening right now and the synth
+        has already replied to it — the other person's lines are context, not
+        reply targets: the synth has nothing pending there, and the live-guard
+        that keeps proactive outreach out of a live chat applies to snippet
+        replies too.
         """
         snippets: List[str] = []
         own_lines: List[str] = []
@@ -679,6 +717,10 @@ class GrilloChatObserverPlugin:
             # were observed in a live outreach prompt, which reads as a broken
             # memory context (and invites the model to reply to ancient lines).
             activity_cutoff = now - timedelta(days=self.activity_window_days)
+            # Same live-conversation window the eligible-target builder uses: any
+            # message younger than this means the chat is being spoken in right
+            # now.
+            quiet_cutoff = now - timedelta(minutes=self.quiet_minutes)
 
             recent = await get_recent_interface_paths(limit * 2)
             for item in recent:
@@ -721,6 +763,12 @@ class GrilloChatObserverPlugin:
                     # will talk to itself (self-reply spam).
                     taken = 0
                     own_line: Optional[str] = None
+                    # Other people's renderable lines for this chat, kept until
+                    # the timestamps say whether the chat is answered.
+                    chat_lines: List[tuple[str, Any, str]] = []
+                    newest_other_ts: Optional[datetime] = None
+                    newest_self_ts: Optional[datetime] = None
+                    newest_any_ts: Optional[datetime] = None
                     for msg in reversed(list(messages)):
                         if not isinstance(msg, dict):
                             continue
@@ -728,6 +776,12 @@ class GrilloChatObserverPlugin:
                         sender = (
                             msg.get("sender_name") or msg.get("sender_id") or "unknown"
                         )
+                        timestamp = msg.get("timestamp") or ""
+                        msg_ts = self._parse_ts(timestamp)
+                        if msg_ts is not None and (
+                            newest_any_ts is None or msg_ts > newest_any_ts
+                        ):
+                            newest_any_ts = msg_ts
                         if self._is_self_sender(sender):
                             # The synth's OWN most recent line in this chat is
                             # kept, but as context: a beat handed only the
@@ -740,30 +794,62 @@ class GrilloChatObserverPlugin:
                             # reachable paths, and a chat the human never spoke
                             # in must not become reachable through the synth's
                             # own line.
+                            if msg_ts is not None and (
+                                newest_self_ts is None or msg_ts > newest_self_ts
+                            ):
+                                newest_self_ts = msg_ts
                             if own_line is None and text:
                                 own_line = self._render_own_line(
-                                    chat_path, text, msg.get("timestamp") or ""
+                                    chat_path, text, timestamp
                                 )
                             continue
-                        timestamp = msg.get("timestamp") or ""
-                        # Relative-age annotation. A bare ISO timestamp is
-                        # invisible-as-old to a small model, so it treats a
-                        # days-old line as the current moment and continues it
-                        # (see AGENTS.md §12 staleness note). Tagging each
-                        # snippet with how long ago it was said lets the model
-                        # judge staleness itself — no hard age gate, so outreach
-                        # always has context behind it.
                         if text:
-                            snippet = text.strip()
+                            if msg_ts is not None and (
+                                newest_other_ts is None or msg_ts > newest_other_ts
+                            ):
+                                newest_other_ts = msg_ts
+                            chat_lines.append((sender, timestamp, text.strip()))
+                            taken += 1
+                        if taken >= 2 or len(snippets) >= limit:
+                            break
+                    if chat_lines:
+                        # Structural decision, from timestamps only: the synth
+                        # has the last word here (``answered``) while the chat is
+                        # still being spoken in (``live``) => there is nothing
+                        # pending to answer, so these lines are context and never
+                        # reply targets. An answered but idle chat keeps its
+                        # human lines as replyable snippets: reaching out there
+                        # later with something new is the beat's purpose, and a
+                        # repeat of the synth's own last line is caught at
+                        # delivery (``GRILLO_DUP_SIMILARITY_THRESHOLD``).
+                        answered = newest_self_ts is not None and (
+                            newest_other_ts is None or newest_self_ts > newest_other_ts
+                        )
+                        live = (
+                            newest_any_ts is not None and newest_any_ts > quiet_cutoff
+                        )
+                        for sender, timestamp, raw_text in chat_lines:
+                            if answered and live and len(own_lines) < limit:
+                                own_lines.append(
+                                    self._render_answered_line(
+                                        chat_path, sender, raw_text, timestamp
+                                    )
+                                )
+                                continue
+                            # Relative-age annotation. A bare ISO timestamp is
+                            # invisible-as-old to a small model, so it treats a
+                            # days-old line as the current moment and continues it
+                            # (see AGENTS.md §12 staleness note). Tagging each
+                            # snippet with how long ago it was said lets the model
+                            # judge staleness itself — no hard age gate, so outreach
+                            # always has context behind it.
+                            snippet = raw_text
                             if len(snippet) > 300:
                                 snippet = snippet[:300] + "..."
                             age_label = self._relative_age_label(timestamp)
                             snippets.append(
                                 f"(chat:{chat_path} | sender:{sender} | {age_label}) {snippet}"
                             )
-                            taken += 1
-                        if taken >= 2 or len(snippets) >= limit:
-                            break
                     if own_line and len(own_lines) < limit:
                         own_lines.append(own_line)
                 except Exception:
@@ -1004,7 +1090,10 @@ class GrilloChatObserverPlugin:
             "actions that would be genuinely helpful right now. "
             "A snippet whose sender is `self` is YOUR OWN earlier line in that chat: it is there "
             "so you can see where the conversation stands, it is what YOU said (not the other "
-            "person's words), and it is never a message to reply to."
+            "person's words), and it is never a message to reply to. "
+            "A snippet tagged `you already answered this` is the other person's line in a chat "
+            "you have ALREADY replied to just now: it is context for where that conversation "
+            "stands, not something to answer again — the conversation is up to date."
         )
 
         body = "\n\nSnippets:\n"

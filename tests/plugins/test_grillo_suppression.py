@@ -179,3 +179,195 @@ def test_observer_prompt_avoids_duplicates():
         ["(chat:telegram_bot/-100123/2 | sender:alice | 2026-02-10T00:00:00Z) Hello"]
     )
     assert "Do NOT propose messages that are conceptually duplicate" in prompt
+
+
+_OWN_LAST_LINE = (
+    "*I take the bottle with both hands like it's a trophy and drink half of it "
+    "in one go, which I will regret in about ninety seconds and don't care about "
+    "at all right now.*"
+)
+
+
+def _beats_with_own_last_line(monkeypatch, *, extra_rows=None):
+    """Point the delivery gates at a chat whose last synth line is known."""
+
+    async def fake_load_chat_history(path):
+        return [
+            {
+                "sender_name": "Scar",
+                "sender_id": "5208932647",
+                "text": "hands you the bottle, drink up sweetie",
+                "timestamp": "2026-09-25T04:29:11+00:00",
+            },
+            {
+                "sender_name": "self",
+                "sender_id": "self",
+                "text": _OWN_LAST_LINE,
+                "timestamp": "2026-09-25T04:29:22+00:00",
+            },
+        ] + list(extra_rows or [])
+
+    monkeypatch.setattr(
+        "core.chat_history_cache.load_chat_history", fake_load_chat_history
+    )
+
+
+@pytest.mark.asyncio
+async def test_observer_repeat_of_own_last_line_is_suppressed(monkeypatch):
+    """An outbound beat must never re-deliver the synth's own previous line.
+
+    Live 2026-09-25 04:31: the observer beat re-sent, byte for byte, the reply
+    the normal turn had produced two minutes earlier — into the same private
+    Telegram DM. Outbound beats are exempt from the last-from-synth gate
+    (reaching out is their purpose), and private chats are exempt too, so nothing
+    stopped it; the repeat gate is scoped to cover exactly this combination.
+    """
+    handler = DummyHandler()
+    from core.core_initializer import INTERFACE_REGISTRY
+
+    INTERFACE_REGISTRY["telegram_bot"] = handler
+
+    _beats_with_own_last_line(monkeypatch)
+
+    reasons: list[str] = []
+
+    class DummyGrillo:
+        @classmethod
+        async def set_activity_response_text(
+            cls, activity_log_id, response_text, append=True
+        ):
+            pass
+
+        @classmethod
+        async def record_suppressed_event(cls, activity_log_id=None, reason=""):
+            reasons.append(reason)
+
+    monkeypatch.setattr("plugins.grillo.grillo_impl.GrilloPlugin", DummyGrillo)
+
+    plugin = MessagePlugin()
+    action = {
+        "type": "message_synth_webui",
+        "payload": {
+            "text": _OWN_LAST_LINE,
+            "interface_path": "telegram_bot/5208932647",
+        },
+    }
+
+    await plugin._handle_message_action(
+        action,
+        {"grillo_beat": True, "beat_type": "observer", "activity_log_id": 2028},
+        bot=None,
+        original_message=None,
+    )
+
+    assert handler.sent == [], "a repeat of the synth's own last line must not be sent"
+    assert any("repeat of own last line" in r for r in reasons), reasons
+
+
+@pytest.mark.asyncio
+async def test_observer_new_outreach_still_goes_out(monkeypatch):
+    """Genuinely new outreach into the same private chat is untouched."""
+    handler = DummyHandler()
+    from core.core_initializer import INTERFACE_REGISTRY
+
+    INTERFACE_REGISTRY["telegram_bot"] = handler
+
+    _beats_with_own_last_line(monkeypatch)
+
+    class DummyGrillo:
+        @classmethod
+        async def set_activity_response_text(
+            cls, activity_log_id, response_text, append=True
+        ):
+            pass
+
+        @classmethod
+        async def record_suppressed_event(cls, activity_log_id=None, reason=""):
+            pass
+
+    monkeypatch.setattr("plugins.grillo.grillo_impl.GrilloPlugin", DummyGrillo)
+
+    plugin = MessagePlugin()
+    action = {
+        "type": "message_synth_webui",
+        "payload": {
+            "text": "Sweetheart, the sun is up and I still owe you an answer.",
+            "interface_path": "telegram_bot/5208932647",
+        },
+    }
+
+    await plugin._handle_message_action(
+        action,
+        {"grillo_beat": True, "beat_type": "observer", "activity_log_id": 2028},
+        bot=None,
+        original_message=None,
+    )
+
+    assert len(handler.sent) == 1
+    assert handler.sent[0]["text"].startswith("Sweetheart")
+
+
+@pytest.mark.asyncio
+async def test_repeat_gate_ignores_the_human_words(monkeypatch):
+    """A beat echoing what the HUMAN just said is not a repeat.
+
+    The gate compares only against rows the synth itself authored, so legitimate
+    outreach that picks up the other person's phrasing is never suppressed.
+    """
+    handler = DummyHandler()
+    from core.core_initializer import INTERFACE_REGISTRY
+
+    INTERFACE_REGISTRY["telegram_bot"] = handler
+
+    human_line = (
+        "I put the bottle down on the night stand next to your hand and tell you "
+        "to drink some water before you fall asleep on me again"
+    )
+
+    _beats_with_own_last_line(
+        monkeypatch,
+        extra_rows=[
+            {
+                "sender_name": "Scar",
+                "sender_id": "5208932647",
+                "text": human_line,
+                "timestamp": "2026-09-25T04:30:00+00:00",
+            }
+        ],
+    )
+
+    class DummyGrillo:
+        @classmethod
+        async def set_activity_response_text(
+            cls, activity_log_id, response_text, append=True
+        ):
+            pass
+
+        @classmethod
+        async def record_suppressed_event(cls, activity_log_id=None, reason=""):
+            pass
+
+    monkeypatch.setattr("plugins.grillo.grillo_impl.GrilloPlugin", DummyGrillo)
+
+    plugin = MessagePlugin()
+    action = {
+        "type": "message_synth_webui",
+        "payload": {
+            # Echoes the human's words, says nothing the synth already said.
+            "text": (
+                "I put the bottle down on the night stand next to your hand and "
+                "tell you to drink some water before you fall asleep on me again "
+                "- and then I will, I promise."
+            ),
+            "interface_path": "telegram_bot/5208932647",
+        },
+    }
+
+    await plugin._handle_message_action(
+        action,
+        {"grillo_beat": True, "beat_type": "observer", "activity_log_id": 2028},
+        bot=None,
+        original_message=None,
+    )
+
+    assert len(handler.sent) == 1

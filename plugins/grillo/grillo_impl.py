@@ -60,6 +60,17 @@ class GrilloPlugin(AIPluginBase):
         return {}
 
     async def start(self):
+        # One Grillo startup per process. The plugin is started from more than one
+        # place (the loader's async queue, then CoreInitializer's explicit start),
+        # and everything below - beat discovery, the recovery loop, the scheduler
+        # task - is a once-per-process job. Only the scheduler used to be guarded,
+        # so every extra call logged "starting lightweight scheduler" and built
+        # another recovery plugin: that is how four recovery loops came to run at
+        # boot and recover the same failure four times.
+        if GrilloPlugin._scheduler_task and not GrilloPlugin._scheduler_task.done():
+            log_debug("[grillo] scheduler already running")
+            return
+
         self._running = True
         log_info("[grillo] starting lightweight scheduler")
         # Try to locate history_evaluator if available
@@ -90,15 +101,12 @@ class GrilloPlugin(AIPluginBase):
         try:
             from .grillo_llm_failure_recovery import GrilloLLMFailureRecoveryPlugin
 
-            self.recovery_plugin = GrilloLLMFailureRecoveryPlugin()
+            if getattr(self, "recovery_plugin", None) is None:
+                self.recovery_plugin = GrilloLLMFailureRecoveryPlugin()
             await self.recovery_plugin.start()
             log_info("[grillo] LLM-failure recovery plugin started")
         except Exception as e:
             log_warning(f"[grillo] Failed to start recovery plugin: {e}")
-
-        if GrilloPlugin._scheduler_task and not GrilloPlugin._scheduler_task.done():
-            log_debug("[grillo] scheduler already running")
-            return
 
         GrilloPlugin._scheduler_running = True
         GrilloPlugin._scheduler_task = asyncio.create_task(self._grillo_beat_loop())

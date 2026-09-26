@@ -129,6 +129,52 @@ def test_failed_sweep_keeps_the_key_deferred(monkeypatch):
     assert "BROKEN" in reg._deferred_keys
 
 
+def test_sweep_clears_a_deferred_key_that_has_no_stored_row(monkeypatch):
+    """A deferred key with no stored row is not a read failure.
+
+    It is on its default because it was never persisted. Leaving it in the
+    deferred set made the end-of-sweep warning call it "pinned because the store
+    could not be read" for the rest of the process: live, that warning grew to 133
+    keys by mid-boot and every one of them was behaving correctly.
+    """
+    monkeypatch.setattr(config_manager, "_last_full_load_monotonic", None)
+    _fake_db(monkeypatch, [("DECLARED", "stored-value")])
+    reg = ConfigRegistry()
+    reg._definitions = {"DECLARED": _def("DECLARED"), "UNSTORED": _def("UNSTORED")}
+    reg._schedule_deferred_retry = lambda: None  # type: ignore[method-assign]
+
+    async def read_inside_loop():
+        return reg.get_value("UNSTORED", "code-default")
+
+    assert asyncio.run(read_inside_loop()) == "code-default"
+    assert "UNSTORED" in reg._deferred_keys
+
+    asyncio.run(reg.load_all_from_db(force=True))
+
+    assert reg.get_value("UNSTORED", "code-default") == "code-default"
+    assert "UNSTORED" not in reg._deferred_keys
+    # The key that does have a stored row still recovers its value.
+    assert reg.get_value("DECLARED", "code-default") == "stored-value"
+
+
+def test_failed_sweep_keeps_an_unstored_key_deferred(monkeypatch):
+    """When the read itself failed, a default proves nothing, so nothing is cleared."""
+    monkeypatch.setattr(config_manager, "_last_full_load_monotonic", None)
+    _fake_db(monkeypatch, [], fail=True)
+    reg = ConfigRegistry()
+    reg._definitions = {"UNSTORED": _def("UNSTORED")}
+    reg._schedule_deferred_retry = lambda: None  # type: ignore[method-assign]
+
+    async def read_inside_loop():
+        return reg.get_value("UNSTORED", "code-default")
+
+    assert asyncio.run(read_inside_loop()) == "code-default"
+
+    asyncio.run(reg.load_all_from_db(force=True))
+
+    assert "UNSTORED" in reg._deferred_keys
+
+
 def test_get_persisted_value_falls_back_to_default(monkeypatch):
     _fake_db(monkeypatch, [], fail=True)
     reg = ConfigRegistry()

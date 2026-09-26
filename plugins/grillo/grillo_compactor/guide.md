@@ -29,6 +29,31 @@ skips clusters below the minimum size, summarizes each with the Grillo cortex
 (bounded by the max-chars/ratio limits), then archives and replaces them.
 Discovery is automatic via the plugin registry.
 
+The **day-unit pass** (`GRILLO_COMPACT_DAY_UNITS`, default on) is what a normal
+run uses: one diary day in, one memory out. Clustering stays available by turning
+that key off.
+
+## Reliability rules worth knowing
+
+- **The `emotion` label is bounded.** The compactor writes the model's
+  `feeling` into `memories.emotion`. Long-lived stores may still declare that
+  column `varchar(50)` while the schema in `scripts/sql/app_main_postgres.sql`
+  says `TEXT`, so the label is trimmed at the narrowest declared width by
+  `_bound_emotion` and the **full** feeling is kept in
+  `archived_memories.notes["feeling"]`. A cosmetic label must never be able to
+  fail a whole day's write. The startup migration
+  `core/migrations.py::_widen_memories_text_columns` aligns such a store with
+  the declared schema on the next boot (idempotent, fail-open, and it only
+  widens columns it measured as bounded).
+- **A day that already failed is done for the night.** Only `persisted` clears a
+  day; `write_failed`, `anchors_failed`, `no_compression`, `kept_raw` and
+  `unparseable` all leave the day exactly as it was, so the remaining cycles do
+  not pay for the same answer again. The set is cleared at the start of the
+  nightly run and of a manual `compact_now`.
+- **A failed write never loses the day.** The memory row is written first and
+  the day is only archived and removed afterwards, so a failure leaves the raw
+  day in `ai_diary` (the day is then retried on the following night).
+
 ## Configuration
 
 | Key | Purpose |

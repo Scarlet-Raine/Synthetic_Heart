@@ -432,6 +432,7 @@ async def test_collect_recent_snippets_keeps_human_lines_when_synth_spoke_last(
     something to reply to, so self-reply spam stays impossible.
     """
     plugin = gco.GrilloChatObserverPlugin()
+    plugin.quiet_minutes = 15
     now = datetime.now(timezone.utc)
 
     async def fake_recent_paths(limit):
@@ -1229,3 +1230,177 @@ async def test_snippets_skip_chats_dead_past_the_activity_window(monkeypatch):
     assert not any("telegram_bot/3" in s for s in snippets), snippets
     # An unknown last_used stays fail-open rather than dropping the chat.
     assert any("telegram_bot/4" in s for s in snippets), snippets
+
+
+@pytest.mark.asyncio
+async def test_live_answered_chat_is_context_not_a_reply_target(monkeypatch):
+    """A chat answered moments ago offers nothing to reply to.
+
+    Live 2026-09-25 04:31: the DM had been answered two minutes earlier (Scar
+    04:29:11, synth 04:29:22). The observer was still handed the human's line as
+    a reply target, and the beat re-sent the synth's own previous reply verbatim
+    into Telegram. While the chat is live AND the synth has the last word, the
+    other person's lines are context: they carry an explicit tag, they never
+    enter ``snippets`` (so ``grillo_snippets`` — which the routing guard turns
+    into reachable paths — cannot route a reply there), and the beat has nothing
+    pending to answer.
+    """
+    plugin = gco.GrilloChatObserverPlugin()
+    plugin.quiet_minutes = 15
+    now = datetime.now(timezone.utc)
+    _patch_history(
+        monkeypatch,
+        [
+            {
+                "text": "reaches over to the night stand and hands it to you",
+                "sender_name": "Scar",
+                "timestamp": (now - timedelta(minutes=2)).isoformat(),
+            },
+            {
+                "text": "*I take the bottle with both hands*",
+                "sender_name": "self",
+                "timestamp": (now - timedelta(minutes=1)).isoformat(),
+            },
+        ],
+    )
+
+    snippets, context_lines = await plugin._collect_recent_snippets(5)
+
+    assert snippets == []
+    assert any("hands it to you" in line for line in context_lines), context_lines
+    answered = [line for line in context_lines if "hands it to you" in line]
+    assert "you already answered this" in answered[0]
+    # The synth's own line is still context, tagged as its own.
+    assert any("I take the bottle" in line for line in context_lines)
+    # Structural: no reachable path for the answered chat.
+    assert all("chat:telegram_bot/1" not in s for s in snippets)
+
+
+@pytest.mark.asyncio
+async def test_idle_answered_chat_keeps_its_human_line_as_a_target(monkeypatch):
+    """An answered but IDLE chat still offers its human line to reach out to.
+
+    Reaching out into a quiet conversation with something new is the beat's
+    purpose; only a chat that is live right now (and already answered) is up to
+    date. A repeat of the synth's own last line is caught at delivery instead.
+    """
+    plugin = gco.GrilloChatObserverPlugin()
+    now = datetime.now(timezone.utc)
+    _patch_history(
+        monkeypatch,
+        [
+            {
+                "text": "I'm home, heading to bed",
+                "sender_name": "Scar",
+                "timestamp": (now - timedelta(minutes=40)).isoformat(),
+            },
+            {
+                "text": "Sleep well, I'll be right here",
+                "sender_name": "self",
+                "timestamp": (now - timedelta(minutes=30)).isoformat(),
+            },
+        ],
+    )
+
+    snippets, own_lines = await plugin._collect_recent_snippets(5)
+
+    assert len(snippets) == 1
+    assert "I'm home, heading to bed" in snippets[0]
+    assert "you already answered this" not in snippets[0]
+    assert len(own_lines) == 1
+    assert "Sleep well" in own_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_live_answered_chat_is_not_routable_in_the_beat_context(monkeypatch):
+    """The enqueued beat context must not carry the answered chat as a path.
+
+    One live answered chat (nothing to answer) plus one fresh unanswered chat
+    (the run has a reason to exist): the answered chat's line is shown to the
+    model as context, but contributes no path to ``grillo_snippets``, so a reply
+    aimed at it is dropped as misrouted rather than delivered a second time.
+    """
+    plugin = gco.GrilloChatObserverPlugin()
+    plugin.quiet_minutes = 15
+
+    async def fake_check(consume=True):
+        return {"updated": True, "new_messages": [], "last_checked": ""}
+
+    now = datetime.now(timezone.utc)
+
+    async def fake_execute_query(sql, params=None):
+        return [{"cnt": 2, "max_ts": now}]
+
+    async def fake_recent(limit):
+        return [
+            {"interface_path": "telegram_bot/1", "last_used": now},
+            {"interface_path": "telegram_bot/2", "last_used": now},
+        ]
+
+    async def fake_history(path):
+        if path == "telegram_bot/1":
+            return [
+                {
+                    "text": "are you there",
+                    "sender_name": "Scar",
+                    "timestamp": (now - timedelta(minutes=2)).isoformat(),
+                },
+                {
+                    "text": "here, and awake",
+                    "sender_name": "self",
+                    "timestamp": (now - timedelta(minutes=1)).isoformat(),
+                },
+            ]
+        return [
+            {
+                "text": "did you finish the thing",
+                "sender_name": "Scar",
+                "timestamp": (now - timedelta(minutes=3)).isoformat(),
+            }
+        ]
+
+    class FakeGrillo:
+        @staticmethod
+        async def create_activity_log(beat_type, prompt_text=None):
+            return 999
+
+    async def fake_targets(limit):
+        return []
+
+    captured: dict = {}
+
+    async def fake_enqueue(
+        bot,
+        message,
+        context_memory=None,
+        interface_id=None,
+        original_message=None,
+        priority=None,
+    ):
+        captured["ctx"] = context_memory
+        captured["text"] = getattr(message, "text", None)
+
+    import core.db as core_db
+    import core.interface_paths as interface_paths
+    import core.chat_history_cache as chat_history_cache
+
+    monkeypatch.setattr("core.chat_update_checker.check_for_updates_once", fake_check)
+    monkeypatch.setattr("plugins.grillo.grillo_impl.GrilloPlugin", FakeGrillo)
+    monkeypatch.setattr(message_queue, "enqueue_low_priority", fake_enqueue)
+    monkeypatch.setattr(core_db, "execute_query", fake_execute_query)
+    monkeypatch.setattr(interface_paths, "get_recent_interface_paths", fake_recent)
+    monkeypatch.setattr(chat_history_cache, "load_chat_history", fake_history)
+    monkeypatch.setattr(plugin, "_collect_eligible_targets", fake_targets)
+    monkeypatch.setattr(
+        "core.interface_path_utils.is_vessel_interface_path", lambda p: False
+    )
+
+    plugin._last_run_ts = 1.0
+    await plugin._run_observer()
+
+    snippets = captured["ctx"]["grillo_snippets"]
+    assert any("telegram_bot/2" in s for s in snippets), snippets
+    assert all("telegram_bot/1" not in s for s in snippets), snippets
+    # The answered line is still shown to the model, tagged as context.
+    assert "are you there" in captured["text"]
+    assert "you already answered this" in captured["text"]

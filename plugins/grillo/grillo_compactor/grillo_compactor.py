@@ -216,6 +216,34 @@ def _parse_confidence(value: object) -> float:
         return _CONFIDENCE_DEFAULT
 
 
+# ``memories.emotion`` carries the model's free-text ``feeling``. The declared
+# schema (`scripts/sql/app_main_postgres.sql`) types it TEXT, but long-lived stores
+# still carry ``varchar(50)``; a 63..104-char feeling then failed the insert
+# outright and left the day uncompacted (57 failed writes in one nightly run).
+# The label is a label, so bound it at the narrowest width any store declares and
+# keep the full text in the archive notes, where nothing is lost.
+_MEMORY_EMOTION_MAX_CHARS = 50
+
+
+def _bound_emotion(value: object, limit: int = _MEMORY_EMOTION_MAX_CHARS) -> str | None:
+    """Trim a model-written feeling so it can never fail the memory write.
+
+    Cuts on a word boundary when one exists near the limit, so the stored label
+    stays readable. Returns None for an empty feeling (the column is nullable).
+    """
+    text = _coerce_text(value)
+    if not text:
+        return None
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    if " " in head:
+        trimmed = head.rsplit(" ", 1)[0].strip(" ,;:.-")
+        if len(trimmed) >= max(1, limit // 2):
+            head = trimmed
+    return head.strip(" ,;:.-") or text[:limit]
+
+
 class GrilloCompactorPlugin:
     display_name = "G.R.I.L.L.O. Compactor"
 
@@ -484,6 +512,13 @@ class GrilloCompactorPlugin:
 
         config_registry.add_listener("GRILLO_COMPACT_AGE_DAYS", _update_age)
 
+        # Days that already failed in this same run. One night is a countable
+        # number of model calls (``cycles`` x up to a batch of days), and a day
+        # that failed once - write error, anchors, no compression - will not
+        # answer differently the next cycle. Retrying them burned ~50 extra
+        # model calls a night and never changed the outcome.
+        self._day_unit_failed: set[int] = set()
+
     def get_supported_actions(self) -> dict:
         """The compactor exposes no LLM actions. Manual runs are triggered via the
         Web UI 'run_component' endpoint (which calls run_action directly) and the
@@ -572,6 +607,7 @@ class GrilloCompactorPlugin:
                         break
 
                     # Run N cycles
+                    self._day_unit_failed.clear()
                     for i in range(self.cycles):
                         if not GrilloCompactorPlugin._scheduler_running:
                             break
@@ -697,6 +733,19 @@ class GrilloCompactorPlugin:
                     }
                 )
 
+        # A day that already failed in this run is not asked again: the answer
+        # would be the same, and one night is a countable number of model calls.
+        # Only ``persisted`` changes a day's state; every other outcome leaves
+        # the day exactly as it was, so it is done for tonight.
+        if not dry_run and self._day_unit_failed:
+            already = [r for r in rows if r.get("id") in self._day_unit_failed]
+            if already:
+                rows = [r for r in rows if r.get("id") not in self._day_unit_failed]
+                log_info(
+                    f"[grillo_compactor] skipping {len(already)} day(s) that already "
+                    "failed earlier in this run"
+                )
+
         if not rows:
             log_debug(
                 f"[grillo_compactor] no day older than {age_days} day(s) is eligible for compaction"
@@ -717,6 +766,13 @@ class GrilloCompactorPlugin:
                 f"status={res.get('status')} chars={res.get('summary_chars')} "
                 f"anchors={res.get('anchor_check', {}).get('coverage')}"
             )
+            if not dry_run and res.get("status") != "persisted":
+                try:
+                    failed_id = int(res.get("row_id") or row.get("id") or 0)
+                except (TypeError, ValueError):
+                    failed_id = 0
+                if failed_id:
+                    self._day_unit_failed.add(failed_id)
         if dry_run:
             return {"dry_run": True, "results": results}
         return True
@@ -867,7 +923,18 @@ class GrilloCompactorPlugin:
             "level": 1,
             "path": "day_unit",
             "day": day_label,
+            # The full feeling, un-truncated: the emotion column only stores a
+            # bounded label (see _bound_emotion), so this is where nothing is lost.
+            "feeling": feeling,
         }
+
+        emotion_label = _bound_emotion(feeling)
+        if feeling and emotion_label != feeling:
+            log_info(
+                f"[grillo_compactor] day {day_label}: feeling bounded from "
+                f"{len(feeling)} to {len(emotion_label or '')} chars for the emotion "
+                "column (full text kept in the archive notes)"
+            )
 
         async with get_conn_ctx() as conn:
             # 1. the memory itself, anchored to the day it came from
@@ -877,7 +944,7 @@ class GrilloCompactorPlugin:
                     author="grillo",
                     source="compaction",
                     tags=tags_raw,
-                    emotion=feeling,
+                    emotion=emotion_label,
                     intensity=None,
                     emotion_state=None,
                     timestamp=day_ts,
@@ -1598,6 +1665,8 @@ class GrilloCompactorPlugin:
                 pass
 
             results = []
+            # A manual run is its own pass: forget what failed in an earlier one.
+            self._day_unit_failed.clear()
             for i in range(max(1, cycles)):
                 try:
                     log_info(

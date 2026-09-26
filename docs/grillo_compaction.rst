@@ -76,6 +76,26 @@ the copy into `ai_diary_archive`, and only then is the source row deleted from
 instead of the old behaviour where the day was deleted first and the write failed
 silently.
 
+Label width and retries (added 2026-09-26 after ten days failed to store). The model's
+`feeling` is a free-text label, and `memories.emotion` is `varchar(50)` on stores that
+predate the declared schema (`scripts/sql/app_main_postgres.sql` says `TEXT`); feelings
+measured 63-104 characters, so the insert was rejected and the day stayed uncompacted -
+57 failed writes and only 4 of 12 eligible days stored in one nightly run. The label is
+now bounded to 50 characters on a word boundary by `_bound_emotion`, and the FULL
+feeling is kept in `archived_memories.notes["feeling"]`, so a cosmetic label can never
+fail a day's write. The startup migration
+`core/migrations.py::_widen_memories_text_columns` aligns a lived-in store with the
+declared schema on the next boot: it measures each column through `information_schema`
+and widens only the ones positively measured as bounded (idempotent, fail-open; a store
+that already matches is untouched).
+
+Days that failed are not asked again in the same run. Only `persisted` clears a day;
+`write_failed`, `anchors_failed`, `kept_raw` (memory written, raw row kept on purpose),
+`no_engine` and `error` all leave the day exactly as it was, so the remaining cycles of
+the same night do not pay for the same answer (about 50 of 89 attempts were being spent
+on repeat failures). The set is cleared at the start of the nightly run and of a manual
+`compact_now`.
+
 Summaries orphaned by that old write path are recovered with
 `scripts/backfill_compacted_memories.py`: insert-only, dry run by default, idempotent
 through an `archived_id:<n>` tag, `--apply` to write, `--undo` to print the reversal.
@@ -85,8 +105,10 @@ Testing
 
 Unit tests are in `tests/test_grillo_compactor.py`, `tests/test_grillo_compactor_clusters.py`,
 `tests/test_grillo_compactor_persist.py` (the write-before-delete ordering and the
-connection the write joins) and `tests/test_grillo_compactor_day_units.py` (one day in,
-one day out: the anchors, the confidence gate, and the cases that must keep the raw row).
+connection the write joins), `tests/test_grillo_compactor_day_units.py` (one day in,
+one day out: the anchors, the confidence gate, and the cases that must keep the raw row)
+and `tests/test_grillo_compactor_resilience.py` (the feeling bound and the failed-day
+rule). `tests/test_migrations_memories_columns.py` covers the column widen.
 They mock DB and Cortex engines. Live read-only checks: `scripts/verify_live_day_units.py`
 (the accounting after a run, plus an independent anchor re-check against the archived day)
 and `scripts/probe_recall_reach.py` (whether a memory is inside the pool the prompt's

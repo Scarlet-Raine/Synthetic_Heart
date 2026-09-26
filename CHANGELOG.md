@@ -1,3 +1,144 @@
+### fix(plugins): a shim module re-exporting a plugin class got its own instance, so the Grillo core started four times at boot  <!-- 2026-09-26 -->
+
+**Symptom (live):** `[grillo] starting lightweight scheduler`, the full beat discovery and `[grillo] LLM-failure recovery plugin started` each appeared **four times in the same second** at 11:12:05, followed by four beat generations. The plugin list showed one Grillo; the process had four runs of its startup.
+
+**Root cause:** two things multiplied. (1) Discovery walks every file under `plugins/`, and `plugins/grillo_plugin.py` is a compatibility shim that re-exports the `GrilloPlugin` defined in `plugins/grillo/grillo_impl.py`, so the loader reached the same class from two modules and built **two distinct instances** - documented in `webui.py` as a known duplication the WebUI collapses for display, which is why only the process saw it. (2) Each instance was started by more than one path (the loader's async queue plus `CoreInitializer`'s explicit `PLUGIN_REGISTRY.get("grillo_plugin")` start), so two instances became four starts, and everything in `start()` was per instance: beat discovery, the beat scheduler guard, and its own LLM-failure recovery plugin with its own `_processed_ids`.
+
+**Fix, three parts:**
+- `core/core_initializer.py::_instantiate_plugin_once` - one instance per plugin **class** per discovery pass: a module that re-exports a class already built returns that object instead of constructing a second one. The registry keeps one entry per class, and `CoreInitializer`'s explicit Grillo start now looks up both names (`grillo_plugin` then `grillo_impl`), the way every other caller already does, so it finds the plugin whichever module the walk reached first.
+- The async-plugin queue dedupes by instance identity as well as by module name, so a reused object is not queued to start twice.
+- `plugins/grillo/grillo_impl.py::GrilloPlugin.start()` returns before doing any of its work once a scheduler is running (it used to check only after beat discovery and after building the recovery plugin), so a repeated start is free instead of a duplicate of everything.
+
+**Measured after:** `tests/test_plugin_instance_dedup.py` - a class reached from two modules is built once and the same object comes back; distinct classes still get distinct instances; and the shim relationship itself is asserted against the real modules so the premise cannot rot silently. `tests/test_grillo_discovery.py::test_second_start_is_a_no_op` - a second start does no discovery, builds no recovery plugin and leaves the caller's scheduler task alone. Both fail on the unpatched tree.
+
+**Notes:** the same pattern applies to every shim module that re-exports a class, so this removes duplicate *work*, not just duplicate log lines. The definitive live check is the next boot: one `starting lightweight scheduler` line, not four.
+
+### fix(diagnostics): the failure log counted test writes as runtime failures, and the recovery loop acted on them  <!-- 2026-09-26 -->
+
+**Symptom (live):** every boot, the LLM-failure recovery loop spent full message-chain turns on chats that do not exist. Its scan is `list_failure_entries(stage="llm_fallback", per_page=50, sort="desc")` filtered to `is_test = 0`, and the newest rows in her store were the test suite's:
+
+```
+telegram_bot/123      376 rows, newest 08:47 UTC today
+synth_webui/42         94
+synth_webui/webui_default  88   (real path - tests and the WebUI both use it)
+synth_webui/sid        47
+```
+
+At 11:12:05-06 the log shows what that costs: `🔴 ENTRY: source=user interface_path=telegram_bot/123`, a prompt build, four `LLM generated no outbound message action for user-facing interface 'telegram_bot/123' - triggering corrector` warnings, and four `recovery delivered` lines. The health views counted the same rows as real failures.
+
+**Root cause:** the marker existed but nothing wrote it. `build_failure_entry` flags `interface_path='fake*'` or `reason='test reason'`; the suite's fixture chats are neither, and the suite drives the real message chain against the real store (it also runs the startup migrations there), so its rows landed as ordinary runtime failures. `is_test` was added to the table after the fact and never backfilled, so the rows already there stayed unflagged too.
+
+**Fix, two parts:**
+- The store now flags what it can see structurally: a write made while a test is running is test data. pytest sets `PYTEST_CURRENT_TEST` for the duration of every test, and the flag **latches** for the rest of the process, so a background task a test started and that writes after teardown is still covered. `is_test=True` by a caller still wins, and the path/reason heuristics are unchanged.
+- A new startup migration, `flag_historic_test_failure_rows`, flags the rows already in the store for the fixture paths the suite uses (`fake%`, `telegram_bot/1`, `telegram_bot/123`, `telegram_bot/5551234567`, `synth_webui/42`, `synth_webui/sid`). None of those can be a live chat: Telegram user ids are large, channel ids are negative, and the WebUI's single session is `webui_default`, which is deliberately **not** in the list. Rows are flagged, never deleted; the pass only touches `is_test = 0`, so it is idempotent and a no-op once clean.
+
+**Measured after:** `tests/test_llm_failure_test_isolation.py` - 11 pass, including the latch (set, read, cleared, still latched), a test-process write for a real-looking chat path, the backfill's UPDATE-under-a-filter shape (asserting it flags and never deletes and that the paths are parameters, not interpolated SQL) and the no-table short-circuit. All six new tests fail on the unpatched tree. Note that `test_build_failure_entry_normal_entry_not_tagged` had to change: it pinned `telegram_bot/123` as a *normal* path, which is exactly the assumption that let the residue land. It now clears the marker explicitly and still pins the path heuristics.
+
+**Notes:** the residue was self-limiting - rows older than `GRILLO_FAILURE_RECOVERY_WINDOW_MIN` (30) are marked processed and never revisited - but they were counted, and every scan spent its 50-row window on them. With both halves in place the loop only ever sees real failures.
+
+### fix(config): the config registry reported keys as unreadable when they were simply never stored  <!-- 2026-09-26 -->
+
+**Symptom (live boot):** `[config] 133 key(s) still on their default because the config store could not be read: [...]`, and the count only grew as boot went on (123 -> 125 -> 130 -> 132 -> 133, and it kept firing minutes later during an ordinary chat turn). The wording says the store failed; the store had been read successfully 175 times in the same boot (`Recovered 'X' from DB (was pinned to its default before the store was readable)`).
+
+**Root cause:** two different situations shared one set. `_deferred_keys` means "read before the store was up, still to be recovered", and `load_all_from_db` pops a key from it only when the store has a **row** for that key. A key that was read early and was never persisted - which is most of them, defaults are only written when someone edits a setting - stayed in the set for the life of the process, and the end-of-pass warning reported it as a read failure.
+
+**Fix:** the sweep now records whether the batch read actually succeeded (`store_readable`) and, when it did, drops keys that have no stored row from the deferred set: their default is the correct value, not a symptom. A failed read changes nothing, so those keys stay deferred and the warning keeps meaning what it says.
+
+**Measured after:** `tests/test_config_store_deferral.py` - 8 pass, including `test_sweep_clears_a_deferred_key_that_has_no_stored_row` (the deferred key is cleared, and a key that does have a row still recovers its stored value in the same sweep) and `test_failed_sweep_keeps_an_unstored_key_deferred` (a failed read clears nothing). Both new tests fail on the unpatched tree for the corresponding half.
+
+**Notes:** no behaviour change for stored keys - this is bookkeeping, and the recovery path itself was already correct. The live instance is started once per process, so the next boot should log the warning with a much smaller set or not at all.
+
+### fix(grillo): the LLM-failure recovery loop ran four times per boot, so one failed turn could be recovered four times  <!-- 2026-09-26 -->
+
+**Symptom (live, every boot):** `grillo_failure_recovery` started four loops and delivered four recovery messages for the same failure:
+
+```
+11:12:05 [grillo_failure_recovery] recovery loop started
+11:12:05 [grillo_failure_recovery] recovery loop started
+11:12:06 [grillo_failure_recovery] recovery loop started
+11:12:06 [grillo_failure_recovery] recovery loop started
+11:12:05 [grillo_failure_recovery] recovery delivered for telegram_bot/123
+11:12:06 [grillo_failure_recovery] recovery delivered for telegram_bot/123
+11:12:06 [grillo_failure_recovery] recovery delivered for telegram_bot/123
+11:12:06 [grillo_failure_recovery] recovery delivered for telegram_bot/123
+```
+
+Four identical recoveries means four full message-chain turns for one failure: each one re-injects the original user text, builds a prompt, calls the cortex, and delivers a reply. On a real chat that is up to four messages for a single failed turn. The same four loops appear at every boot (yesterday's 22:16 boot had four as well), so this is not new - it is the recovery loop's version of the duplicate-message class.
+
+**Root cause:** two layers, both structural.
+- **The plugin was built once per Grillo start.** `grillo_impl.py::GrilloPlugin.start()` does `self.recovery_plugin = GrilloLLMFailureRecoveryPlugin(); await self.recovery_plugin.start()` on every call, and the loader instantiates the Grillo plugin four times at boot (the plugin manager plus each beat registration), so four plugin copies existed. The beat scheduler one line below already guarded itself with a process-wide class flag (`_scheduler_task` / `_scheduler_running`); the recovery loop had no equivalent.
+- **`start()` only guarded the same instance.** `if self._running: return` is per instance, so four fresh instances each started their own loop. Their `_processed_ids` sets and per-path rate limits are per instance too, so at boot the four loops scanned the same rows at the same moment and none of them saw the others' marks. The `metadata.processed_by_recovery` flag wrote afterwards, which is why this is a boot race rather than a permanent spam loop.
+
+**Also fixed in the same file:** `stop()` could not actually stop the loop. It cancelled its task and awaited it inside `except Exception`, but `asyncio.CancelledError` has been a `BaseException` since 3.8, so the await re-raised and `stop()` threw out of shutdown instead of returning. It now catches `asyncio.CancelledError` explicitly and clears the task, which is how the sibling loop in `plugins/radio_host/track_monitor.py` already does it.
+
+**Fix:** a module-level `_ACTIVE_RECOVERY` guard. The first instance to start owns the loop; any later instance logs `a recovery loop is already running in this process; this instance stays idle (one loop per process)` and returns. The guard is released by the owner's `stop()` only, so stopping one of the idle copies - which the plugin manager does - cannot kill the running loop. Module level rather than class level so it holds no matter which instance starts first.
+
+**Measured after:** `tests/test_grillo_llm_failure_recovery.py` - 7 pass, including the new `test_only_one_recovery_loop_runs_per_process` (a second instance stays idle, the owner keeps the loop, the guard is released with the owner so the next instance can start, and `stop()` returns cleanly with a pending task). The test fails on the unpatched tree. The failure-log suites (`test_llm_failure_test_isolation`, `test_failure_log_capture`, `test_log_failure_api`) still pass.
+
+**Notes:** the recovery plugin's `guide.md` already claimed "the loop is guarded so only one instance runs at a time" - the guard existed but was per instance, so the documented intent is what the code now actually does. Still open, reported not changed: the test suite writes `llm_failure_log` rows for fixture chats (`telegram_bot/123`, `synth_webui/42`) into the live store with `is_test=0` - the auto-flag in `core/llm_failure_log.py` only covers `fake*` paths and `reason='test reason'`, and `tests/test_llm_failure_test_isolation.py` pins `telegram_bot/123` as a normal path on purpose. Those rows are what the recovery loop keeps finding (376 for `telegram_bot/123`), and every boot spends a few turns on chats that do not exist.
+
+### fix(grillo): a Grillo beat cancelled the beat before it, so the diary day was never merged - on every run  <!-- 2026-09-26 -->
+
+**Symptom (live 2026-09-26 05:16 and 09:16, `logs/synth.log`):** the diary consolidation fired on schedule and logged the same plan both times, byte for byte - `Day 2026-09-25 is 111443 characters: consolidating PART 1 of 5 (24710 chars sent, 86733 kept for a later run)` - while that day's row never shrank and **not one** `update_diary_entry` call appeared anywhere in the day's log. The 111k-character day stayed a raw blob, which is exactly what the chunked merge exists to fix.
+
+**Root cause:** the consolidation's model call was cancelled about twelve seconds in, on every run:
+
+```
+05:16:47 [flow] -> LLM plugin: handing off chat_id=-1 interface=grillo prompt_len=42349
+05:16:58 [QUEUE] Cancelled LOW_PRIORITY background task for grillo/-1 (superseded by incoming user message)
+```
+
+The canceller was not a user message: it was the **observer beat**, which runs on the same `grillo/-1` lane about ten seconds later in the same minute. `core/message_queue.py` cancels a running low-priority background task when a new item arrives for its path, and the exemption for outbound beats is computed for the *running* task rather than the incoming one - `diary_consolidation` is an internal beat, so it was cancellable, and the next beat in the minute pre-empted it. The observer's own turn then ran to completion (74,835-char prompt, 2,432-char response) while the consolidation's day was discarded unused.
+
+**Fix:** a Grillo beat never pre-empts another Grillo beat. Both cancel sites now consult `_is_beat_message` through `_should_cancel_background_task`: the path-local cancel and the cross-path `grillo/*` sweep are skipped when the incoming item is itself a beat, decisive from the item's own context flag, never from text. A real user message still cancels a running internal beat, which is the behaviour that guard was written for. `_is_beat_message` and `_should_cancel_background_task` are pure and unit-tested.
+
+**Measured after:** `tests/test_message_queue_low_priority_non_blocking.py` - 7 pass, including the new guards: a beat arriving on `grillo/-1` leaves the in-flight internal beat running, a real user message on the same item shape and lane still cancels it, and the beat exemption does not bypass the cancellable/finished guards. Note on verification: the pre-existing `test_observer_background_task_is_not_cancelled_by_user_message` could not have caught this - it seeds a task that is already marked non-cancellable, so it passes whether or not the cancel block is reached.
+
+**Notes:** live confirmation is the next scheduled consolidation run, which should log an `update_diary_entry` action and a shrinking day. The consolidation additionally only merges while the day is unmerged, so the fix restores progress rather than merely avoiding the error.
+
+### fix(grillo): the nightly compaction stored 4 of 12 eligible days - a 50-character `emotion` column rejected the model's feeling, and ten cycles paid for the same failures  <!-- 2026-09-26 -->
+
+**Symptom (live 2026-09-25 and 2026-09-26, 05:00 local runs, `logs/synth.log`):** both nightly runs compacted almost nothing. The 09-26 run attempted 12 days across 10 cycles (89 attempts): **4 persisted**, **57 `write_failed`**, 19 `anchors_failed`, 6 `no_compression`, 3 `kept_raw`. Every failure carried the same pair of lines:
+
+```
+[insert_memory] write failed (StringDataRightTruncationError: value too long for type character varying(50)); no memory row was stored
+[grillo_compactor] day 2026-09-20: memory write failed (...); the day is untouched in ai_diary
+```
+
+Nothing was lost - each failed day stayed in `ai_diary` (11 days present, none archived or deleted) - but the days the compaction exists to make recallable never became memories. The 09-25 run failed the same way (53 `write_failed`, 5 persisted), so this was not a regression from the previous fix: that fix is what turned a silent no-op into a loud one.
+
+**Root cause, two layers:**
+- **The live column is narrower than the declared schema.** `scripts/sql/app_main_postgres.sql` types `memories.emotion`, `scope`, `emotion_state`, `author` and `source` as `TEXT`; the long-lived soul store still carries `varchar(50)`/`varchar(100)`. The compactor writes the model's free-text `feeling` into `emotion`, and the feelings measured 63..104 characters (`"quiet tenderness, missing him, then safe, claimed, grounded; a warm curiosity about crossing softer lines"`). Postgres rejected the row client-side of any partial write. Corroboration: every stored `source='compaction'` row has `max(length(emotion)) = 50`, so only short feelings have ever fitted.
+- **A failed day stayed eligible, so the night paid for it ten times.** The cycle re-selected the same failed days on every pass, so about 50 of the 89 attempts re-asked days whose answer had not changed.
+
+**Fix:**
+- `_bound_emotion` bounds the label at the narrowest width any store declares (50 characters, cut on a word boundary when one exists) and the **full** feeling is written to `archived_memories.notes["feeling"]`, so nothing is lost. A cosmetic label can no longer fail a whole day's write.
+- A new startup migration, `widen_memories_text_columns`, aligns a lived-in store with the declared schema. It measures each column through `information_schema` and only widens the ones positively measured as bounded (`ALTER COLUMN ... TYPE text` on Postgres; on MySQL a `MODIFY` that preserves nullability, and a column carrying a store default is left alone rather than have that default restated). A store that already matches the schema is untouched.
+- The day-unit cycle keeps a per-run set of days that already failed: only `persisted` clears a day, anything else is done for tonight. The set is cleared at the start of the nightly run and of a manual `compact_now`, so a manual run is its own pass.
+
+**Measured after:** `tests/test_grillo_compactor_resilience.py` (7 - the bound, the null case, the list case, the skip, and that a dry run never marks a day done) and `tests/test_migrations_memories_columns.py` (5 - only bounded columns widened, a matching store untouched, a missing table short-circuits, MySQL nullability kept, a defaulted column skipped) pass, along with the existing day-unit and compactor suites.
+
+**Notes:** the compaction reads as **correct** once the label fits, and older days stop being retried. The remaining known gap is that `anchors_failed` days are still re-attempted on the next night (by design - the day keeps its raw text), which is now once per night instead of ten times.
+
+### fix(grillo): an observer beat re-sent Dee's own reply into Telegram, byte for byte, two minutes after she sent it  <!-- 2026-09-25 -->
+
+**Symptom (live 2026-09-25 04:29 and 04:31, `telegram_bot/5208932647`):** the same message went out twice. At 04:29:11 Scar wrote into the DM, at 04:29:22 the normal reactive turn replied ("*I take the bottle with both hands like it's a trophy...*"), and at 04:31 the observer beat (`grillo_activity_log` id 2028) delivered that very reply a second time - identical text, same chat, no edit. The stored prompt for beat 2028 shows what it was working from: snippet 1 was Scar's line from one minute earlier (already answered), snippet 6 was the synth's own one-minute-old line tagged `your own line, not a reply target`, and the beat's output was snippet 6 copied verbatim.
+
+**Root cause, three layers:**
+- **The snippet collector offered an already-answered conversation as a reply target.** `_collect_recent_snippets` had no answered-state and no live-window check: every human line inside `GRILLO_OBSERVER_ACTIVITY_WINDOW_DAYS` became a snippet, and snippets are what `grillo_snippets` turns into reachable paths. The `LIVE-CONVERSATION` gate exists, but only in `_collect_eligible_targets` (it decides whether the model is *offered* a chat to reach out to); the reply side had no equivalent, so a chat the synth had answered 60 seconds earlier still looked pending. The model did the reasonable thing with what it was shown: it answered the newest line, reusing the words it was also shown as its own.
+- **Delivery had no repeat gate for this combination.** `message_plugin` skipped all Grillo suppression for outbound beats (`not is_outbound`), and the two gates that remained applied to **public** chats only (Telegram negative ids, Discord/Reddit/Matrix rooms). A beat repeating the synth's own line in a private DM therefore tripped nothing.
+- **The beat's generic `send_message` was relabelled `message_synth_webui`.** The beat's own origin is `grillo/-1`, which resolves to no chat interface, and the fallback in `core/message_chain.py` was "the WebUI's outbound verb" - even though the action's payload pointed at Telegram. It delivered only because `message_plugin` trusts `interface_path` over the action type; the mislabel was invisible until the disposition of a beat send was read back.
+
+**Fix:**
+- A chat that is **live** (a message younger than `GRILLO_OUTREACH_QUIET_MINUTES`) **and already answered** (the synth's newest line is newer than the newest line from anyone else) now contributes its human lines as **context** instead of reply targets, tagged `you already answered this, not a reply target` in the observer prompt. They never enter `grillo_snippets`, so the routing guard cannot route a reply there. An answered but *idle* chat still offers its human lines: reaching out there later with something new is what the run is for. Answered-state is read from timestamps only, never from message text.
+- `message_plugin` gains a repeat gate: for **every** Grillo beat and **every** chat type, a send whose text matches the synth's own recent line in that chat (`GRILLO_DUP_SIMILARITY_THRESHOLD`, default 0.85) is dropped and recorded as `repeat of own last line similarity=...`. It compares only against rows the synth authored, so genuine outreach that echoes the *human's* words is untouched, and it is fail-open - a broken history read never blocks a message. Outbound beats remain exempt from the public-chat gates (reaching out is their purpose) and from nothing else.
+- The generic message action is typed after **the path that action targets** first, then the turn's own path, and an unresolvable origin keeps the unified `send_message` instead of being relabelled as a WebUI action.
+
+**Measured after:** `tests/test_grillo_observer.py`, `tests/plugins/test_grillo_suppression.py` and `tests/test_message_chain.py` - 47 pass. The four new guards were run against the unpatched tree first and all four fail there (the answered chat stays a reply target; the beat repeat is delivered; the action comes back `message_synth_webui`), so they are regression tests rather than restatements. In the wider Grillo/message sweep (470 tests) the 18 live-DB-dependent failures are identical with and without the change; the only delta is the four new guards.
+
+**Notes:** the observer's `guide.md` now documents the reply-target rule and the delivery-side repeat gate. The remaining gap this fix does not close: the beat may still *author* a new message into a live conversation if some other chat's snippet routes it there - only the exact-repeat case is caught at delivery; general "is this worth saying" judgement stays with the model.
+
+
 ### fix(install): uninstall asks about the database before it removes anything  <!-- 2026-09-25 -->
 
 **Symptom (reported from a real run):** the uninstaller mentioned `--purge` only after the folder had been deleted, so the script that could have purged the database no longer existed and it had to be dropped by hand.
