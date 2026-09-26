@@ -1,3 +1,29 @@
+### fix(prompt): her dream and the avatar's expression protocol were built on every turn and silently dropped  <!-- 2026-09-26 -->
+
+**Symptom (live):** every prompt build logged `injected context keys with no renderer, so they never reach the prompt: ['todays_dream']`, and after 12:00 the same warning named `['facial_expression_guidance']`. Both blocks were built on every turn; neither reached the model.
+
+**Evidence from her store:** the dream beat is healthy - 29 dreams since 2026-07-06, running daily at 05:00 local (newest 2026-09-26 03:00 UTC), each with a readable dream of ~1,100-2,000 characters in its action envelope. `facial_expression_plugin` is enabled and builds its tag guidance every turn (`PLUGIN_ENABLED__facial_expression_plugin` was recovered from the DB at 12:56:59). So generation, storage and injection all worked, and the last step - rendering - did not exist.
+
+**Root cause:** `get_static_injection()` merges a plugin's dict into `context_section`, but a key only reaches the prompt when a renderer consumes it, and rendering happens from `_PLUGIN_CONTEXT_BLOCKS` in `core/prompt_engine.py`. Neither key was in that table, so both were dropped silently: she never saw her own dream, and the model had no way to learn the `[em_NAME:intensity]` tag protocol the avatar's face depends on. The drop detector named both keys, which is how they were found.
+
+**Fix:**
+- `todays_dream` renders under `[Today's dream]` and `facial_expression_guidance` under `[Facial expressions]`, on both prompt routes (the ordinary chat/beat summary and the live route), declared in the one table both renderers read.
+- The dream's own fetch no longer falls back to the linked diary row. `diary_entry_id` is audit linkage to whichever diary row existed when the beat's action was dispatched, not a source of the dream: today's dream at 05:00 is linked to a 35,535-character interaction diary written at 11:28, and the largest link in the table is 95,722 characters. A dream row whose envelope carries no readable dream now injects nothing instead of a wall of unrelated diary text. In practice 28 of 29 rows carry the dream, and the one that does not (2026-09-22, `response_text` NULL) was the risk case.
+
+**Measured after:** `tests/test_plugin_context_blocks.py` gains three tests - the dream block renders on both routes, the expression guidance renders on both routes, both keys are declared and considered rendered - and the drop-detector test now uses synthetic keys instead of the two real ones it used to pin as unrendered. `tests/test_grillo_dream.py` gains four: an envelope with no dream yields no dream even when a diary row is linked, an envelope's `content` is what gets injected, the block is present inside the inject window and empty past the cutoff, plus a source guard that the `ai_diary` join cannot come back as a dream source. All fail on the unpatched tree.
+
+**Notes:** `upcoming_events` (plugins/event_plugin) is still an injected key with no renderer and is deliberately left alone here - it is not something she is missing in a conversation, and rendering it changes what every prompt carries. Worth a decision rather than a guess.
+
+### chore(core): the plugin loader said "queued" for modules it did not queue  <!-- 2026-09-26 -->
+
+**Symptom:** the boot log showed three `Queued async plugin for startup: plugins.grillo*` lines while the queue held one entry and one `start()` ran, which made the plugin-deduplication fix look broken during verification.
+
+**Root cause:** the log call sat outside the guard that appends to the queue, so a module skipped by either dedupe (same module name, or the same instance reached through a shim) still logged that it had been queued.
+
+**Fix:** the line is logged only when the entry is appended, and a skipped module logs at debug with its reason.
+
+**Measured after:** the live boot after this change logs one `Queued async plugin for startup: plugins.grillo_plugin` and one `Started pending async plugin`, which is what the queue actually contains.
+
 ### fix(plugins): a shim module re-exporting a plugin class got its own instance, so the Grillo core started four times at boot  <!-- 2026-09-26 -->
 
 **Symptom (live):** `[grillo] starting lightweight scheduler`, the full beat discovery and `[grillo] LLM-failure recovery plugin started` each appeared **four times in the same second** at 11:12:05, followed by four beat generations. The plugin list showed one Grillo; the process had four runs of its startup.

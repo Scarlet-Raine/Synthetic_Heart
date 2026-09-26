@@ -1096,8 +1096,8 @@ def _build_current_turn_anchor(context_section: dict[str, Any]) -> str:
 # ``get_static_injection()`` merges a plugin's dict into ``context_section``, but
 # a key is only visible to the model if a renderer consumes it: anything nothing
 # reads is dropped silently. A live Home Assistant block was built on every turn
-# and never reached the prompt that way, and the same is true today for
-# ``upcoming_events`` (plugins/event_plugin) and ``facial_expression_guidance``.
+# and never reached the prompt that way, and ``upcoming_events``
+# (plugins/event_plugin) is still in that state.
 # Add a plugin's key here when its block must appear in the ordinary chat and
 # beat prompt, and pin it in tests/test_plugin_context_blocks.py.
 #
@@ -1112,6 +1112,14 @@ _PLUGIN_CONTEXT_BLOCKS: tuple[tuple[str, str, str | None], ...] = (
     ("home", "[Home]", None),
     ("home_weather", "[Weather]", "weather"),
     ("home_location", "[House]", "location"),
+    # A block a plugin builds for the model and that no renderer consumed: it was
+    # written, gathered, merged and dropped on every turn.
+    # ``todays_dream`` is grillo_dream's dream for today (present from the 05:00
+    # beat until GRILLO_DREAM_INJECT_UNTIL), and ``facial_expression_guidance``
+    # is the facial_expression_plugin teaching the ``[em_NAME:intensity]`` tag
+    # protocol that drives the avatar's face through the Karada state server.
+    ("todays_dream", "[Today's dream]", None),
+    ("facial_expression_guidance", "[Facial expressions]", None),
 )
 
 # Injected keys that some renderer already consumes. The drop detector in

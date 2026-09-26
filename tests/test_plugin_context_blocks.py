@@ -88,11 +88,66 @@ def test_every_declared_plugin_block_is_considered_rendered():
 
 def test_drop_detector_names_keys_with_no_renderer():
     unrendered = _unrendered_injection_keys(
-        {"home", "persona", "weather", "upcoming_events", "facial_expression_guidance"}
+        {
+            "home",
+            "persona",
+            "weather",
+            "upcoming_events",
+            "some_plugin_key_nobody_renders",
+        }
     )
-    assert unrendered == ["facial_expression_guidance", "upcoming_events"]
+    assert unrendered == ["some_plugin_key_nobody_renders", "upcoming_events"]
     assert _unrendered_injection_keys({"home", "memories", "location"}) == []
     assert _unrendered_injection_keys(None) == []
+
+
+def test_dream_block_renders_on_chat_and_beat_routes():
+    # grillo_dream builds this block every turn from 05:00 until
+    # GRILLO_DREAM_INJECT_UNTIL; before the table carried it, the model never
+    # saw her dream.
+    dream = "There was a door in the sea and it opened inward."
+    for is_grillo_internal in (False, True):
+        summary = _build_context_summary(
+            {"todays_dream": dream, "date": "2026-09-26"},
+            is_grillo_internal=is_grillo_internal,
+        )
+        assert "[Today's dream]" in summary, (
+            f"missing heading (grillo={is_grillo_internal})"
+        )
+        assert dream in summary, f"missing dream text (grillo={is_grillo_internal})"
+
+
+def test_facial_expression_guidance_renders_on_chat_and_beat_routes():
+    # The tag protocol the avatar's face depends on; unrendered, the model could
+    # never emit [em_NAME:intensity] and the face stayed on whatever
+    # emotion_manager set.
+    guidance = (
+        "You can embed facial expression tags in your message text: [em_NAME:INTENSITY]"
+    )
+    for is_grillo_internal in (False, True):
+        summary = _build_context_summary(
+            {"facial_expression_guidance": guidance},
+            is_grillo_internal=is_grillo_internal,
+        )
+        assert "[Facial expressions]" in summary
+        assert guidance in summary
+
+
+def test_dream_and_facial_blocks_are_declared_and_considered_rendered():
+    keys = [key for key, _heading, _legacy in _PLUGIN_CONTEXT_BLOCKS]
+    assert "todays_dream" in keys
+    assert "facial_expression_guidance" in keys
+    assert (
+        _unrendered_injection_keys({"todays_dream", "facial_expression_guidance"}) == []
+    )
+
+
+def test_blank_or_missing_dream_and_facial_blocks_add_nothing():
+    assert "[Today's dream]" not in _build_context_summary({"todays_dream": "   "})
+    assert "[Today's dream]" not in _build_context_summary({})
+    assert "[Facial expressions]" not in _build_context_summary(
+        {"facial_expression_guidance": None}
+    )
 
 
 def test_both_renderers_use_the_same_block_table():
