@@ -531,6 +531,21 @@ def _record_stale_reply_drop(interface_path: str | None) -> None:
         log_debug(f"[telegram_utils] stale-reply drop recording skipped: {exc}")
 
 
+def telegram_parse_mode_for(chat_id: int | str) -> str | None:
+    """Return the Telegram ``parse_mode`` to use when sending to *chat_id*.
+
+    Group and supergroup ids are negative, and a group is the only kind of chat
+    where another SyntH instance may be reading. Telegram consumes ``*action*``
+    markers as bold markup whenever a parse_mode is set, and the plain text the
+    peer instance receives then contains no markers at all, so each instance
+    remembered the other's physical actions as plain speech while keeping its
+    own. Measured 2026-09-27: a 1,579-character line carrying 6 asterisks
+    arrived at the peer as 1,573 characters with none. Private chats keep
+    Markdown, so ``*action*`` still renders as bold there.
+    """
+    return None if str(chat_id).startswith("-") else "Markdown"
+
+
 async def send_with_thread_fallback(
     bot,
     chat_id: int | str,

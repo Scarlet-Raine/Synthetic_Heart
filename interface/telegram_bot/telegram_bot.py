@@ -51,6 +51,7 @@ from core.chat_attention import set_attention, get_attention, evaluate_triggers
 from interface.message_send_utils import (
     safe_send,
     send_with_thread_fallback,
+    telegram_parse_mode_for,
 )
 from core.message_sender import (
     send_content,
@@ -2978,7 +2979,7 @@ class TelegramInterface:
                 self.bot,
                 chat_id,
                 text,
-                parse_mode="Markdown",
+                parse_mode=telegram_parse_mode_for(chat_id),
                 thread_id=thread_id,  # fixed: correct param is thread_id
                 reply_to_message_id=reply_message_id,
                 fallback_chat_id=fallback_chat_id,
