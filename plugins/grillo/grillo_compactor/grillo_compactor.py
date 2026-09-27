@@ -83,6 +83,51 @@ _NAME_GROUPS = (
 _ANCHOR_COVERAGE_FLOOR = 0.8
 
 
+def _day_unit_summary(
+    *,
+    dry_run: bool,
+    considered: int,
+    skipped_failed: int,
+    skipped_covered: int,
+    covered_total: int,
+    archive_unreadable: bool,
+    results: list,
+) -> dict:
+    """Describe one day-unit pass in the terms the WebUI panel reports.
+
+    ``persisted`` is the only outcome that changes a day; every other outcome leaves the
+    day exactly as it was (see ``_compact_one_day``), so the panel can say "N summarised,
+    M left as they were, K skipped because a memory already exists" without reading logs.
+    ``model_calls`` is the number of days actually handed to the model this run.
+    """
+    rows = [r for r in results if isinstance(r, dict)]
+    persisted = sum(1 for r in rows if r.get("status") == "persisted")
+    errors = sum(1 for r in rows if r.get("status") in ("error", "write_failed"))
+    return {
+        "dry_run": bool(dry_run),
+        "considered": int(considered),
+        "eligible": len(rows),
+        "processed": len(rows),
+        "persisted": persisted,
+        "errors": errors,
+        "left_unchanged": max(0, len(rows) - persisted - errors),
+        "skipped_failed": int(skipped_failed),
+        "skipped_covered": int(skipped_covered),
+        "covered_total": int(covered_total),
+        "archive_unreadable": bool(archive_unreadable),
+        "model_calls": len(rows),
+        "results": results,
+    }
+
+
+def _is_int_in(value, wanted: set) -> bool:
+    """True when ``value`` reads as an id in ``wanted``; an unreadable id never matches."""
+    try:
+        return int(value) in wanted
+    except (TypeError, ValueError):
+        return False
+
+
 def _setting(name: str, default, cast=None):
     """Read one compaction setting, falling back to the default.
 
@@ -518,6 +563,11 @@ class GrilloCompactorPlugin:
         # answer differently the next cycle. Retrying them burned ~50 extra
         # model calls a night and never changed the outcome.
         self._day_unit_failed: set[int] = set()
+        # On-demand pass state for the WebUI panel (Settings → Memory Compaction): the
+        # background task and the last summary it produced. `run_action` is stateless by
+        # comparison, so a panel press and a scheduled night cannot fight over it.
+        self._compaction_task: "asyncio.Task | None" = None
+        self._compaction_state: dict = {}
 
     def get_supported_actions(self) -> dict:
         """The compactor exposes no LLM actions. Manual runs are triggered via the
@@ -667,8 +717,8 @@ class GrilloCompactorPlugin:
         "   played Minecraft, name Minecraft and say what she did in it.\n"
         "3. Keep her voice: first person, as the source uses it, and names exactly as she uses them\n"
         "   (Daddy, Mama, Papa).\n"
-        "4. Do not invent, do not moralise, do not turn specifics into abstractions. Never write \"a quiet day\",\n"
-        "   \"emotional intimacy\", \"self-discovery\", \"boundaries\", \"a moment of connection\", or any phrase\n"
+        '4. Do not invent, do not moralise, do not turn specifics into abstractions. Never write "a quiet day",\n'
+        '   "emotional intimacy", "self-discovery", "boundaries", "a moment of connection", or any phrase\n'
         "   that could describe any day.\n"
         "5. Do not censor or clinicalise intimate or bodily parts. If the day contains them, describe them.\n"
         "6. The summary must be between 800 and {max_chars} characters. Shorter is a failure.\n"
@@ -677,13 +727,69 @@ class GrilloCompactorPlugin:
         "day does not mention must come back EMPTY with a short reason in its `_note` field. Never fill a slot\n"
         "from an adjacent meaning: a missing anchor can be distrusted, a made-up one would be believed.\n"
         "\n"
-        'Return ONLY this JSON, nothing else:\n'
+        "Return ONLY this JSON, nothing else:\n"
         '{{"summary": "...", "anchors": {{"weather": "", "weather_note": "...", "place": ["..."], '
         '"who": ["..."], "food": ["..."], "objects_events": ["..."]}}, "feeling": "...", '
         '"confidence": "low|medium|high", "declined": false}}\n'
     )
 
-    async def _run_day_unit_cycle(self, dry_run: bool = False, marker: str | None = None):
+    # --------------------------------------------------- what has already been compacted
+    #
+    # The archive is the index of what has been compacted: `source_ids` holds the
+    # `ai_diary` ids a record came from. A day whose summary did not earn a replacement
+    # is kept in `ai_diary` ON PURPOSE (see `_compact_one_day`), so without reading the
+    # index the next night picks that same day up, summarises it again and writes a
+    # second memory for one day. Measured 2026-09-27: the archive held 22 day-unit records
+    # for 15 days, seven of those days carrying two records each, and the nightly pass made
+    # fifteen model calls where five were needed.
+
+    @staticmethod
+    def _covered_day_ids(rows) -> set:
+        """Day ids already recorded in the archive, from ``source_ids`` rows.
+
+        Accepts the mapping and the tuple shape the two cursors return, tolerates a JSON
+        string or a plain list, and ignores anything unparseable: an id it cannot read is
+        simply treated as not covered.
+
+        To make a day eligible again, delete the archive record that names it
+        (`GRILLO_COMPACT_ALLOW_RECOMPACT` is registered but never read, so it does not do
+        this, and its description speaks about the clustering path rather than this one).
+        """
+        covered = set()
+        for r in rows or []:
+            raw = r.get("source_ids") if isinstance(r, dict) else (r[0] if r else None)
+            if raw is None:
+                continue
+            try:
+                ids = json.loads(raw) if isinstance(raw, str) else raw
+            except Exception:
+                continue
+            if not isinstance(ids, (list, tuple)):
+                continue
+            for i in ids:
+                try:
+                    covered.add(int(i))
+                except (TypeError, ValueError):
+                    continue
+        return covered
+
+    async def _load_covered_day_ids(self) -> set:
+        """Day ids the archive says are already compacted."""
+        from core.db import get_conn_ctx
+
+        async with get_conn_ctx() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT source_ids FROM archived_memories "
+                    "WHERE compaction_level = 1 AND notes LIKE %s",
+                    ("%day_unit%",),
+                )
+                fetched = await cur.fetchall()
+        return self._covered_day_ids(fetched)
+
+    async def _run_day_unit_cycle(
+        self, dry_run: bool = False, marker: str | None = None
+    ):
         """Summarise each eligible day as itself. One model call per day, oldest first."""
         from core.db import _get_db_type, get_conn_ctx
 
@@ -733,6 +839,15 @@ class GrilloCompactorPlugin:
                     }
                 )
 
+        # Counters for the summary the WebUI panel reports (see ``compaction_status``):
+        # each eligible day either persists, or is deliberately left exactly as it was,
+        # and the panel has to be able to say which without reading the log.
+        considered = len(rows)
+        skipped_failed = 0
+        skipped_covered = 0
+        covered_total = 0
+        archive_unreadable = False
+
         # A day that already failed in this run is not asked again: the answer
         # would be the same, and one night is a countable number of model calls.
         # Only ``persisted`` changes a day's state; every other outcome leaves
@@ -741,16 +856,57 @@ class GrilloCompactorPlugin:
             already = [r for r in rows if r.get("id") in self._day_unit_failed]
             if already:
                 rows = [r for r in rows if r.get("id") not in self._day_unit_failed]
+                skipped_failed = len(already)
                 log_info(
                     f"[grillo_compactor] skipping {len(already)} day(s) that already "
                     "failed earlier in this run"
+                )
+
+        # A day the archive already holds a memory for is not summarised again. The memory
+        # exists, the raw day is kept beside it deliberately, and running the pass again
+        # only writes a second copy of the same day (see _covered_day_ids). If the index
+        # cannot be read we skip the pass rather than write duplicates we cannot detect.
+        try:
+            covered = await self._load_covered_day_ids()
+        except Exception as e:
+            log_warning(
+                "[grillo_compactor] could not read the compaction archive "
+                f"({e}); skipping the day-unit pass this run instead of risking duplicates"
+            )
+            return _day_unit_summary(
+                dry_run=dry_run,
+                considered=considered,
+                skipped_failed=skipped_failed,
+                skipped_covered=0,
+                covered_total=0,
+                archive_unreadable=True,
+                results=[],
+            )
+
+        if covered:
+            covered_total = len(covered)
+            already = [r.get("id") for r in rows if _is_int_in(r.get("id"), covered)]
+            if already:
+                rows = [r for r in rows if not _is_int_in(r.get("id"), covered)]
+                skipped_covered = len(already)
+                log_info(
+                    f"[grillo_compactor] skipping {len(already)} day(s) that already have "
+                    "a memory in the archive"
                 )
 
         if not rows:
             log_debug(
                 f"[grillo_compactor] no day older than {age_days} day(s) is eligible for compaction"
             )
-            return {"dry_run": True, "results": []} if dry_run else True
+            return _day_unit_summary(
+                dry_run=dry_run,
+                considered=considered,
+                skipped_failed=skipped_failed,
+                skipped_covered=skipped_covered,
+                covered_total=covered_total,
+                archive_unreadable=archive_unreadable,
+                results=[],
+            )
 
         # A night is a countable number of model calls: one per day, oldest first.
         results = []
@@ -773,9 +929,15 @@ class GrilloCompactorPlugin:
                     failed_id = 0
                 if failed_id:
                     self._day_unit_failed.add(failed_id)
-        if dry_run:
-            return {"dry_run": True, "results": results}
-        return True
+        return _day_unit_summary(
+            dry_run=dry_run,
+            considered=considered,
+            skipped_failed=skipped_failed,
+            skipped_covered=skipped_covered,
+            covered_total=covered_total,
+            archive_unreadable=archive_unreadable,
+            results=results,
+        )
 
     async def _compact_one_day(self, row: dict, dry_run: bool = False) -> dict:
         """Turn ONE diary day into ONE memory, carrying its anchors, or leave the day alone.
@@ -1642,6 +1804,158 @@ class GrilloCompactorPlugin:
         except Exception as exc:
             log_error(f"[grillo_compactor] Unexpected error in cycle: {exc}")
             return False
+
+    # ------------------------------------------------------------------
+    # On-demand run of the nightly pass (WebUI: Settings → Memory Compaction)
+    # ------------------------------------------------------------------
+    async def compaction_preview(self) -> dict:
+        """What the next pass would look at, without spending a single model call.
+
+        The numbers describe the SAME selection the pass makes (the age cutoff and the
+        batch limit), so ``days`` is what a press would consider, ``covered`` is how many
+        of those the archive already holds a memory for (the ones the pass now skips) and
+        ``remaining`` is what is left to summarise. ``stored_days`` is the whole table, for
+        context only: comparing it against the archive's own id set would mix two
+        different populations and report a nonsense remainder.
+        """
+        from core.db import _get_db_type, get_conn_ctx
+
+        age_days = max(0, _setting("GRILLO_COMPACT_DAY_AGE_DAYS", 2, int))
+        limit = max(1, int(getattr(self, "batch_size", 40) or 40))
+        is_postgres = _get_db_type() == "postgres"
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=age_days)
+
+        out: dict = {
+            "days": None,
+            "covered": None,
+            "remaining": None,
+            "stored_days": None,
+            "age_days": age_days,
+        }
+        try:
+            async with get_conn_ctx() as conn:
+                async with conn.cursor() as cur:
+                    if is_postgres:
+                        await cur.execute(
+                            "SELECT id FROM ai_diary WHERE created_at < %s "
+                            "ORDER BY created_at ASC LIMIT %s",
+                            (cutoff_dt, limit),
+                        )
+                    else:
+                        await cur.execute(
+                            "SELECT id FROM ai_diary WHERE created_at < "
+                            "DATE_SUB(NOW(), INTERVAL %s DAY) ORDER BY created_at ASC LIMIT %s",
+                            (age_days, limit),
+                        )
+                    rows = await cur.fetchall() or []
+                    await cur.execute("SELECT COUNT(*) AS n FROM ai_diary")
+                    total_row = await cur.fetchone()
+        except Exception as e:
+            log_debug(
+                f"[grillo_compactor] compaction preview could not read the diary: {e}"
+            )
+            return out
+
+        ids = []
+        for row in rows:
+            value = (
+                row.get("id") if isinstance(row, dict) else (row[0] if row else None)
+            )
+            if value is None:
+                continue
+            try:
+                ids.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        out["days"] = len(ids)
+        if isinstance(total_row, dict):
+            out["stored_days"] = int(total_row.get("n") or 0)
+        elif total_row:
+            out["stored_days"] = int(total_row[0] or 0)
+
+        try:
+            covered = await self._load_covered_day_ids()
+        except Exception as e:
+            log_debug(
+                f"[grillo_compactor] compaction preview could not read the archive: {e}"
+            )
+            return out
+        out["covered"] = sum(1 for day_id in ids if day_id in covered)
+        out["remaining"] = max(0, len(ids) - out["covered"])
+        return out
+
+    async def compaction_status(self) -> dict:
+        """State of the on-demand pass: running, the last summary, and the preview.
+
+        A finished run keeps its summary until the next run starts, so the panel can show
+        the last result (how many days it summarised, how many it skipped as already
+        compacted) long after the pass ended.
+        """
+        state = getattr(self, "_compaction_state", None) or {}
+        task = getattr(self, "_compaction_task", None)
+        running = task is not None and (not task.done())
+        return {
+            "running": running,
+            "dry_run": bool(state.get("dry_run", False)),
+            "started_at": state.get("started_at"),
+            "finished_at": state.get("finished_at"),
+            "error": state.get("error"),
+            "summary": state.get("summary"),
+            "preview": await self.compaction_preview(),
+        }
+
+    async def start_compaction_now(self, dry_run: bool = False) -> dict:
+        """Run the nightly day-unit pass now, in the background.
+
+        The pass costs one model call per eligible day and reads whole days, so this only
+        starts it; the caller polls ``compaction_status``. A second press while a pass is
+        running is refused rather than queued, so a stray double click cannot double the
+        night's model calls.
+        """
+        task = getattr(self, "_compaction_task", None)
+        if task is not None and not task.done():
+            return {
+                "started": False,
+                "reason": "already_running",
+                **(await self.compaction_status()),
+            }
+        self._compaction_state = {
+            "dry_run": bool(dry_run),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "error": None,
+            "summary": None,
+        }
+        self._compaction_task = asyncio.create_task(
+            self._run_compaction_now(dry_run=dry_run)
+        )
+        log_info(
+            f"[grillo_compactor] on-demand compaction started (dry_run={bool(dry_run)})"
+        )
+        return {"started": True, **(await self.compaction_status())}
+
+    async def _run_compaction_now(self, dry_run: bool = False) -> None:
+        """Run one pass and keep its summary for the panel. Never raises."""
+        try:
+            # Its own pass: forget what failed in an earlier one, exactly as a manual
+            # ``compact_now`` run does.
+            self._day_unit_failed.clear()
+            summary = await self._run_one_compaction_cycle(dry_run=dry_run)
+            self._compaction_state["summary"] = summary
+            log_info(
+                "[grillo_compactor] on-demand compaction finished: "
+                f"persisted={summary.get('persisted')} "
+                f"skipped_covered={summary.get('skipped_covered')} "
+                f"left_unchanged={summary.get('left_unchanged')} "
+                f"errors={summary.get('errors')}"
+            )
+        except Exception as e:
+            self._compaction_state["error"] = str(e)
+            log_error(f"[grillo_compactor] on-demand compaction failed: {e}")
+        finally:
+            self._compaction_state["finished_at"] = datetime.now(
+                timezone.utc
+            ).isoformat()
 
     async def run_action(
         self, action_type: str, payload: dict = None, context: dict = None

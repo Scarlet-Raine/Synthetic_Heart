@@ -31,6 +31,14 @@
       </div>
     </article>
     <article class="card">
+      <h2>Memory Compaction</h2>
+      <p>Grillo summarises each past day of diary into one memory, so recall returns knowledge instead of whole days of transcript. It normally runs on its own schedule; this button runs exactly the same pass now, which is how you check it without waiting a night to find out. It costs one model call per eligible day, and days the archive already holds a memory for are skipped, so pressing it a second time costs nothing. The pass runs in the background and the line below follows it.</p>
+      <div style="margin-top:0.6rem; display:flex; gap:0.75rem; align-items:center; flex-wrap:wrap;">
+        <button id="run-compaction-now" class="btn-ghost" type="button">Run nightly compaction now</button>
+        <span id="compaction-status" class="meta">Checking…</span>
+      </div>
+    </article>
+    <article class="card">
       <h2>Notifications</h2>
       <p>Enable desktop notifications and audio cues whenever new messages arrive.</p>
       <label class="toggle">

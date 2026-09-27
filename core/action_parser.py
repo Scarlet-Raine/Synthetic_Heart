@@ -40,6 +40,9 @@ register_action_safety_config()
 
 _retry_tracker = {}
 _STATIC_INJECTION_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+# A plugin whose static injection takes longer than this is named in the one aggregated
+# line `gather_static_injections` logs after its gather, instead of getting its own line.
+_SLOW_INJECTION_SEC = 0.1
 _GRILLO_ACTIVITY_MESSAGE_ID_RE = re.compile(r"^grillo_[a-z_]+_(\d+)$")
 
 
@@ -2756,10 +2759,7 @@ def _generate_context_tags(
         context_tags.append("technical")
     if "event" in action_types:
         context_tags.append("scheduling")
-    if (
-        "speech_zen_elevenlabs" in action_types
-        or "audio_telegram_bot" in action_types
-    ):
+    if "speech_zen_elevenlabs" in action_types or "audio_telegram_bot" in action_types:
         context_tags.append("audio")
 
     # Content-based analysis for specific topics
@@ -3022,6 +3022,11 @@ async def gather_static_injections(message=None, context_memory=None):
 
     tasks = []
     plugin_names = []
+    # Plugins that took longer than _SLOW_INJECTION_SEC. Reported once, aggregated,
+    # after the gather: per-plugin lines for every plugin over the threshold means one
+    # warning line per plugin per prompt build, which is most of them on a busy install
+    # and buries the one number that matters (the slowest contributor).
+    slow_injections: list = []
 
     for plugin in loaded_plugins:
         try:
@@ -3096,10 +3101,10 @@ async def gather_static_injections(message=None, context_memory=None):
                         return _stale_fallback("timeout")
 
                     duration = time.time() - start
-                    if duration > 0.1:
-                        log_info(
-                            f"[action_parser] ⚠️ get_static_injection() on {name} took {duration:.3f}s"
-                        )
+                    if duration > _SLOW_INJECTION_SEC:
+                        # Named in the aggregated line logged after the gather, so a
+                        # prompt build costs one timing line, not one per slow plugin.
+                        slow_injections.append((name, duration))
                     else:
                         log_debug(
                             f"[action_parser] ✅ get_static_injection() on {name} took {duration:.3f}s"
@@ -3131,6 +3136,7 @@ async def gather_static_injections(message=None, context_memory=None):
         # plugin being enabled.
         return _add_core_injections({})
 
+    gather_start = time.time()
     log_debug(
         f"[action_parser] Running {len(tasks)} injections in parallel: {plugin_names}"
     )
@@ -3145,6 +3151,16 @@ async def gather_static_injections(message=None, context_memory=None):
                 )
     except Exception as e:
         log_error(f"[action_parser] Error in asyncio.gather results: {e}")
+
+    # One timing line per prompt build, naming the slowest contributors: the plugins
+    # themselves stay silent unless something is actually slow.
+    if slow_injections:
+        worst = sorted(slow_injections, key=lambda item: item[1], reverse=True)[:3]
+        shown = ", ".join(f"{name} {duration:.3f}s" for name, duration in worst)
+        log_info(
+            f"[action_parser] ⏱️ static injections: {len(tasks)} block(s) in "
+            f"{time.time() - gather_start:.2f}s; slowest: {shown}"
+        )
 
     # A plugin block that replaces a built-in provider (the legacy key is
     # declared in core.prompt_engine._PLUGIN_CONTEXT_BLOCKS) drops that provider's

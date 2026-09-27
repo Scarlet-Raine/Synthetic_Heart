@@ -106,3 +106,75 @@ async def test_gather_static_injections_uses_cached_payload_after_timeout(
 
     assert first == {"soul_session_state": "fresh"}
     assert second == {"soul_session_state": "fresh"}
+
+
+class _SlowInjectionPlugin:
+    """A plugin whose static injection takes a measurable amount of time."""
+
+    def __init__(self, delay: float) -> None:
+        self._delay = delay
+
+    def get_supported_action_types(self) -> list[str]:
+        return ["static_inject"]
+
+    async def get_static_injection(self) -> dict[str, object]:
+        await asyncio.sleep(self._delay)
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_slow_injections_are_reported_once_for_the_whole_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One timing line per prompt build, naming the slowest contributor.
+
+    Every plugin over the threshold used to log its own line, so a single beat could
+    print six of them and the one number that matters (which plugin is slowest, and how
+    long the whole gather took) was buried. The per-plugin detail stays at debug.
+    """
+    from core import action_parser
+
+    monkeypatch.setattr(action_parser, "_STATIC_INJECTION_CACHE", {})
+    monkeypatch.setattr(action_parser, "_SLOW_INJECTION_SEC", 0.01)
+    monkeypatch.setattr(
+        action_parser,
+        "_load_action_plugins",
+        lambda: [_SlowInjectionPlugin(0.05)],
+    )
+
+    info_lines: list[str] = []
+    debug_lines: list[str] = []
+    monkeypatch.setattr(action_parser, "log_info", info_lines.append)
+    monkeypatch.setattr(action_parser, "log_debug", debug_lines.append)
+
+    await action_parser.gather_static_injections()
+
+    timing = [line for line in info_lines if "static injections:" in line]
+    assert len(timing) == 1, info_lines
+    assert "slowest: _SlowInjectionPlugin" in timing[0]
+    assert "block(s) in" in timing[0]
+    assert not [line for line in debug_lines if "took" in line], (
+        "a slow plugin is named in the aggregate line, not logged again on its own"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_fast_gather_says_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No slow plugin means no timing line: the panel is for problems, not decoration."""
+    from core import action_parser
+
+    monkeypatch.setattr(action_parser, "_STATIC_INJECTION_CACHE", {})
+    monkeypatch.setattr(
+        action_parser,
+        "_load_action_plugins",
+        lambda: [_BlockInjectionPlugin({"weather": "wttr.in text"})],
+    )
+
+    info_lines: list[str] = []
+    monkeypatch.setattr(action_parser, "log_info", info_lines.append)
+
+    await action_parser.gather_static_injections()
+
+    assert not [line for line in info_lines if "static injections:" in line]

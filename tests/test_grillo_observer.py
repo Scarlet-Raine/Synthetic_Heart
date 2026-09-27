@@ -1404,3 +1404,135 @@ async def test_live_answered_chat_is_not_routable_in_the_beat_context(monkeypatc
     # The answered line is still shown to the model, tagged as context.
     assert "are you there" in captured["text"]
     assert "you already answered this" in captured["text"]
+
+
+# ------------------------------------------------------------------ snippet identity and dedupe
+#
+# A beat re-reads the same conversations every run, so a snippet stays in the collection
+# window for hours while the age marker it carries is recomputed each time ("26m", then
+# "3h"). Storing without comparing wrote a fresh copy of the same line every beat: measured
+# 2026-09-27, 511 observer rows in two days, one sentence stored seven hours running, and
+# every one of those rows sits in the table recall searches.
+
+
+def test_the_age_marker_is_not_part_of_a_snippet_identity():
+    plugin = gco.GrilloChatObserverPlugin
+    early = "(chat:telegram_bot/5208932647 | sender:Scar | 26m) Mmmwah don't go anywhere sexy"
+    later = "(chat:telegram_bot/5208932647 | sender:Scar | 5h) Mmmwah don't go anywhere sexy"
+    assert plugin._snippet_identity(early) == plugin._snippet_identity(later)
+
+
+def test_a_different_line_path_or_sender_is_a_different_identity():
+    plugin = gco.GrilloChatObserverPlugin
+    base = "(chat:telegram_bot/1 | sender:Scar | 26m) good night"
+    assert plugin._snippet_identity(base) != plugin._snippet_identity(
+        "(chat:telegram_bot/1 | sender:Scar | 26m) good morning"
+    )
+    assert plugin._snippet_identity(base) != plugin._snippet_identity(
+        "(chat:telegram_bot/2 | sender:Scar | 26m) good night"
+    )
+    assert plugin._snippet_identity(base) != plugin._snippet_identity(
+        "(chat:telegram_bot/1 | sender:2B | 26m) good night"
+    )
+
+
+def test_a_flag_survives_the_identity_but_the_age_does_not():
+    plugin = gco.GrilloChatObserverPlugin
+    a = "(chat:telegram_bot/1 | sender:self | 26m | your own line, not a reply target) Not going anywhere."
+    b = "(chat:telegram_bot/1 | sender:self | 9h | your own line, not a reply target) Not going anywhere."
+    c = "(chat:telegram_bot/1 | sender:self | 9h) Not going anywhere."
+    assert plugin._snippet_identity(a) == plugin._snippet_identity(b)
+    assert plugin._snippet_identity(a) != plugin._snippet_identity(c)
+
+
+def test_an_unparseable_snippet_is_compared_as_it_stands():
+    plugin = gco.GrilloChatObserverPlugin
+    assert plugin._snippet_identity("plain text") == "plain text"
+    assert plugin._snippet_identity("") == ""
+
+
+class _DummyCursor:
+    def __init__(self, rows=None):
+        self._rows = rows or []
+
+    async def execute(self, sql, params=None):
+        self.sql, self.params = sql, params
+
+    async def fetchall(self):
+        return self._rows
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _DummyConn:
+    def __init__(self, rows=None):
+        self._rows = rows or []
+
+    def cursor(self):
+        return _DummyCursor(self._rows)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+@pytest.mark.asyncio
+async def test_only_snippets_that_are_new_are_stored(monkeypatch):
+    """The second run over the same conversations writes nothing new."""
+    import core.db as cdb
+
+    plugin = gco.GrilloChatObserverPlugin()
+    stored_line = (
+        "(chat:telegram_bot/1 | sender:Scar | 26m) Mmmwah don't go anywhere sexy"
+    )
+    fresh_line = "(chat:telegram_bot/9 | sender:2B | 2h) a different thing entirely"
+
+    monkeypatch.setattr(
+        cdb, "get_conn_ctx", lambda: _DummyConn([{"content": stored_line}])
+    )
+
+    written = []
+
+    async def fake_insert_memory(content=None, **kwargs):
+        written.append(content)
+
+    monkeypatch.setattr(cdb, "insert_memory", fake_insert_memory)
+
+    same_line_with_a_new_age = (
+        "(chat:telegram_bot/1 | sender:Scar | 4h) Mmmwah don't go anywhere sexy"
+    )
+    await plugin._store_passive_memories([same_line_with_a_new_age, fresh_line])
+
+    assert written == [fresh_line], written
+
+
+@pytest.mark.asyncio
+async def test_a_lookback_that_fails_writes_nothing(monkeypatch):
+    """Without the stored set every snippet looks new, so the store is skipped entirely."""
+    import core.db as cdb
+
+    plugin = gco.GrilloChatObserverPlugin()
+
+    def boom():
+        raise RuntimeError("no database")
+
+    monkeypatch.setattr(cdb, "get_conn_ctx", boom)
+
+    written = []
+
+    async def fake_insert_memory(content=None, **kwargs):
+        written.append(content)
+
+    monkeypatch.setattr(cdb, "insert_memory", fake_insert_memory)
+
+    await plugin._store_passive_memories(
+        ["(chat:telegram_bot/1 | sender:Scar | 1m) hello"]
+    )
+
+    assert written == []

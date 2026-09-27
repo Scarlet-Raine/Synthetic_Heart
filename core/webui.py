@@ -1006,6 +1006,9 @@ class SynthWebUIInterface:
         # starts the pass in the background.
         self.app.get("/api/soul/redistil")(self.soul_redistil_status)
         self.app.post("/api/soul/redistil")(self.start_soul_redistil)
+        # On-demand run of the nightly memory compaction (Settings → Memory Compaction).
+        self.app.get("/api/grillo/compaction")(self.grillo_compaction_status)
+        self.app.post("/api/grillo/compaction")(self.start_grillo_compaction)
 
         # Agent tasks endpoints (Agentic Runtime persistence)
         self.app.get("/api/agent/tasks")(self.list_agent_tasks)
@@ -10412,6 +10415,68 @@ class SynthWebUIInterface:
             raise
         except Exception as exc:
             log_error(f"{LOG_PREFIX} Failed to start the re-distil pass: {exc}")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    # ------------------------------------------------------------------
+    # Nightly compaction, on demand (Settings → Memory Compaction)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _compactor_plugin():
+        """Return the loaded Grillo compactor, or raise 503 when it is not there."""
+        from core.core_initializer import PLUGIN_REGISTRY
+
+        plugin = (
+            PLUGIN_REGISTRY.get("grillo_compactor")
+            if isinstance(PLUGIN_REGISTRY, dict)
+            else None
+        )
+        if plugin is None or not hasattr(plugin, "start_compaction_now"):
+            raise HTTPException(
+                status_code=503, detail="Grillo compactor is not available"
+            )
+        return plugin
+
+    async def grillo_compaction_status(self):
+        """Report on the on-demand compaction: running, last result, and the preview.
+
+        The preview is what a press would cost (days the archive already covers are
+        skipped), so nobody has to press to find out whether the pass would do anything.
+        """
+        try:
+            plugin = self._compactor_plugin()
+            return JSONResponse({"success": True, **(await plugin.compaction_status())})
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log_error(f"{LOG_PREFIX} Failed to read compaction status: {exc}")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    async def start_grillo_compaction(self, request: Request):
+        """Start the nightly compaction pass now, in the background.
+
+        One model call per eligible diary day, so this only starts it; the caller polls
+        GET for progress and for the summary. An optional ``{"dry_run": true}`` body
+        reports what the pass would do without writing anything.
+        """
+        plugin = self._compactor_plugin()
+        dry_run = False
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            dry_run = bool(payload.get("dry_run", False))
+        try:
+            return JSONResponse(
+                {
+                    "success": True,
+                    **(await plugin.start_compaction_now(dry_run=dry_run)),
+                }
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log_error(f"{LOG_PREFIX} Failed to start the compaction pass: {exc}")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     # ------------------------------------------------------------------

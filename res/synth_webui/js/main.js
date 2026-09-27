@@ -6744,6 +6744,129 @@ function pickAccentDarkFromHex(hex) { return darkenHex(hex, 0.28); }
                             }
                         });
                     }
+                    // ── Memory compaction ─────────────────────────────────────
+                    // Grillo's nightly pass turns each past day of diary into one
+                    // memory. Running it by hand is how the pass gets checked without
+                    // waiting for the next night: one model call per eligible day, run
+                    // in the background on the server, so this polls for progress and
+                    // for the summary of what the pass actually did.
+                    const compactBtn = document.getElementById('run-compaction-now');
+                    const compactStatus = document.getElementById('compaction-status');
+                    if (compactBtn && !window.__synth_compaction_wired) {
+                        window.__synth_compaction_wired = true;
+                        if (window.__synth_compaction_timer) {
+                            window.clearTimeout(window.__synth_compaction_timer);
+                            window.__synth_compaction_timer = null;
+                        }
+
+                        const COMPACT_WARN = '#d08b2c';
+
+                        const compactPreviewLine = (state) => {
+                            const preview = (state && state.preview) || {};
+                            if (typeof preview.days !== 'number') return '';
+                            const considered = preview.days;
+                            const covered = typeof preview.covered === 'number' ? preview.covered : 0;
+                            const remaining = typeof preview.remaining === 'number'
+                                ? preview.remaining
+                                : Math.max(0, considered - covered);
+                            const stored = typeof preview.stored_days === 'number' ? preview.stored_days : null;
+                            if (!considered) {
+                                if (stored === 0) return 'No diary days are stored yet.';
+                                return stored === null
+                                    ? 'Nothing is old enough to compact yet.'
+                                    : `Nothing is old enough to compact yet (${stored} day(s) stored).`;
+                            }
+                            if (!remaining) {
+                                return `All ${considered} day(s) the pass would consider already have a memory, so it would spend no model calls.`;
+                            }
+                            return `${considered} day(s) to consider, ${covered} of them already compacted. A pass would summarise up to ${remaining}, one model call each.`;
+                        };
+
+                        const compactResultLine = (summary) => {
+                            if (!summary) return '';
+                            const parts = [`${summary.persisted || 0} day(s) summarised`];
+                            if (summary.left_unchanged) parts.push(`${summary.left_unchanged} left unchanged`);
+                            if (summary.skipped_covered) parts.push(`${summary.skipped_covered} skipped as already compacted`);
+                            if (summary.errors) parts.push(`${summary.errors} failed`);
+                            const calls = summary.model_calls || 0;
+                            return `Last pass: ${parts.join(', ')}, ${calls} model call(s).`;
+                        };
+
+                        const paintCompaction = (state) => {
+                            if (!compactStatus) return;
+                            const summary = state && state.summary;
+                            const problems = (summary && summary.errors) || 0;
+                            compactStatus.style.color =
+                                (problems || (state && state.error)) ? COMPACT_WARN : '';
+                            compactBtn.disabled = !!(state && state.running);
+                            if (state && state.running) {
+                                compactStatus.textContent = state.dry_run
+                                    ? 'Checking what the pass would do…'
+                                    : 'Running the nightly compaction now, one model call per day. This can take a few minutes…';
+                                return;
+                            }
+                            if (state && state.error) {
+                                compactStatus.textContent = `Pass failed: ${state.error}`;
+                                return;
+                            }
+                            if (summary) {
+                                compactStatus.textContent =
+                                    `${compactResultLine(summary)} ${compactPreviewLine(state)}`.trim();
+                                return;
+                            }
+                            compactStatus.textContent = compactPreviewLine(state) || 'Ready.';
+                        };
+
+                        const pollCompaction = async () => {
+                            let state = null;
+                            try {
+                                const response = await fetch('/api/grillo/compaction');
+                                const payload = await response.json().catch(() => ({}));
+                                if (response.ok && payload.success) state = payload;
+                                else if (compactStatus) {
+                                    compactStatus.textContent = 'Compaction status unavailable.';
+                                    return;
+                                }
+                            } catch (error) {
+                                if (compactStatus) compactStatus.textContent = 'Compaction status unavailable.';
+                                return;
+                            }
+                            paintCompaction(state);
+                            if (state && state.running) {
+                                window.__synth_compaction_timer = window.setTimeout(pollCompaction, 5000);
+                            }
+                        };
+
+                        compactBtn.addEventListener('click', async () => {
+                            compactBtn.disabled = true;
+                            if (compactStatus) compactStatus.textContent = 'Starting…';
+                            try {
+                                const response = await fetch('/api/grillo/compaction', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({}),
+                                });
+                                const payload = await response.json().catch(() => ({}));
+                                if (!response.ok || !payload.success) {
+                                    throw new Error(payload.detail || payload.error || `HTTP ${response.status}`);
+                                }
+                                if (payload.started === false && payload.reason === 'already_running') {
+                                    try { if (window.showToast) window.showToast('A compaction pass is already running.', false); } catch (e) { /* ignore */ }
+                                } else {
+                                    try { if (window.showToast) window.showToast('Running the nightly compaction now, in the background.', false); } catch (e) { /* ignore */ }
+                                }
+                                paintCompaction(payload);
+                                window.__synth_compaction_timer = window.setTimeout(pollCompaction, 3000);
+                            } catch (error) {
+                                const message = error && error.message ? error.message : 'Could not start the pass';
+                                if (compactStatus) compactStatus.textContent = `Could not start: ${message}`;
+                                try { if (window.showToast) window.showToast(`Compaction failed to start: ${message}`, true); } catch (e) { /* ignore */ }
+                                compactBtn.disabled = false;
+                            }
+                        });
+
+                        pollCompaction();
+                    }
                     initNotifications();
                     window.__synth_settings_initialized = true;
                 }

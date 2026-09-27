@@ -1051,14 +1051,85 @@ class GrilloChatObserverPlugin:
         except Exception:
             return "?"
 
+    # How many recent observer rows are compared against when deciding whether a
+    # snippet has already been stored. A snippet stays in the collection window for
+    # hours, so the same lines come back beat after beat; a few hundred rows cover
+    # every conversation the observer can currently see.
+    _DEDUPE_LOOKBACK_ROWS = 500
+
+    @staticmethod
+    def _snippet_identity(snippet: str) -> str:
+        """Identity of a snippet for dedupe, with the volatile age marker removed.
+
+        A snippet is rendered as ``(chat:<path> | sender:<who> | <age>[ | <flags>]) body``
+        and the age is recomputed on every run, so the same line arrives looking new
+        each beat (``26m``, then ``3h``, then ``5h``). Dropping that one field keeps the
+        identity stable across runs while the path, the sender, any flag and the body
+        still have to match. Fail-safe: anything unparseable is compared as it stands.
+        """
+        text = (snippet or "").strip()
+        head, sep, body = text.partition(") ")
+        if not sep or not head.startswith("("):
+            return text
+        parts = [p.strip() for p in head[1:].split("|")]
+        if len(parts) >= 3:
+            parts = [parts[0], parts[1], *parts[3:]]
+        return "(" + " | ".join(parts) + ") " + body.strip()
+
+    async def _load_stored_snippet_identities(self) -> set:
+        """Identities of the observer rows already in ``memories`` (recent window)."""
+        from core.db import get_conn_ctx
+
+        async with get_conn_ctx() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT content FROM memories WHERE scope = %s ORDER BY id DESC LIMIT %s",
+                    ("observer", self._DEDUPE_LOOKBACK_ROWS),
+                )
+                fetched = await cur.fetchall()
+
+        out = set()
+        for r in fetched or []:
+            content = r.get("content") if isinstance(r, dict) else (r[0] if r else None)
+            if content:
+                out.add(self._snippet_identity(str(content)))
+        return out
+
     async def _store_passive_memories(self, snippets: List[str]) -> None:
-        """Persist observer snippets as passive memories when enabled."""
+        """Persist observer snippets as passive memories, once each.
+
+        A beat re-reads the same conversations every run, so a snippet stays in the
+        window for hours and the age marker it carries is rewritten each time. Storing
+        without comparing wrote a fresh copy of the same line every beat (measured
+        2026-09-27: 511 observer rows in two days, one sentence stored seven times, and
+        those rows are in the table recall searches), so the same line could reach a
+        prompt several times over. The age marker is stripped before comparison and a
+        snippet that is already stored is skipped.
+        """
         try:
             from core.db import insert_memory
 
+            try:
+                stored = await self._load_stored_snippet_identities()
+            except Exception as e:
+                # Without the comparison every snippet looks new, which is exactly the
+                # duplication this guard exists to stop: skip the store for this run
+                # rather than write copies, and say so loudly enough to be found.
+                log_warning(
+                    "[grillo_chat_observer] could not read stored observer memories "
+                    f"({e}); skipping this run's memory store"
+                )
+                return
+
             tags = json.dumps(["grillo", "observer", "passive"])
+            written = 0
+            skipped = 0
             for snippet in snippets:
                 try:
+                    identity = self._snippet_identity(snippet)
+                    if identity in stored:
+                        skipped += 1
+                        continue
                     await insert_memory(
                         content=snippet,
                         author="observer",
@@ -1066,10 +1137,13 @@ class GrilloChatObserverPlugin:
                         tags=tags,
                         scope="observer",
                     )
+                    stored.add(identity)
+                    written += 1
                 except Exception as e:
                     log_debug(f"[grillo_chat_observer] Failed to store memory: {e}")
             log_info(
-                f"[grillo_chat_observer] Stored {len(snippets)} observer snippets as memories"
+                f"[grillo_chat_observer] Stored {written} observer snippet(s) as memories "
+                f"({skipped} already stored, skipped)"
             )
         except Exception as e:
             log_warning(f"[grillo_chat_observer] Memory storage failed: {e}")

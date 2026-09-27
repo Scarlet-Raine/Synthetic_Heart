@@ -556,6 +556,20 @@ and `update_emotion_state` briefs, and the emotion-type list (215).
 11. **Both commits are live as of 15:13 on 2026-09-24** and verified in §0.6. What is *not* verified is
     the mid-day part-merge on today's own row (46,702 chars and growing, the first day over the chunk
     limit): its first part will be the live proof, and its log line is `consolidating PART 1 of N`.
+12. **A beat's JSON needed four repair passes — investigated 2026-09-27, not a defect; the timing lines
+    were tidied.** The 08:04:57 observer beat logged `extract_json_from_text` recovering its payload after
+    four parse errors. Read against the code, that is the extractor doing its job: `json_utils.py:752`
+    reports `Extracted JSON with 1849 extra chars (prefix: 396, suffix: 1453)`, i.e. the model wrote
+    narration around the envelope, and the message chain then recorded `parsed=True recovered=False` at
+    08:05:12 and executed the action (`create_personal_diary_entry`). **No second model call is involved** —
+    the repair passes are local parse attempts — so the earlier note's "costs a second model round trip"
+    was wrong, and the narration itself is her voice rather than something to prompt away. What was worth
+    changing was the logging: the four `get_static_injection()` lines were INFO with a warning glyph and a
+    per-plugin duration (each genuinely over the 0.1 s threshold, measured per plugin, not cumulative),
+    which is one line per slow plugin per prompt build — six in that beat. They are now one aggregated
+    line per build (`static injections: N block(s) in X.XXs; slowest: A 0.541s, B 0.302s`, `action_parser.py`
+    `_SLOW_INJECTION_SEC`), with the per-plugin detail at `log_debug`. The 1.13 s prompt build in that
+    window is the price of the blocks themselves, not of the repair.
 
 ---
 

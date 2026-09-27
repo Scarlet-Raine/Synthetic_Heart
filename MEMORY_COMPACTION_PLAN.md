@@ -150,8 +150,9 @@ observer included: `memories` went 14 to 21 at 00:38:41 with 7 rows of `source='
 growing `memories` count is not by itself evidence that compaction ran. Count the compactor's own rows with
 `source='compaction'`.
 
-**Still to implement:** F6 only (the prompt-side caps and the duplicate `[Recent context from other
+**Still to implement:** F6 (the prompt-side caps and the duplicate `[Recent context from other
 conversations]` entry, which live in `core/prompt_engine.py` and are independent of everything here).
+F9 was carried out on 2026-09-27, below.
 
 **Day-unit level-1 pass, implemented 2026-09-24, live 2026-09-25:** the compactor now defaults to one day in,
 one day out (`GRILLO_COMPACT_DAY_UNITS`, default true, false restores the clustering path untouched).
@@ -257,6 +258,55 @@ is computed from the FULL content (`:721`), so the ratio checks compare a summar
 never saw. Decide deliberately: either send more per row (and budget for it), or say in the prompt what
 the slice is, and consider whether `personal_thought` belongs in compaction at all, given the anchors
 requirement in §16.1 of the audit.
+
+### F9 (found live 2026-09-27) the duplicate material already in the store, and how to clear it
+
+The two defects that produced these rows are fixed in code (see `CHANGELOG.md`, 2026-09-27: the observer
+now dedupes a snippet by an identity with the volatile age marker stripped, and the day-unit pass skips a
+day the archive already holds a record for). What is still there is the material already written:
+
+* `memories` with `scope='observer'`: **511 rows** since 2026-09-25, growing 6-7 an hour, one sentence of
+  Scar's stored at 00:00, 01:00, 04:00, 05:00, 06:00 and 07:00 local, every copy identical except for the
+  age marker. `GRILLO_OBSERVER_STORE_MEMORIES` is the lever that decides whether they are written at all.
+* **Seven days carry two compaction memories each**: 08-29 (261+525), 09-04 (258+262), 09-06 (115+143),
+  09-07 (144+259), 09-08 (140+526), 09-17 (142+260), 09-19 (141+527). `ai_diary_archive` agrees: 22
+  day-unit records across 15 days, seven of them doubled for one source day. Each second copy is a later
+  nightly pass over a day that had already been summarised, and on 2026-09-27 that pass paid 15 model
+  calls for work that needed 5.
+
+Related trap found while fixing this: `GRILLO_COMPACT_ALLOW_RECOMPACT` (registered, label "Allow
+Recompaction of Archived Memories", default true) is **never read** - only assigned in `__init__`
+(`grillo_compactor.py:360`) - so its description ("allow archived_memories to be considered in future
+compaction runs") describes behaviour no code implements. The new skip is unconditional instead, and the
+way to make one day eligible again is to delete the archive record that names it.
+
+This needed a decision before any row was touched, because it is her memory and not test data: merge each
+doubled day into one memory and remove the redundant observer rows, or leave the rows and rely on the new
+dedupe to stop the growth. The owner asked for it to be carried out on 2026-09-27. What was done:
+
+* **Backup first, at the repository root** (the same convention as the existing `repair_backup_*.json`):
+  `dedupe_backup_20260927T074124Z.json`, 338,064 bytes, holding every affected row in full - both
+  categories, with ids, text, timestamps and the identity each observer row matched under. Restoring any
+  removed row means re-inserting it from that file.
+* **Seven doubled days merged**: the NEWER summary was kept in every pair (08-29: 261 gone, 525 kept;
+  09-04: 258/262; 09-06: 115/143; 09-07: 144/259; 09-08: 140/526; 09-17: 142/260; 09-19: 141/527), the
+  superseded text was copied into `archived_memories` first (`tag='superseded_duplicate'`,
+  `created_by='dedupe_cleanup'`, `notes` naming the survivor, ids 37-43), and only then was the duplicate
+  `memories` row deleted. The newer row is the day-unit summary, which is the one that carries the day's
+  anchors.
+* **Observer rows deduped**: 527 rows to **65**, one per snippet identity, computed with the same
+  `_snippet_identity` the observer now dedupes with. These were deleted rather than archived, deliberately
+  and against the earlier suggestion in this section: each is a verbatim copy of a message that is still in
+  `chat_history_cache` (and the whole set is in the backup file), so archiving them would have put the same
+  text in a third place and added 462 rows of chat snippets to the compactor's archive table. If they should
+  live in `archived_memories` after all, the backup file has all of them.
+* **The compactor's day-unit records in `archived_memories` were left exactly as they are.** They are the
+  index `_covered_day_ids` reads to decide a day is done, so deleting the second record for a day would
+  re-open that day to another nightly pass. The audit trail of what each pass produced is worth more than
+  the tidiness, and the skip logic needs both records to be harmless.
+* Verified after the change: `memories` total 563 to 94 (observer 527 to 65, compaction 22 to 15, other
+  categories untouched at 14), all seven kept day rows present, all seven removed ones absent, seven
+  `dedupe_cleanup` archive rows written.
 
 ---
 

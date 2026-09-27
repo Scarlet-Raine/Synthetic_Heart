@@ -103,7 +103,9 @@ async def test_run_one_compaction_cycle_basic(monkeypatch):
 
     # Run one cycle
     res = await p._run_one_compaction_cycle()
-    assert res is True
+    # The day-unit pass reports a counted summary (the WebUI panel reads it); the
+    # clustering path still returns True. Either way, a failed cycle returns False.
+    assert res is True or (isinstance(res, dict) and res.get("dry_run") is False)
 
 
 @pytest.mark.asyncio
@@ -195,7 +197,9 @@ async def test_tag_selection_fallback(monkeypatch):
     )
 
     res = await p._run_one_compaction_cycle()
-    assert res is True
+    # The day-unit pass reports a counted summary (the WebUI panel reads it); the
+    # clustering path still returns True. Either way, a failed cycle returns False.
+    assert res is True or (isinstance(res, dict) and res.get("dry_run") is False)
 
 
 def test_confidence_label_is_coerced_to_a_number():

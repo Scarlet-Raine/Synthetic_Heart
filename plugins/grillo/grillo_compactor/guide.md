@@ -22,6 +22,33 @@ The plugin is **runnable** from the WebUI Plugins tab: the **Run compaction**
 button triggers a single compaction cycle on demand (dispatched to
 `run_action("compact_now", ...)`) without waiting for the nightly schedule.
 
+### Settings → Memory Compaction
+
+The Settings tab carries a **Memory Compaction** card, next to Memory
+Re-Distillation, whose button runs the *same* pass the nightly schedule runs
+(the day-unit pass, `_run_one_compaction_cycle`), not the legacy clustering
+cycles that `run_action` drives. It exists so a change to the pass can be
+checked the same minute instead of a day later.
+
+* `POST /api/grillo/compaction` starts a pass in the background and returns
+  immediately (`{"dry_run": true}` in the body reports what the pass would do
+  without writing anything). One model call per eligible day, so it is not
+  something to hold an HTTP request open for.
+* `GET /api/grillo/compaction` reports `running`, the last summary, and a
+  preview of what a press would do - days stored, days the archive already
+  covers, what is left - computed without a model call.
+* A second press while a pass is running is refused (`already_running`), so a
+  double click cannot double the night's model calls.
+* The summary counts every outcome: `persisted`, `left_unchanged`, `errors`,
+  `skipped_covered` (days the archive already holds a memory for),
+  `skipped_failed`, `covered_total`, `model_calls`. A pass that skipped
+  everything is therefore visible as such rather than looking like a quiet night.
+* If the archive cannot be read the summary carries `archive_unreadable: true`
+  and the panel says the pass stood down instead of reporting success.
+
+The endpoint answers 503 when the Grillo compactor is not loaded, so the card
+degrades honestly rather than appearing to work.
+
 ## How it works
 
 The plugin clusters candidate memories older than `GRILLO_COMPACT_AGE_DAYS`,
