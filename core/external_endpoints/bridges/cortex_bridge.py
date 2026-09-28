@@ -13,7 +13,7 @@ import base64
 import contextlib
 import copy
 import json
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from core.ai_plugin_base import AIPluginBase
 from core.external_endpoints.models import EndpointProtocol
@@ -1775,6 +1775,12 @@ class ExternalCortexEngine(AIPluginBase):
         that salience for ordinary JSON-protocol turns. Native-tool turns
         declare the contract via tools (``supports_tool_calling`` True) and are
         skipped.
+
+        A multimodal turn carries its current turn as a content-part list
+        (``image_url`` / ``input_audio`` / ``text``) rather than a plain string,
+        so the reminder goes on the trailing text part of that list — otherwise
+        an image turn loses the format anchor the text path gets and answers in
+        prose, forcing a correction round-trip on every picture.
         """
         try:
             if getattr(prompt, "supports_tool_calling", True):
@@ -1784,9 +1790,19 @@ class ExternalCortexEngine(AIPluginBase):
             last = messages[-1]
             if not isinstance(last, dict) or last.get("role") != "user":
                 return
-            content = last.get("content")
+            content: Any = last.get("content")
             if isinstance(content, str):
                 last["content"] = content + _JSON_FORMAT_REMINDER
+            elif isinstance(content, list):
+                parts: list[Any] = content
+                for raw_part in reversed(parts):
+                    if not isinstance(raw_part, dict):
+                        continue
+                    part = cast("dict[str, Any]", raw_part)
+                    if part.get("type") == "text" and isinstance(part.get("text"), str):
+                        part["text"] = part["text"] + _JSON_FORMAT_REMINDER
+                        return
+                parts.append({"type": "text", "text": _JSON_FORMAT_REMINDER.lstrip()})
         except Exception as exc:
             log_debug(f"[cortex_bridge] format reminder skip: {exc}")
 

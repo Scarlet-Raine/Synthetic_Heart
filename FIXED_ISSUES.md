@@ -5,6 +5,12 @@
 
 ---
 
+### An attached picture silently lost the JSON format reminder, so image turns took a correction round-trip  <!-- 2026-09-28 -->
+**Symptom:** attaching an image to a message reliably triggered the corrector: `logs/cortex_api.log` shows 3 of 5 image turns answering in plain in-character prose (no JSON envelope) against 96 of 96 text chat turns answering with valid JSON, so the follow-up correction call ran almost every picture.
+**Location:** `core/external_endpoints/bridges/cortex_bridge.py::ExternalCortexEngine._append_json_format_reminder` (the `isinstance(content, str)` guard); `core/prompt_renderers.py::_build_multimodal_turn_text` (renders the image turn as a content-part list).
+**Status:** fixed (2026-09-28).
+**Notes:** the reminder ("Respond with ONLY valid JSON — your ENTIRE reply must be the JSON actions object…") is appended to the last user message because the system prompt is far too long to hold the format contract at generation time; a text turn ends with it, but a multimodal turn's current message is a `[{type: image_url}, {type: text}]` list, so the str-only guard skipped it and the image turn ended with the vision frame instead. Replaying the captured failing turn against the same endpoint proved the image itself is innocent — the image rides the same call (a probe image was read back correctly and costs ~185 prompt tokens) and the envelope survives or breaks purely with the trailing instruction: as sent 2/6, without the reminder 1/6, with the reminder restored 6/6. The reminder now also lands on the trailing text part of a part-list turn (and is added as its own part when the list carries no text), so picture turns get the same format anchor as text turns. **Tests:** `tests/test_external_endpoints_adapter.py::test_json_format_reminder_appended_to_multimodal_turn` and `::test_json_format_reminder_adds_text_part_when_multimodal_list_has_none`.
+
 
 ### The upcoming-events block was built every turn and never rendered  <!-- 2026-09-26 -->
 **Symptom:** `plugins/event_plugin` produced the `upcoming_events` block every turn and the model never saw it - the last of the three keys the drop detector named, after `todays_dream` and `facial_expression_guidance`.

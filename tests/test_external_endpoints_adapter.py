@@ -2177,6 +2177,69 @@ def test_json_format_reminder_skipped_for_native_tool_turns():
     assert "Respond with ONLY valid JSON" not in last["content"]
 
 
+def test_json_format_reminder_appended_to_multimodal_turn():
+    """A picture turn must carry the same format reminder as a text turn.
+
+    Multimodal turns render the current turn as a content-part list rather than
+    a plain string. The reminder used to be applied only to ``str`` content, so
+    an image turn silently lost the format anchor that sits next to the text
+    being answered and the model replied in prose — a correction round-trip on
+    every attached picture.
+    """
+    from core.external_endpoints.bridges.cortex_bridge import ExternalCortexEngine
+    from core.prompt_request import Attachment, PromptRequest, RuntimeContext
+
+    engine = ExternalCortexEngine(_openai_endpoint({}), cast(Any, SimpleNamespace()))
+    prompt = PromptRequest(
+        system_instruction="Use JSON.",
+        current_text="look at this one",
+        tool_declarations=[],
+        attachments=[Attachment(mime_type="image/jpeg", data="AAAA")],
+        runtime_ctx=RuntimeContext(
+            interface_name="telegram_bot", interface_path="telegram_bot/123"
+        ),
+        supports_tool_calling=False,
+    )
+    messages = engine._build_messages(prompt)
+    last = messages[-1]
+    assert last["role"] == "user"
+    assert isinstance(last["content"], list)
+
+    parts: list[dict[str, Any]] = last["content"]
+    assert parts[0]["type"] == "image_url"
+    text_part = next(p for p in parts if p["type"] == "text")
+    assert "Respond with ONLY valid JSON" in text_part["text"]
+    assert "your ENTIRE reply must be the JSON" in text_part["text"]
+    # The reminder must be the LAST thing in the turn, after the vision frame.
+    assert text_part["text"].rstrip().endswith("}}]}")
+    assert text_part["text"].index("[VISION:") < text_part["text"].index(
+        "Respond with ONLY valid JSON"
+    )
+
+
+def test_json_format_reminder_adds_text_part_when_multimodal_list_has_none():
+    """A part-list turn with no text part still gets the reminder, not nothing."""
+    from core.external_endpoints.bridges.cortex_bridge import ExternalCortexEngine
+
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/jpeg;base64,AAAA"},
+                }
+            ],
+        }
+    ]
+    ExternalCortexEngine._append_json_format_reminder(
+        messages, SimpleNamespace(supports_tool_calling=False)
+    )
+    parts: list[dict[str, Any]] = messages[-1]["content"]
+    assert [p["type"] for p in parts] == ["image_url", "text"]
+    assert "Respond with ONLY valid JSON" in parts[-1]["text"]
+
+
 @pytest.mark.asyncio
 async def test_plain_native_action_json_is_capped_when_provider_ignores_tools():
     """A 200/plain-JSON fallback cannot flood one vessel turn with actions."""
