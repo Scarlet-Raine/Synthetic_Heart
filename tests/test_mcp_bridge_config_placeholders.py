@@ -13,10 +13,13 @@ The tests cover the resolution itself, then prove the end result by spawning the
 logs server from the real config file and calling a tool on it.
 
 The end-to-end test speaks the MCP stdio transport directly rather than importing
-the ``mcp`` client package: importing that package inside pytest trips over a
-pre-existing namespace-package shadow from a bundled ``node_modules/dotenv``, and
-the spawn plus a real ``tools/list`` / ``tools/call`` exchange is the stronger
-proof anyway.
+the ``mcp`` client package, because the spawn plus a real ``tools/list`` /
+``tools/call`` exchange is the stronger proof: it exercises the child process
+itself instead of the client library. (The reason it was *once* the only option is
+gone: pytest used to run with python-dotenv replaced by a stub carrying only
+``load_dotenv``, so the client package's ``dotenv_values`` import failed. The stub
+now leaves the real package in place — see ``tests/__init__.py`` and
+``test_the_mcp_client_package_imports_inside_pytest`` below.)
 """
 
 from __future__ import annotations
@@ -328,3 +331,27 @@ def test_the_real_config_actually_spawns_the_logs_server() -> None:
         )
     finally:
         rpc.close()
+
+
+def test_the_mcp_client_package_imports_inside_pytest() -> None:
+    """The dotenv stub must not shadow the real package.
+
+    ``tests/__init__.py`` used to replace python-dotenv for the whole process with
+    a stub carrying only ``load_dotenv``. ``mcp`` (through pydantic-settings)
+    imports ``dotenv_values``, so inside pytest the client could not be imported at
+    all and every stdio server failed to connect with "cannot import name
+    'dotenv_values' from 'dotenv' (unknown location)" — an ERROR per server per
+    connect attempt in the runtime log, with the servers otherwise healthy. The
+    first import below is the exact one that used to fail; the second is what the
+    client needs to open a session.
+    """
+    from dotenv import dotenv_values
+
+    assert callable(dotenv_values)
+
+    from mcp.client.session import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+
+    assert ClientSession is not None
+    assert StdioServerParameters is not None
+    assert stdio_client is not None

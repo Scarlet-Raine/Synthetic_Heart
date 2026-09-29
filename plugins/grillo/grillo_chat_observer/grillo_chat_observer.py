@@ -1057,6 +1057,48 @@ class GrilloChatObserverPlugin:
     # every conversation the observer can currently see.
     _DEDUPE_LOOKBACK_ROWS = 500
 
+    # A snippet younger than this is still the head of a conversation being
+    # spoken in right now: the very next prompt carries that same line as the
+    # live message, so remembering it writes a copy of the current turn into the
+    # store and the recall path serves it back beside the original. The model
+    # then reads one message as the person repeating themselves (live
+    # 2026-09-28 22:13: the human sent "I'm fine, your belly and ur so warm"
+    # once; the observer stored it 8s later and the outreach that followed wrote
+    # "'Fine' again. Second time in four minutes, husband"). Skipped, not
+    # dropped: the line stays in the collection window for hours, so a later
+    # beat stores it once it is genuinely history.
+    _FRESH_SNIPPET_SKIP_SEC = 300
+
+    @staticmethod
+    def _snippet_age_seconds(snippet: str) -> Optional[float]:
+        """Age in seconds the snippet's own age marker reports, or ``None``.
+
+        Snippets are rendered ``(chat:<path> | sender:<who> | <age>) body`` with
+        a compact age (``12m``, ``3h``, ``2d``; ``just now`` when younger than a
+        minute). Fail-safe: an unrecognised marker returns ``None`` so the
+        caller treats the line as old and stores it, never the reverse.
+        """
+        text = (snippet or "").strip()
+        head, sep, _body = text.partition(") ")
+        if not sep or not head.startswith("("):
+            return None
+        parts = [p.strip() for p in head[1:].split("|")]
+        if len(parts) < 3:
+            return None
+        label = parts[2].casefold()
+        if label.startswith("age:"):
+            label = label[4:]
+        if label.endswith(" ago"):
+            label = label[:-4]
+        label = label.strip()
+        if label in ("just now", "now"):
+            return 0.0
+        if len(label) >= 2 and label[:-1].isdigit():
+            factor = {"m": 60.0, "h": 3600.0, "d": 86400.0}.get(label[-1])
+            if factor is not None:
+                return float(int(label[:-1])) * factor
+        return None
+
     @staticmethod
     def _snippet_identity(snippet: str) -> str:
         """Identity of a snippet for dedupe, with the volatile age marker removed.
@@ -1105,6 +1147,11 @@ class GrilloChatObserverPlugin:
         those rows are in the table recall searches), so the same line could reach a
         prompt several times over. The age marker is stripped before comparison and a
         snippet that is already stored is skipped.
+
+        A snippet younger than ``_FRESH_SNIPPET_SKIP_SEC`` is skipped too: it is
+        still the head of a live conversation and the next prompt carries it as the
+        live message, so remembering it here is what put one message into a prompt
+        twice.
         """
         try:
             from core.db import insert_memory
@@ -1124,8 +1171,16 @@ class GrilloChatObserverPlugin:
             tags = json.dumps(["grillo", "observer", "passive"])
             written = 0
             skipped = 0
+            fresh = 0
             for snippet in snippets:
                 try:
+                    age_seconds = self._snippet_age_seconds(snippet)
+                    if (
+                        age_seconds is not None
+                        and age_seconds < self._FRESH_SNIPPET_SKIP_SEC
+                    ):
+                        fresh += 1
+                        continue
                     identity = self._snippet_identity(snippet)
                     if identity in stored:
                         skipped += 1
@@ -1143,7 +1198,7 @@ class GrilloChatObserverPlugin:
                     log_debug(f"[grillo_chat_observer] Failed to store memory: {e}")
             log_info(
                 f"[grillo_chat_observer] Stored {written} observer snippet(s) as memories "
-                f"({skipped} already stored, skipped)"
+                f"({skipped} already stored, {fresh} still live, skipped)"
             )
         except Exception as e:
             log_warning(f"[grillo_chat_observer] Memory storage failed: {e}")

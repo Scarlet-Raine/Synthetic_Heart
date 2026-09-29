@@ -895,6 +895,65 @@ def _sanitize_context_entries(entries: list[Any], *, kind: str) -> list[str]:
     return sanitized
 
 
+# A cross-chat line and the current turn's own text can carry the SAME message.
+# The Grillo observer's snippet feed is *itself* the message being answered on a
+# beat turn, and those snippets name the same lines the cross-chat block renders
+# from the chat map; a line that reached the prompt through both routes is then
+# read as the person repeating themselves (live 2026-09-28: the DM outreach wrote
+# "'Fine' again. Second time in four minutes, husband" off a single "I'm fine" the
+# human had sent once). The comparison is structural — punctuation, spacing and
+# case are stripped, then the quoted body is substring-matched — so it holds in
+# any language and never inspects meaning.
+_DUP_FINGERPRINT_RE = re.compile(r"[\W_]+", re.UNICODE)
+# Bodies shorter than this are not used for the match: a two-letter line ("ok",
+# "yes") occurs inside almost any turn text, and dropping a legitimately
+# different line would be worse than rendering one short duplicate.
+_MIN_DUP_BODY_CHARS = 16
+
+
+def _duplicate_fingerprint(value: Any) -> str:
+    """Case/punctuation/whitespace-folded form of a message, for duplicate checks."""
+    return _DUP_FINGERPRINT_RE.sub(" ", str(value or "").casefold()).strip()
+
+
+def _quoted_history_body(line: Any) -> str:
+    """The message text a rendered history line quotes, or ``""`` when it has none.
+
+    Lines render as ``[from <room>] [<ts>] <Sender>: "<text>"`` with an optional
+    reply quote between the sender and the body, so the body runs from the LAST
+    ``: "`` to the closing quote — exactly the text the model reads as "what this
+    person said".
+    """
+    text = str(line or "")
+    marker = text.rfind(': "')
+    if marker == -1:
+        return ""
+    body = text[marker + 3 :].rstrip()
+    if body.endswith('"'):
+        body = body[:-1]
+    return body.strip()
+
+
+def _drop_cross_chat_lines_repeating_turn(
+    lines: list[str], current_turn_text: Any
+) -> list[str]:
+    """Drop cross-chat lines whose message is already inside the current turn.
+
+    Returns ``lines`` unchanged when there is no turn text to compare against
+    (diary/thought entries carry no quoted body, so they are always kept).
+    """
+    turn = _duplicate_fingerprint(current_turn_text)
+    if not turn:
+        return lines
+    kept: list[str] = []
+    for line in lines:
+        body = _duplicate_fingerprint(_quoted_history_body(line))
+        if len(body) >= _MIN_DUP_BODY_CHARS and body in turn:
+            continue
+        kept.append(line)
+    return kept
+
+
 _EXPLICIT_RUNTIME_FACT_REQUEST_RE = re.compile(
     r"(?ix)\b("
     r"what(?:'s| is)?\s+(?:the\s+)?(?:time|date|day|timezone|location|weather)\b|"
@@ -1258,6 +1317,7 @@ def _build_context_summary(
     context_section: dict[str, Any],
     is_grillo_internal: bool = False,
     include_explicit_runtime_facts: bool = False,
+    current_turn_text: Any = "",
 ) -> str:
     """Format moderately-stable context parts into a plain text block.
 
@@ -1346,6 +1406,13 @@ def _build_context_summary(
         history_recent = _sanitize_context_entries(
             list(context_section.get("history_recent") or []),
             kind="history_recent",
+        )
+        # A line already present in the message being answered (the observer
+        # snippet feed on a beat turn carries the same lines) must not be rendered
+        # a second time: two copies of one message read as the person repeating
+        # themselves, and the model then says so out loud.
+        history_recent = _drop_cross_chat_lines_repeating_turn(
+            history_recent, current_turn_text
         )
         if history_recent:
             parts.append("[Recent context from other conversations]")
@@ -2033,6 +2100,10 @@ def _assemble_prompt_request(  # noqa: PLR0913
         include_explicit_runtime_facts=(
             is_grillo_internal or _turn_requests_explicit_runtime_facts(text)
         ),
+        # The turn being answered is the reference for the cross-chat block: a
+        # line it already carries is not repeated there (see
+        # _drop_cross_chat_lines_repeating_turn).
+        current_turn_text=text,
     )
 
     # ── Conversation history ─────────────────────────────────────────────────

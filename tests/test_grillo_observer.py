@@ -6,7 +6,9 @@ from core import message_queue
 
 
 @pytest.mark.asyncio
-async def test_observer_builds_prompt_and_collects(monkeypatch):
+async def test_observer_builds_prompt_and_collects(
+    monkeypatch, idle_eligible_target
+):
     plugin = gco.GrilloChatObserverPlugin()
 
     # force update checker to report new messages (DB not available)
@@ -50,6 +52,7 @@ async def test_observer_builds_prompt_and_collects(monkeypatch):
         called["text"] = getattr(message, "text", None)
 
     monkeypatch.setattr(message_queue, "enqueue_low_priority", fake_enqueue)
+    idle_eligible_target(plugin)
 
     # ensure the first-run guard is bypassed
     plugin._last_run_ts = 1.0
@@ -64,7 +67,9 @@ async def test_observer_builds_prompt_and_collects(monkeypatch):
     ]
 
 
-async def _run_observer_with_freshness_row(monkeypatch, plugin, cnt, max_ts):
+async def _run_observer_with_freshness_row(
+    monkeypatch, plugin, cnt, max_ts, idle_target
+):
     """Drive _run_observer with a stubbed freshness query, returning its context."""
 
     async def fake_execute_query(sql, params=None):
@@ -77,22 +82,7 @@ async def _run_observer_with_freshness_row(monkeypatch, plugin, cnt, max_ts):
 
     monkeypatch.setattr(plugin, "_collect_recent_snippets", fake_collect)
 
-    async def fake_collect_targets(limit: int) -> list[dict]:
-        # Hermetic: the real builder reads the live database, and whether its
-        # newest conversation is live decides whether a decay-driven run speaks
-        # at all. Pin an idle target so the freshness logic under test, not the
-        # operator's recent chat activity, decides whether this run proceeds.
-        return [
-            {
-                "interface_path": "telegram_bot/1",
-                "last_sender": "Scar",
-                "eligible": True,
-                "age_seconds": 7200.0,
-                "in_active_conversation": False,
-            }
-        ]
-
-    monkeypatch.setattr(plugin, "_collect_eligible_targets", fake_collect_targets)
+    idle_target(plugin)
 
     class FakeGrillo:
         @staticmethod
@@ -124,7 +114,9 @@ async def _run_observer_with_freshness_row(monkeypatch, plugin, cnt, max_ts):
 
 
 @pytest.mark.asyncio
-async def test_a_message_older_than_one_cadence_is_not_fresh_traffic(monkeypatch):
+async def test_a_message_older_than_one_cadence_is_not_fresh_traffic(
+    monkeypatch, idle_eligible_target
+):
     """A message that predates a downtime must not suppress the proactive note.
 
     The cursor only says "newer than the last run". After the process has been
@@ -137,7 +129,7 @@ async def test_a_message_older_than_one_cadence_is_not_fresh_traffic(monkeypatch
     seeded = datetime.now(timezone.utc) - timedelta(hours=7)
 
     captured = await _run_observer_with_freshness_row(
-        monkeypatch, plugin, cnt=5, max_ts=seeded
+        monkeypatch, plugin, cnt=5, max_ts=seeded, idle_target=idle_eligible_target
     )
 
     assert captured["ctx"]["decay_driven"] is True
@@ -146,13 +138,15 @@ async def test_a_message_older_than_one_cadence_is_not_fresh_traffic(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_a_message_inside_the_cadence_is_still_fresh_traffic(monkeypatch):
+async def test_a_message_inside_the_cadence_is_still_fresh_traffic(
+    monkeypatch, idle_eligible_target
+):
     """The ordinary case is untouched: a recent message keeps the reply framing."""
     plugin = gco.GrilloChatObserverPlugin()
     seeded = datetime.now(timezone.utc) - timedelta(minutes=5)
 
     captured = await _run_observer_with_freshness_row(
-        monkeypatch, plugin, cnt=1, max_ts=seeded
+        monkeypatch, plugin, cnt=1, max_ts=seeded, idle_target=idle_eligible_target
     )
 
     assert captured["ctx"]["decay_driven"] is False
@@ -314,6 +308,7 @@ async def test_collect_recent_snippets_reports_a_chat_where_only_the_synth_spoke
 @pytest.mark.asyncio
 async def test_observer_prompt_marks_own_lines_and_keeps_them_out_of_routing(
     monkeypatch,
+    idle_eligible_target,
 ):
     """The prompt carries the synth's own line; grillo_snippets (the routing
     channel the guard turns into reachable paths) does not."""
@@ -357,6 +352,7 @@ async def test_observer_prompt_marks_own_lines_and_keeps_them_out_of_routing(
     monkeypatch.setattr("core.chat_update_checker.check_for_updates_once", fake_check)
     monkeypatch.setattr("plugins.grillo.grillo_impl.GrilloPlugin", FakeGrillo)
     monkeypatch.setattr(message_queue, "enqueue_low_priority", fake_enqueue)
+    idle_eligible_target(plugin)
     plugin._last_run_ts = 1.0
 
     await plugin._run_observer()
@@ -489,7 +485,9 @@ async def test_collect_recent_snippets_keeps_human_lines_when_synth_spoke_last(
 
 
 @pytest.mark.asyncio
-async def test_observer_propose_only_flag_in_prompt(monkeypatch):
+async def test_observer_propose_only_flag_in_prompt(
+    monkeypatch, idle_eligible_target
+):
     plugin = gco.GrilloChatObserverPlugin()
     plugin.propose_only = True
 
@@ -527,6 +525,7 @@ async def test_observer_propose_only_flag_in_prompt(monkeypatch):
     monkeypatch.setattr(message_queue, "enqueue_low_priority", fake_enqueue)
 
     # bypass first-run guard
+    idle_eligible_target(plugin)
     plugin._last_run_ts = 1.0
     await plugin._run_observer()
 
@@ -539,7 +538,7 @@ async def test_observer_propose_only_flag_in_prompt(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_observer_runs_when_updates_present(monkeypatch):
+async def test_observer_runs_when_updates_present(monkeypatch, idle_eligible_target):
     plugin = gco.GrilloChatObserverPlugin()
 
     # Make the checker report that there are updates
@@ -576,6 +575,7 @@ async def test_observer_runs_when_updates_present(monkeypatch):
     monkeypatch.setattr(message_queue, "enqueue_low_priority", fake_enqueue)
 
     # bypass the first-run guard
+    idle_eligible_target(plugin)
     plugin._last_run_ts = 1.0
     await plugin._run_observer()
 
@@ -1510,6 +1510,77 @@ async def test_only_snippets_that_are_new_are_stored(monkeypatch):
     await plugin._store_passive_memories([same_line_with_a_new_age, fresh_line])
 
     assert written == [fresh_line], written
+
+
+def test_snippet_age_seconds_reads_the_markers():
+    """The age comes from the snippet's own marker; unknown means "treat as old"."""
+    plugin = gco.GrilloChatObserverPlugin
+
+    assert (
+        plugin._snippet_age_seconds("(chat:telegram_bot/1 | sender:Scar | 1m) hi")
+        == 60.0
+    )
+    assert (
+        plugin._snippet_age_seconds("(chat:telegram_bot/1 | sender:Scar | 12m) hi")
+        == 720.0
+    )
+    assert (
+        plugin._snippet_age_seconds("(chat:telegram_bot/1 | sender:Scar | 3h) hi")
+        == 10800.0
+    )
+    assert (
+        plugin._snippet_age_seconds("(chat:telegram_bot/1 | sender:Scar | 2d) hi")
+        == 172800.0
+    )
+    assert (
+        plugin._snippet_age_seconds("(chat:telegram_bot/1 | sender:Scar | just now) hi")
+        == 0.0
+    )
+    # A flag after the age still parses; anything unreadable is not fresh.
+    assert (
+        plugin._snippet_age_seconds(
+            "(chat:telegram_bot/1 | sender:Scar | 4m | you already answered this) hi"
+        )
+        == 240.0
+    )
+    assert (
+        plugin._snippet_age_seconds("(chat:telegram_bot/1 | sender:Scar | ?) hi")
+        is None
+    )
+    assert plugin._snippet_age_seconds("plain text") is None
+    assert plugin._snippet_age_seconds("") is None
+
+
+@pytest.mark.asyncio
+async def test_a_line_that_is_still_live_is_not_stored_as_a_memory(monkeypatch):
+    """A line still at the head of a conversation is not history yet.
+
+    Storing it writes a copy of the current turn into the store, and the recall
+    path then serves that copy back beside the live line, so the model reads one
+    message as the person repeating themselves (live 2026-09-28: a single "I'm
+    fine" produced "'Fine' again. Second time in four minutes, husband").
+    """
+    import core.db as cdb
+
+    plugin = gco.GrilloChatObserverPlugin()
+    live_line = (
+        "(chat:telegram_bot/5208932647 | sender:Scar | 1m) "
+        "I'm fine, your belly and and ur so warm"
+    )
+    historic_line = "(chat:telegram_bot/9 | sender:2B | 2h) a different thing entirely"
+
+    monkeypatch.setattr(cdb, "get_conn_ctx", lambda: _DummyConn([]))
+
+    written = []
+
+    async def fake_insert_memory(content=None, **kwargs):
+        written.append(content)
+
+    monkeypatch.setattr(cdb, "insert_memory", fake_insert_memory)
+
+    await plugin._store_passive_memories([live_line, historic_line])
+
+    assert written == [historic_line], written
 
 
 @pytest.mark.asyncio

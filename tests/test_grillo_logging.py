@@ -6,7 +6,7 @@ import plugins.grillo.grillo_dream as gd
 
 
 @pytest.mark.asyncio
-async def test_observer_logs_activity(caplog, monkeypatch):
+async def test_observer_logs_activity(caplog, monkeypatch, idle_eligible_target):
     caplog.set_level("INFO")
 
     logged_messages = []
@@ -49,6 +49,7 @@ async def test_observer_logs_activity(caplog, monkeypatch):
     monkeypatch.setattr(
         "core.message_queue.enqueue_low_priority", fake_enqueue_low_priority
     )
+    idle_eligible_target(observer)
 
     # Run observer once
     await observer._run_observer()

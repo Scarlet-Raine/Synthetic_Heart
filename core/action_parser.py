@@ -2530,6 +2530,20 @@ def _action_result_error(result: Any) -> str | None:
     return None
 
 
+def _is_reply_delivery_type(action_type: Any) -> bool:
+    """True for action types that put the reply text in front of the person.
+
+    ``send_message`` is the unified delivery action (AGENTS.md §6) and the only
+    one a current prompt can emit; ``message_*`` are its legacy per-interface
+    predecessors, still accepted on replay. Callers use this to decide whether a
+    retry may send anything at all (a second delivery of the same reply is worse
+    than a skipped correction) and to recognise a delivered reply in a
+    correction context. Structural name match only; never inspects content.
+    """
+    name = str(action_type or "")
+    return name == "send_message" or name.startswith("message_")
+
+
 def _is_delivered_auto_tts_failure(failed_item: Any) -> bool:
     """True when a failed action is an auto-injected ``tts_speak`` whose
     VoxPlugin text-only fallback already delivered the reply.

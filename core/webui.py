@@ -9411,7 +9411,7 @@ class SynthWebUIInterface:
             import recurring_ical_events
 
             from core.calendar_utils import build_calendar
-            from core.time_zone_utils import get_local_timezone
+            from core.time_zone_utils import format_day_month, get_local_timezone
 
             system_tz = get_local_timezone()
             window_start = _dt.now(tz=system_tz)
@@ -9464,11 +9464,11 @@ class SynthWebUIInterface:
                         continue
 
                     if all_day:
-                        label = f"{local_dt.strftime('%b %-d')} (all day)"
+                        label = f"{format_day_month(local_dt)} (all day)"
                     else:
                         tz_abbr = local_dt.strftime("%Z") or "local"
                         label = (
-                            f"{local_dt.strftime('%b %-d')}, "
+                            f"{format_day_month(local_dt)}, "
                             f"{local_dt.hour}:{local_dt.strftime('%M')} ({tz_abbr})"
                         )
 

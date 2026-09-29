@@ -118,6 +118,18 @@ def parse_local_to_utc(date_str: str, time_str: str) -> datetime:
     return dt_local.replace(tzinfo=local_tz).astimezone(ZoneInfo("UTC"))
 
 
+def format_day_month(dt: datetime) -> str:
+    """Format a datetime as ``Sep 29`` — no leading zero, on every platform.
+
+    ``strftime("%b %-d")`` is a glibc extension: on Windows it raises
+    ``ValueError: Invalid format string``. The callers here format lines inside a
+    per-item guard that swallows the error, so on Windows every event line quietly
+    disappeared instead of failing loudly. Build the component-wise string rather
+    than rely on the extension.
+    """
+    return f"{dt.strftime('%b')} {dt.day}"
+
+
 def format_dual_time(dt_utc: datetime) -> str:
     """Return formatted time in local timezone with UTC in parentheses."""
     dt_local = utc_to_local(dt_utc)
