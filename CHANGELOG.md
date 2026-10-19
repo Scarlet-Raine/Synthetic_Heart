@@ -1,3 +1,19 @@
+### fix(security): optional WebUI authentication on every route, skin path traversal closed, MCP/command gates fail closed  <!-- 2026-10-19 -->
+
+**Audit findings (read-only review, 2026-10-19).** The WebUI has no authentication unless configured (`SYNTH_WEBUI_API_TOKEN` was optional and gated ~12 of ~185 routes) while the container binds 0.0.0.0. Reachable without credentials: config writes (`SYNTH_AUTONOMY_MODE`) followed by `/api/agent/run` → `agent_run_shell`; `DELETE /api/skins/%2e%2e` (`Path("..").name == ".."`) → `rmtree` of the app root; a regex-only SQL console that missed `SELECT ... INTO`/`pg_read_file`; stored XSS through `title="..."` (the DOM-based `escapeHtml` leaves quotes alone).
+
+**Fix.**
+- `core/webui_auth.py`: one ASGI middleware in front of all HTTP/WebSocket routes, **opt-in (off by default)**: `SYNTH_WEBUI_API_TOKEN` set turns it on with that token; `SYNTH_WEBUI_AUTH=enabled` turns it on with a generated token in `/config/.webui_token` (0600). Credentials: bearer header, `?token=` or a `/login` session cookie (HttpOnly, SameSite=Strict, Origin-checked on writes/WS); constant-time compare; per-address throttle. When enabled, integrations that call the API without a token (Mate Engine, scripts) must send `Authorization: Bearer <token>`.
+- Skins: `SynthWebUIInterface._skin_path` (name allowlist + resolved-parent check) used by activate/upload/download/delete, and zip entries are validated before extraction.
+- SQL console: runs in a database-enforced read-only transaction (`core.db.execute_read_only_query`); filter also rejects `INTO` and file/admin functions.
+- `escapeHtml` (3 copies) now encodes `"` and `'`.
+- MCP tools go through `is_action_allowed_for_execution` using the server's configured `security_level`; stdio MCP servers no longer inherit the parent environment; commands deny callers without an identity (`command_registry`).
+- `/api/config` payloads (API keys) are no longer logged; web_search page fetches reject private/loopback/link-local targets and re-check every redirect (`core/url_safety.py`).
+
+**Also (reliability, same audit).** Per-endpoint LLM timeout circuit breaker (`core/external_endpoints/timeout_breaker.py`): after 2 consecutive timeouts calls fail fast for 120 s and a single probe (≤300 s) checks recovery — a wedged Zen engine previously cost 30 min × 3 retries per call for 37 h (2026-10-16 → 10-18). Agent-reply and event delivery use `send_message` instead of the legacy `message_<interface>` type that failed with "No plugin matched interface". The `play_once`/intro-outro animation warning (87% of all WARNINGs) is logged once per file. `emotion_manager` keeps and cancels its decay task. `tests/test_plugin_conformance.py` freezes the known plugin deviations so new ones fail CI.
+
+**Not changed (needs an owner decision):** `plugins/gasmask/` is a test stub without `PLUGIN_CLASS` (the real implementation sits in `plugins_dev/`); enabling it changes every prompt. `plugins/vessel_plugin.py` + `vessel_base.py` + `vessels/` register the same `vessel_plugin` key as `plugins/rift_vessel/`. Published DB/Zen/webtop ports and root-in-container are untouched.
+
 ### fix(grillo): the awaiting-reply gate is back, as a toggle, because it was not a bug  <!-- 2026-10-03 -->
 
 **Symptom (regression of the 09-17 removal):** the observer beat nags a thread the synth already dominated. Five consecutive hourly beats pushed "still coming tonight?" → "hurry home!" → "did you get home okay?" into a DM whose newest message was the synth's own and where the human was simply not answering yet.
