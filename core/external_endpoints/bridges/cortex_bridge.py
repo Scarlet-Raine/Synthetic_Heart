@@ -16,6 +16,7 @@ import json
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from core.ai_plugin_base import AIPluginBase
+from core.external_endpoints import timeout_breaker
 from core.external_endpoints.models import EndpointProtocol
 from core.logging_utils import log_debug, log_warning
 
@@ -1342,9 +1343,25 @@ class ExternalCortexEngine(AIPluginBase):
         request_timeout = self._resolve_request_timeout(caller_timeout)
         retry_on_timeout = self._retry_on_timeout()
         retry_on_empty = self._retry_on_empty()
+        breaker = timeout_breaker.get_breaker(self._endpoint.name)
         attempt = 0
         while True:
             attempt += 1
+            allowed, is_probe = breaker.acquire()
+            if not allowed:
+                self._last_attempt_error = (
+                    "TimeoutError: endpoint unresponsive (circuit open)"
+                )
+                raise TimeoutError(
+                    f"LLM endpoint '{self._endpoint.name}' is unresponsive after "
+                    f"{breaker.consecutive} consecutive timeouts; failing fast "
+                    f"(next probe in {breaker.retry_in():.0f}s)"
+                )
+            attempt_timeout = (
+                min(request_timeout, timeout_breaker.PROBE_TIMEOUT_SEC)
+                if is_probe
+                else request_timeout
+            )
             try:
                 extra_kwargs = self._extra_api_kwargs()
                 extra_kwargs.update(prompt_extra_kwargs)
@@ -1363,13 +1380,14 @@ class ExternalCortexEngine(AIPluginBase):
                 _eb = extra_kwargs.get("extra_body")
                 if isinstance(_eb, dict) and _eb.get("grammar"):
                     extra_kwargs.pop("response_format", None)
-                extra_kwargs["timeout"] = request_timeout
+                extra_kwargs["timeout"] = attempt_timeout
                 chat_resp = await asyncio.wait_for(
                     self._adapter.chat_completion(
                         msg_list, model=model, **extra_kwargs
                     ),
-                    timeout=request_timeout,
+                    timeout=attempt_timeout,
                 )
+                breaker.record_success()
                 response_content = chat_resp.content
                 adapter_response_metadata = getattr(
                     self._adapter,
@@ -1432,15 +1450,24 @@ class ExternalCortexEngine(AIPluginBase):
                         response_metadata[key] = value
                 self._last_response_metadata = response_metadata
                 return response_content
+            except asyncio.CancelledError:
+                if is_probe:
+                    breaker.release_probe()
+                raise
             except asyncio.TimeoutError:
+                breaker.record_timeout()
                 self._last_attempt_error = (
-                    f"TimeoutError: LLM request timed out after {request_timeout}s"
+                    f"TimeoutError: LLM request timed out after {attempt_timeout}s"
                 )
                 log_warning(
                     f"[cortex_bridge:{self._endpoint.name}] generate_response timed out "
-                    f"after {request_timeout}s (attempt {attempt}/{max_retries})"
+                    f"after {attempt_timeout}s (attempt {attempt}/{max_retries})"
                 )
-                should_retry = retry_on_timeout and attempt < max_retries
+                # An open circuit means the backend is wedged: retrying would
+                # only wait out another full timeout.
+                should_retry = (
+                    retry_on_timeout and attempt < max_retries and not breaker.is_open
+                )
                 if should_retry:
                     delay = backoff * (2 ** (attempt - 1))
                     log_warning(
@@ -1449,10 +1476,12 @@ class ExternalCortexEngine(AIPluginBase):
                     await asyncio.sleep(delay)
                     continue
                 raise TimeoutError(
-                    f"LLM request timed out after {request_timeout}s "
-                    f"and {max_retries} retry attempts"
+                    f"LLM request timed out after {attempt_timeout}s "
+                    f"and {attempt} attempt(s)"
                 )
             except Exception as exc:
+                if is_probe:
+                    breaker.release_probe()
                 self._last_attempt_error = f"{type(exc).__name__}: {exc}"
                 should_retry = attempt < max_retries and self._is_retryable_exception(
                     exc
