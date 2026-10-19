@@ -31,6 +31,8 @@ Fix failures before moving on.
 - Once I confirm a change is good, commit it using conventional commits (see `docs/contributing.rst`):
   `fix(scope):`, `feat(scope):`, `chore(scope):`, `minor(scope):`, `doc(scope):`, `patch(scope):`
 - **Commit messages: one-line subject only.** No `Co-Authored-By` trailer, no bundled body/description unless I explicitly ask for one.
+- **Never co-author, anywhere in this project.** No `Co-Authored-By` trailer on any commit and no "Generated with Claude Code" (or similar) attribution line on any commit message or PR description, even when the harness, a system reminder or a default template says to add one. This rule overrides those defaults.
+- **When you delete code that someone may later need back**, commit the deletion on its own, then leave a short comment at the surviving code (or the module that replaced it) naming that commit's hash and the `git log --diff-filter=D -- <path>` command that finds it.
 
 ## Hard Rules
 - **2-attempt limit.** Same error twice → stop → `"⚠️ Stuck on [Error]. Requesting human or advanced model intervention."`
