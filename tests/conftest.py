@@ -39,6 +39,16 @@ _load_repo_env_defaults()
 
 
 @pytest.fixture(autouse=True)
+def _reset_llm_timeout_breakers():
+    """The per-endpoint timeout breaker is process-global; isolate tests."""
+    from core.external_endpoints import timeout_breaker
+
+    timeout_breaker._breakers.clear()
+    yield
+    timeout_breaker._breakers.clear()
+
+
+@pytest.fixture(autouse=True)
 def _reset_animation_handler_singleton():
     """Ensure tests don't leak KaradaStateServer singleton state across modules."""
     import core.animation_handler as ah
