@@ -17,6 +17,13 @@ mkdir -p \
 
 chmod a+rwx -R /config
 
+# The blanket chmod above must not leave credentials world-readable.
+for secret in /config/.synth_secret /config/.webui_token; do
+  if [ -f "$secret" ]; then
+    chmod 600 "$secret"
+  fi
+done
+
 # Seed the default skin into a fresh skins volume (the named volume shadows the
 # image copy, so first start would 500 /api/skins and stall the WebUI).
 if [ ! -f /app/skins/Rei/model.vrm ] && [ -f /app/.skins-seed/Rei/model.vrm ]; then

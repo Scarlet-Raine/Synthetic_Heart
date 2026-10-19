@@ -69,6 +69,8 @@ from core.animation_handler import (
     set_karada_state_server,
 )
 from core.karada_ws_transport import WebSocketTransport
+from core import webui_auth
+from core.webui_auth import WebUIAuthMiddleware
 from core import animation_uploads
 import mimetypes
 
@@ -154,7 +156,15 @@ _WEBUI_TOUCH_PRIORITY = 11
 _READ_ONLY_QUERY_RE = re.compile(r"^\s*(?:select|with)\b", re.IGNORECASE)
 _WRITE_QUERY_RE = re.compile(
     r"\b(?:insert|update|delete|drop|alter|create|truncate|replace|grant|"
-    r"revoke|merge|call|exec|execute|attach|detach|vacuum|pragma|set|copy)\b",
+    r"revoke|merge|call|exec|execute|attach|detach|vacuum|pragma|set|copy|into)\b",
+    re.IGNORECASE,
+)
+# Server-side file / admin helpers a read-only SELECT could still reach.
+_DANGEROUS_FUNC_RE = re.compile(
+    r"\b(?:pg_read_file|pg_read_binary_file|pg_ls_\w+|pg_stat_file|pg_file_\w+|"
+    r"pg_sleep\w*|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|"
+    r"pg_logdir_ls|lo_\w+|dblink\w*|set_config|load_file|"
+    r"query_to_xml\w*|xmlparse|current_setting)\b",
     re.IGNORECASE,
 )
 
@@ -171,7 +181,7 @@ def _is_read_only_query(query: str) -> bool:
         return False
     if not _READ_ONLY_QUERY_RE.match(stripped):
         return False
-    if _WRITE_QUERY_RE.search(stripped):
+    if _WRITE_QUERY_RE.search(stripped) or _DANGEROUS_FUNC_RE.search(stripped):
         return False
     return True
 
@@ -1189,6 +1199,11 @@ class SynthWebUIInterface:
                 f"{LOG_PREFIX} Failed to add plugin dispatch middleware: {_mw_exc}"
             )
 
+        # Must stay the LAST add_middleware call: Starlette wraps later
+        # middleware around earlier ones, and the auth gate has to sit outside
+        # the index/plugin-dispatch middlewares that answer before routing.
+        self.app.add_middleware(WebUIAuthMiddleware)  # type: ignore[arg-type]
+
     # ------------------------------------------------------------------
     # Plugin extension API
     # ------------------------------------------------------------------
@@ -1780,9 +1795,9 @@ class SynthWebUIInterface:
             )
 
         try:
-            from core.db import execute_query
+            from core.db import execute_read_only_query
 
-            rows = await execute_query(query)
+            rows = await execute_read_only_query(query)
             serialized = _serialize_query_rows(rows, limit)
             return JSONResponse(
                 {
@@ -2124,7 +2139,7 @@ class SynthWebUIInterface:
 
     @staticmethod
     def get_supported_actions() -> dict:
-        from plugins.vox_plugin import is_vox_enabled
+        from core.optional_plugins import is_vox_enabled
 
         vox_on = is_vox_enabled()
 
@@ -2159,7 +2174,7 @@ class SynthWebUIInterface:
     @staticmethod
     def get_prompt_instructions(action_name: str) -> dict:
         if action_name == "message_synth_webui":
-            from plugins.vox_plugin import is_vox_enabled
+            from core.optional_plugins import is_vox_enabled
 
             vox_on = is_vox_enabled()
 
@@ -3499,13 +3514,7 @@ class SynthWebUIInterface:
     # WebSocket logic
     # ------------------------------------------------------------------
     async def websocket_endpoint(self, websocket: WebSocket):
-        from core.karada_api import _configured_api_token, _token_from_websocket
-
-        expected_token = _configured_api_token()
-        if (
-            expected_token is not None
-            and _token_from_websocket(websocket) != expected_token
-        ):
+        if not webui_auth.websocket_authorized(websocket):
             await websocket.close(code=4401, reason="Invalid or missing API token")
             return
 
@@ -4446,13 +4455,7 @@ class SynthWebUIInterface:
         - ``{"type": "vad",     "signal": "speech_start"|"speech_end"}`` — VAD events.
         - ``{"type": "error",   "detail": "..."}`` — error notification.
         """
-        from core.karada_api import _configured_api_token, _token_from_websocket
-
-        expected_token = _configured_api_token()
-        if (
-            expected_token is not None
-            and _token_from_websocket(websocket) != expected_token
-        ):
+        if not webui_auth.websocket_authorized(websocket):
             await websocket.close(code=4401, reason="Invalid or missing API token")
             return
 
@@ -6191,6 +6194,25 @@ class SynthWebUIInterface:
                 if rei.exists():
                     skin = "Rei"
         return JSONResponse({"skin": skin})
+
+    _SAFE_SKIN_NAME = re.compile(r"^\w[\w. -]*$")
+
+    @classmethod
+    def _skin_path(cls, skins_dir: Path, name: str) -> Path:
+        """Return ``skins_dir / name`` or raise 400 if it could escape ``skins_dir``.
+
+        ``Path(name).name`` is not enough: ``Path("..").name == ".."``.
+        """
+        if (
+            not isinstance(name, str)
+            or ".." in name
+            or not cls._SAFE_SKIN_NAME.fullmatch(name)
+        ):
+            raise HTTPException(status_code=400, detail="Invalid skin name")
+        candidate = skins_dir / name
+        if candidate.resolve().parent != skins_dir.resolve():
+            raise HTTPException(status_code=400, detail="Invalid skin name")
+        return candidate
 
     @staticmethod
     def _sanitize_vrm_filename(name: str) -> str:
@@ -11042,9 +11064,10 @@ class SynthWebUIInterface:
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Invalid JSON payload") from exc
 
-        log_debug(f"{LOG_PREFIX} update_config_entry received payload: {payload}")
-
         key = str(payload.get("key") or "").strip()
+        # Never log the value: config entries include API keys and passwords.
+        log_debug(f"{LOG_PREFIX} update_config_entry received key={key!r}")
+
         if not key:
             raise HTTPException(status_code=400, detail="Missing configuration key")
 
@@ -11052,7 +11075,6 @@ class SynthWebUIInterface:
             log_error(
                 f"{LOG_PREFIX} 'value' not in payload. Keys: {list(payload.keys())}"
             )
-            log_error(f"{LOG_PREFIX} Full payload: {payload}")
             raise HTTPException(status_code=400, detail="Missing configuration value")
 
         value = payload.get("value")
@@ -14671,7 +14693,7 @@ class SynthWebUIInterface:
         Returns 201 with name if activated, 404 if no VRM found.
         """
         skins_dir = Path(__file__).resolve().parent.parent / "skins"
-        target_skin = skins_dir / Path(skin_name).name
+        target_skin = self._skin_path(skins_dir, skin_name)
         if not target_skin.exists() or not target_skin.is_dir():
             raise HTTPException(status_code=404, detail="Skin not found")
 
@@ -14814,7 +14836,7 @@ class SynthWebUIInterface:
             raise HTTPException(status_code=400, detail="Only .vrm files are accepted")
 
         skins_dir = Path(__file__).resolve().parent.parent / "skins"
-        skin_path = skins_dir / Path(skin_name).name
+        skin_path = self._skin_path(skins_dir, skin_name)
         if not skin_path.exists() or not skin_path.is_dir():
             raise HTTPException(status_code=404, detail="Skin not found")
 
@@ -14854,7 +14876,7 @@ class SynthWebUIInterface:
             )
 
         skins_dir = Path(__file__).resolve().parent.parent / "skins"
-        skin_path = skins_dir / Path(skin_name).name
+        skin_path = self._skin_path(skins_dir, skin_name)
         if not skin_path.exists() or not skin_path.is_dir():
             raise HTTPException(status_code=404, detail="Skin not found")
 
@@ -14878,7 +14900,7 @@ class SynthWebUIInterface:
         import tempfile
 
         skins_dir = Path(__file__).resolve().parent.parent / "skins"
-        skin_path = skins_dir / Path(skin_name).name
+        skin_path = self._skin_path(skins_dir, skin_name)
         if not skin_path.exists() or not skin_path.is_dir():
             raise HTTPException(status_code=404, detail="Skin not found")
 
@@ -14941,7 +14963,20 @@ class SynthWebUIInterface:
                 else:
                     root = Path(file.filename).stem
 
-                dest = skins_dir / root
+                # Every member must stay inside the (validated) root folder.
+                for member in names:
+                    parts = Path(member).parts
+                    if Path(member).is_absolute() or ".." in parts:
+                        raise HTTPException(
+                            status_code=400, detail="Invalid zip entry path"
+                        )
+                    if parts and parts[0] != root:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Skin pack must contain a single top-level folder",
+                        )
+
+                dest = self._skin_path(skins_dir, root)
                 if dest.exists():
                     # Overwrite existing skin (except Rei)
                     if root == "Rei":
@@ -14998,15 +15033,15 @@ class SynthWebUIInterface:
         """Delete a skin folder. Rei is protected and cannot be deleted."""
         import shutil
 
-        safe_name = Path(skin_name).name
+        skins_dir = Path(__file__).resolve().parent.parent / "skins"
+        skin_path = self._skin_path(skins_dir, skin_name)
+        safe_name = skin_path.name
         if safe_name == "Rei":
             raise HTTPException(
                 status_code=403,
                 detail="The default skin 'Rei' cannot be deleted",
             )
 
-        skins_dir = Path(__file__).resolve().parent.parent / "skins"
-        skin_path = skins_dir / safe_name
         if not skin_path.exists() or not skin_path.is_dir():
             raise HTTPException(status_code=404, detail="Skin not found")
 
