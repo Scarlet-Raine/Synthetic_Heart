@@ -1785,7 +1785,8 @@ class EventPlugin(AIPluginBase):
             # synth_webui/..., ...) instead of assuming Telegram.
             interface_name = interface_path.split("/")[0]
             action = {
-                "type": f"message_{interface_name}",
+                "type": "send_message",
+                "interface": interface_name,
                 "payload": payload,
             }
 

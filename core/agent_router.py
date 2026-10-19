@@ -830,8 +830,12 @@ async def _deliver_agent_reply(
             thread_id = path_parts[2].strip()
             if thread_id:
                 payload["thread_id"] = thread_id
+    # Unified ``send_message`` (resolved from interface_path via the interface
+    # registry). The legacy per-interface ``message_<name>`` type goes through
+    # plugin discovery instead, which failed with "No plugin matched interface"
+    # whenever ACTIVE_INTERFACES was not populated at delivery time.
     action = {
-        "type": f"message_{interface_name}",
+        "type": "send_message",
         "interface": interface_name,
         "payload": payload,
     }

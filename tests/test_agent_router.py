@@ -149,7 +149,8 @@ async def test_deliver_ships_timeout_with_executed_actions(
 
     assert len(delivered) == 1
     action = delivered[0]
-    assert action["type"] == "message_telegram_bot"
+    assert action["type"] == "send_message"
+    assert action["interface"] == "telegram_bot"
     assert action["payload"]["text"] == "I read the file — it is small."
     assert action["payload"]["interface_path"] == "telegram_bot/123"
 
