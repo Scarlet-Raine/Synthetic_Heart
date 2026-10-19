@@ -872,6 +872,34 @@ def _pseudo_params_to_dict(raw: str) -> dict[str, Any]:
     return params
 
 
+_DIALECT_NAME_KEYS = ("tool", "name", "action")
+_DIALECT_PARAMS_KEYS = ("params", "arguments", "parameters", "input", "payload")
+
+
+def _flat_dialect_payload(text: str, tool_name: str) -> dict[str, Any]:
+    """Return the sibling fields of a flat ``{"action": NAME, ...fields}`` call.
+
+    Some models put the arguments next to the name key instead of inside a
+    params blob, e.g. ``{"action": "send_message", "interface_path": "...",
+    "content": "..."}``. Returns every field except the name key itself, or an
+    empty dict when ``text`` is not a single flat object for ``tool_name`` (any
+    params-style key means the nested forms handle it instead).
+    """
+    start = text.find("{")
+    if start == -1:
+        return {}
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text[start:])
+    except ValueError:
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    name_key = next((k for k in _DIALECT_NAME_KEYS if obj.get(k) == tool_name), None)
+    if name_key is None or any(k in obj for k in _DIALECT_PARAMS_KEYS):
+        return {}
+    return {k: v for k, v in obj.items() if k != name_key}
+
+
 def _recover_tool_call_dialect(text: str) -> Optional[dict[str, Any]]:
     """Normalise an alternative tool-call dialect into the SyntH schema.
 
@@ -884,6 +912,7 @@ def _recover_tool_call_dialect(text: str) -> Optional[dict[str, Any]]:
         {"tool": "NAME", "params": ["query": "x", "limit": "5"]}
         [tool:NAME] {"params": ["query": "x"]}
         {"name": "NAME", "arguments": {...}}
+        {"action": "NAME", "field": "x", ...}
 
     Returned as ``{"actions": [{"type": NAME, "payload": {...}}]}`` when at
     least one tool call is recovered, else ``None``.
@@ -910,6 +939,8 @@ def _recover_tool_call_dialect(text: str) -> Optional[dict[str, Any]]:
             if not tool_name:
                 continue
             payload = _pseudo_params_to_dict(m.group(2) or "")
+            if m.group(2) is None:
+                payload = _flat_dialect_payload(text, tool_name)
             actions.append({"type": tool_name, "payload": payload})
 
         # Case B: the ``[tool:NAME] {...}`` pseudo-markup form. Only add it when

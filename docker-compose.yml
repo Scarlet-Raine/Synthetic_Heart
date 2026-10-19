@@ -118,6 +118,13 @@ services:
     volumes:
       - synth_zen_data:/app/data
       - synth_zen_config:/config
+    # Docker's json-file driver is unbounded by default; this container's log had
+    # reached 34 MB with no rotation (single 1.6 MB lines included).
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
     networks:
       - synth_network
 
