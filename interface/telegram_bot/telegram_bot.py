@@ -2330,7 +2330,7 @@ class TelegramInterface:
     @staticmethod
     def get_prompt_instructions(action_name: str) -> dict:
         """Prompt instructions for supported actions."""
-        from plugins.vox_plugin import is_vox_enabled
+        from core.optional_plugins import is_vox_enabled
 
         if action_name != "send_message":
             return None

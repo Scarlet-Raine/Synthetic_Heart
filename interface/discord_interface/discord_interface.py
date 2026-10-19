@@ -826,7 +826,7 @@ class DiscordInterface:
 
     @staticmethod
     def get_prompt_instructions(action_name: str) -> dict:
-        from plugins.vox_plugin import is_vox_enabled
+        from core.optional_plugins import is_vox_enabled
 
         if action_name == "send_message":
             vox_on = is_vox_enabled()
