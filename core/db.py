@@ -3067,6 +3067,30 @@ async def start_pool_cleanup_task():
         return None
 
 
+async def execute_read_only_query(query: str, params: tuple = ()) -> list:
+    """Run *query* inside a database-enforced read-only transaction.
+
+    The caller's SQL filter is a first line of defence only; the transaction
+    makes the database itself refuse writes (``SELECT ... INTO``, data-modifying
+    CTEs, function side effects). Postgres uses asyncpg's ``readonly=True``
+    transaction, MariaDB ``START TRANSACTION READ ONLY``.
+    """
+    async with get_conn_ctx() as conn:
+        transaction = getattr(conn, "transaction", None)
+        if callable(transaction):
+            async with transaction(readonly=True):
+                async with conn.cursor(DictCursor) as cur:
+                    await cur.execute(query, params)
+                    return list(await cur.fetchall())
+        async with conn.cursor(DictCursor) as cur:
+            await cur.execute("START TRANSACTION READ ONLY")
+            try:
+                await cur.execute(query, params)
+                return list(await cur.fetchall())
+            finally:
+                await cur.execute("ROLLBACK")
+
+
 async def execute_query(query: str, params: tuple = ()) -> list:
     """Execute a SQL query and return the results."""
     try:
