@@ -235,7 +235,10 @@ class McpClientBridge:
                     command=command,
                     args=list(cfg.args),
                     cwd=str(repo_root()),
-                    env={**os.environ, **cfg.env} if cfg.env else None,
+                    # Never forward the parent environment: it holds every API
+                    # key and DB password. The SDK adds its own safe defaults
+                    # (PATH, HOME...); anything else must be listed in cfg.env.
+                    env=dict(cfg.env) if cfg.env else None,
                 )
                 read, write = await stack.enter_async_context(
                     stdio_client(server_params)

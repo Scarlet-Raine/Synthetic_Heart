@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from core.logging_utils import log_error, log_info
+from core.logging_utils import log_error, log_info, log_warning
 
 
 def _stringify_mcp_result(result: Any) -> str:
@@ -97,7 +97,7 @@ class AgentToolExecutor:
         arguments = arguments or {}
 
         if tool.is_external():
-            return await self._execute_mcp(tool, arguments)
+            return await self._execute_mcp(tool, arguments, context, original_message)
         return await self._execute_internal(tool, arguments, context, original_message)
 
     async def _execute_internal(
@@ -156,10 +156,46 @@ class AgentToolExecutor:
             }
 
     async def _execute_mcp(
-        self, tool: Any, arguments: dict[str, Any]
+        self,
+        tool: Any,
+        arguments: dict[str, Any],
+        context: dict[str, Any] | None = None,
+        original_message: Any = None,
     ) -> dict[str, Any]:
-        """Invoke an external MCP tool via the client bridge."""
+        """Invoke an external MCP tool via the client bridge.
+
+        Goes through the same safety gate as internal actions, using the
+        ``security_level`` configured for the MCP server.
+        """
+        from core.action_safety import is_action_allowed_for_execution
         from core.mcp_bridge.client import mcp_client_bridge
+
+        # Agent tool calls are model-originated by definition.
+        gate_context = {**(context or {}), "from_cortex": True}
+        allowed, reason, _meta = is_action_allowed_for_execution(
+            {
+                "type": tool.name,
+                "payload": arguments,
+                # The operator's per-server ``security_level`` is the policy
+                # knob; the auto-added "mcp:<server>" effect marker is only a
+                # provenance tag and must not bump every tool to "medium".
+                "declared_metadata": {"security_level": tool.security_level},
+            },
+            gate_context,
+            original_message,
+        )
+        if not allowed:
+            log_warning(
+                f"[agent_tool_executor] MCP tool '{tool.name}' blocked by safety "
+                f"gate: {reason}"
+            )
+            return {
+                "ok": False,
+                "tool": tool.name,
+                "source": tool.source,
+                "result": "",
+                "error": f"Tool not permitted: {reason}",
+            }
 
         try:
             log_info(

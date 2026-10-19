@@ -73,10 +73,12 @@ async def handle_command_message(
         return None
 
     # Permission check - most commands require trainer privileges
+    # Fail closed: a caller that cannot say who is asking gets no commands.
     interface_registry = get_interface_registry()
-    if user_id and interface_id:
-        if not interface_registry.is_trainer(interface_id, user_id):
-            return "❌ Access denied. This command requires trainer privileges."
+    if user_id in (None, "") or not interface_id:
+        return "❌ Access denied. This command requires trainer privileges."
+    if not interface_registry.is_trainer(interface_id, user_id):
+        return "❌ Access denied. This command requires trainer privileges."
 
     try:
         # Pass interface context to commands that support it
