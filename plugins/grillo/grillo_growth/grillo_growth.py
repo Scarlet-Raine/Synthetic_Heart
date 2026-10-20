@@ -52,6 +52,13 @@ from core.growth_state import (
 )
 from core.json_utils import extract_json_from_text
 from core.logging_utils import log_debug, log_error, log_info, log_warning
+from core.soul.retractions import (
+    claim_matching,
+    drop_claim_items,
+    load_claims,
+    render_known_false_block,
+    strip_claim_sentences,
+)
 from core.variables_engine import register_exposed_var
 
 # Day-of-week names used by the GROWTH_WEEKLY_DAY select (Python weekday()
@@ -66,6 +73,14 @@ _WEEKDAY_NAMES = [
     "Sunday",
 ]
 _WEEKDAY_INDEX = {name.lower(): idx for idx, name in enumerate(_WEEKDAY_NAMES)}
+
+
+# Appended to the generator instructions while a retraction is in force.
+_FALSE_CLAIMS_INSTRUCTION = (
+    " The payload's known_false_claims lists statements the trainer has said are "
+    "FALSE. Never mention, imply or build on them, even if the persona, the diary "
+    "or the memories do."
+)
 
 
 class GrilloGrowthPlugin:
@@ -307,6 +322,29 @@ class GrilloGrowthPlugin:
             "proposal": pending,
         }
 
+    async def discard_pending_proposal_matching(self, claims: list[Any]) -> bool:
+        """Discard the pending proposal when it restates a retracted claim.
+
+        Called by the retraction flow once the trainer has said something is
+        false: a proposal written from a diary that still carries the claim would
+        otherwise bake it into the self-growth text on approval. Returns whether
+        a proposal was discarded.
+        """
+        pending = self._load_pending_proposal()
+        if pending is None:
+            return False
+        from core.soul.retractions import claim_matching
+
+        text = str(pending.get("self_growth") or "")
+        if claim_matching(claims, text=text) is None:
+            return False
+        await self._clear_pending_proposal()
+        log_info(
+            "[grillo_growth] Pending self-growth proposal discarded: it restates "
+            "a claim the trainer retracted"
+        )
+        return True
+
     async def run_now(self, payload: Optional[dict] = None) -> dict:
         """Run the weekly self-growth cycle immediately (WebUI "Run Now").
 
@@ -541,6 +579,15 @@ class GrilloGrowthPlugin:
         current_growth = await get_current_growth() or ""
         likes, dislikes = self._current_likes_dislikes()
 
+        # What the trainer has said is false must not be carried forward by the
+        # very texts this note is built from: strip it from them, and tell the
+        # model about it besides.
+        claims = await load_claims(("active",))
+        if claims:
+            current_growth = strip_claim_sentences(current_growth, claims)
+            diary_blob = strip_claim_sentences(diary_blob, claims)
+            memories = drop_claim_items(memories, claims)
+
         memories_text = (
             "\n".join(f"- {m}" for m in memories) if memories else "(none recalled)"
         )
@@ -588,21 +635,21 @@ class GrilloGrowthPlugin:
             "have...'), never first or third person. "
             "If you do not wish to change likes/dislikes, repeat the current lists "
             "verbatim. Never include commentary outside the JSON."
-        )
+        ) + _FALSE_CLAIMS_INSTRUCTION * bool(claims)
 
-        prompt = {
-            "input": {
-                "type": "self_growth_reflection",
-                "payload": {
-                    "description": header,
-                    "persona": persona,
-                    "current_self_growth": current_growth,
-                    "current_likes": likes,
-                    "current_dislikes": dislikes,
-                    "past_week_diary": diary_blob or "(no diary entries this week)",
-                    "recalled_memories": memories_text,
-                },
-            },
+        payload: dict[str, Any] = {
+            "description": header,
+            "persona": persona,
+            "current_self_growth": current_growth,
+            "current_likes": likes,
+            "current_dislikes": dislikes,
+            "past_week_diary": diary_blob or "(no diary entries this week)",
+            "recalled_memories": memories_text,
+        }
+        if claims:
+            payload["known_false_claims"] = render_known_false_block(claims)
+        prompt: dict[str, Any] = {
+            "input": {"type": "self_growth_reflection", "payload": payload},
             "context": {},
             "instructions": instructions,
         }
@@ -670,6 +717,9 @@ class GrilloGrowthPlugin:
             if retried is not None and str(retried.get("self_growth") or "").strip():
                 parsed = retried
 
+        parsed = await self._enforce_false_claims(
+            engine, prompt, instructions, parsed, claims
+        )
         if parsed is None:
             log_warning(
                 "[grillo_growth] LLM did not return a usable rewrite after retry; "
@@ -693,6 +743,47 @@ class GrilloGrowthPlugin:
             if isinstance(new_dislikes, list)
             else dislikes,
         }
+
+    async def _enforce_false_claims(
+        self,
+        engine: Any,
+        prompt: dict[str, Any],
+        instructions: str,
+        parsed: dict[str, Any] | None,
+        claims: list[Any],
+    ) -> dict[str, Any] | None:
+        """Refuse a note that restates a claim the trainer retracted.
+
+        The prompt already carries the claim and its sentences were stripped from
+        the inputs, but an unconstrained model can still produce it from the rest
+        of the persona. One retry names the problem; if the claim is still there
+        the cycle is skipped rather than writing a falsehood into the self-growth
+        text that every prompt reads.
+        """
+        if parsed is None or not claims:
+            return parsed
+        if claim_matching(claims, text=str(parsed.get("self_growth") or "")) is None:
+            return parsed
+        log_warning(
+            "[grillo_growth] The rewrite restates a retracted claim; retrying once"
+        )
+        retry_prompt = dict(prompt)
+        retry_prompt["instructions"] = (
+            instructions + "\n\nYour previous reply restated a statement listed in "
+            "known_false_claims. REWRITE it without that statement and without "
+            "anything that depends on it."
+        )
+        retried = await self._generate_and_parse(engine, retry_prompt)
+        if (
+            retried is not None
+            and str(retried.get("self_growth") or "").strip()
+            and claim_matching(claims, text=str(retried.get("self_growth"))) is None
+        ):
+            return retried
+        log_warning(
+            "[grillo_growth] The retry still restates a retracted claim; skipping"
+        )
+        return None
 
     # Filler markers used only as an output-quality guard (not feature routing).
     # These are the recurring empty phrases this unconstrained cortex falls back
@@ -1135,6 +1226,12 @@ class GrilloGrowthPlugin:
         old_likes = [str(x) for x in (old_proposal.get("likes") or [])]
         old_dislikes = [str(x) for x in (old_proposal.get("dislikes") or [])]
 
+        claims = await load_claims(("active",))
+        if claims:
+            old_growth = strip_claim_sentences(old_growth, claims)
+            diary_blob = strip_claim_sentences(diary_blob, claims)
+            memories = drop_claim_items(memories, claims)
+
         memories_text = (
             "\n".join(f"- {m}" for m in memories) if memories else "(none recalled)"
         )
@@ -1175,22 +1272,22 @@ class GrilloGrowthPlugin:
             "have...), never first or third person. "
             "If you do not wish to change likes/dislikes, repeat the current "
             "lists verbatim. Never include commentary outside the JSON."
-        )
+        ) + _FALSE_CLAIMS_INSTRUCTION * bool(claims)
 
-        prompt = {
-            "input": {
-                "type": "self_growth_revision",
-                "payload": {
-                    "description": header,
-                    "persona": persona,
-                    "previous_self_growth": old_growth,
-                    "previous_likes": old_likes,
-                    "previous_dislikes": old_dislikes,
-                    "trainer_feedback": feedback,
-                    "past_week_diary": diary_blob or "(no diary entries this week)",
-                    "recalled_memories": memories_text,
-                },
-            },
+        payload: dict[str, Any] = {
+            "description": header,
+            "persona": persona,
+            "previous_self_growth": old_growth,
+            "previous_likes": old_likes,
+            "previous_dislikes": old_dislikes,
+            "trainer_feedback": feedback,
+            "past_week_diary": diary_blob or "(no diary entries this week)",
+            "recalled_memories": memories_text,
+        }
+        if claims:
+            payload["known_false_claims"] = render_known_false_block(claims)
+        prompt: dict[str, Any] = {
+            "input": {"type": "self_growth_revision", "payload": payload},
             "context": {},
             "instructions": instructions,
         }
@@ -1248,6 +1345,9 @@ class GrilloGrowthPlugin:
             if retried is not None and str(retried.get("self_growth") or "").strip():
                 parsed = retried
 
+        parsed = await self._enforce_false_claims(
+            engine, prompt, instructions, parsed, claims
+        )
         if parsed is None:
             log_warning(
                 "[grillo_growth] LLM did not return a usable revision after "

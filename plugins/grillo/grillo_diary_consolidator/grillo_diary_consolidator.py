@@ -26,6 +26,7 @@ from core.core_initializer import register_plugin
 from core.config_manager import config_registry
 from core.db import DictCursor, get_conn_ctx
 from core.logging_utils import log_debug, log_info, log_error
+from core.soul.retractions import get_known_false_claims_block
 
 # Default cap on how many times the same unresolved diary day may be
 # re-offered to the LLM before this plugin gives up on it. Without this, a
@@ -422,6 +423,18 @@ class GrilloDiaryConsolidatorPlugin:
                 "you were not shown.\n"
             )
 
+        known_false = await get_known_false_claims_block()
+        false_rule = ""
+        if known_false:
+            # The merged page replaces the fragments, so a belief the trainer has
+            # retracted must come out of it as a recorded mistake, not as fact.
+            false_rule = (
+                "- The trainer has said the statements below are FALSE. If a "
+                "fragment mentions one, keep it as something you wrongly "
+                "believed or were told, never as a fact, a plan or a lasting "
+                "circumstance.\n" + known_false + "\n"
+            )
+
         prompt = (
             "[DIARY CONSOLIDATION — INTERNAL SYSTEM TASK]\n\n"
             "Below are diary fragments from multiple days. For EACH day, "
@@ -440,7 +453,7 @@ class GrilloDiaryConsolidatorPlugin:
             "- Group related topics together into coherent paragraphs.\n"
             "- End each day with an emotional reflection or thought.\n"
             "- You MUST produce ONE update_diary_entry action per day.\n"
-            f"{part_rule}\n"
+            f"{part_rule}{false_rule}\n"
             "Diary fragments:\n\n"
             f"{chr(10).join(sections)}\n\n"
             "Respond with ONLY valid JSON (no additional text):\n"

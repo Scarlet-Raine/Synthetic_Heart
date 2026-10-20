@@ -216,3 +216,39 @@ async def test_a_whole_day_hands_no_preserve_offset_to_the_write(monkeypatch):
     await plugin.build_prompt()
 
     assert plugin.pending_beat_context is None
+
+
+async def test_the_merge_prompt_carries_the_retractions_in_force(monkeypatch):
+    import importlib
+
+    plugin = _make_plugin()
+    day = date(2026, 9, 1)
+
+    async def fake_find_unmerged_days(max_days):
+        return [(day, 51, "We planned the trip to Ca' Senz'Autobus.", 1)]
+
+    async def fake_block() -> str:
+        return "- the trip to Ca' Senz'Autobus (the trainer said: it does not exist)"
+
+    monkeypatch.setattr(plugin, "_find_unmerged_days", fake_find_unmerged_days)
+    module = importlib.import_module(
+        "plugins.grillo.grillo_diary_consolidator.grillo_diary_consolidator"
+    )
+    monkeypatch.setattr(module, "get_known_false_claims_block", fake_block)
+
+    prompt = await plugin.build_prompt()
+
+    assert "FALSE" in prompt
+    assert "it does not exist" in prompt
+    assert "wrongly believed" in prompt
+
+
+async def test_the_merge_prompt_is_unchanged_without_retractions(monkeypatch):
+    plugin = _make_plugin()
+
+    async def fake_find_unmerged_days(max_days):
+        return [(date(2026, 9, 1), 51, "A quiet day.", 1)]
+
+    monkeypatch.setattr(plugin, "_find_unmerged_days", fake_find_unmerged_days)
+    prompt = await plugin.build_prompt()
+    assert "FALSE" not in prompt

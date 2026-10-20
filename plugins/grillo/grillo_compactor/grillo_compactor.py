@@ -18,6 +18,10 @@ from core.core_initializer import register_plugin
 from core.logging_utils import log_info, log_debug, log_warning, log_error
 from core.config_manager import config_registry
 from core.json_utils import extract_json_from_text
+from core.soul.retractions import (
+    KNOWN_FALSE_SUMMARY_INSTRUCTION as _KNOWN_FALSE_INSTRUCTION,
+    get_known_false_claims_block,
+)
 
 # Local imports deferred to runtime to avoid circular import and expensive imports
 
@@ -949,6 +953,7 @@ class GrilloCompactorPlugin:
         min_confidence = float(_setting("GRILLO_COMPACT_REPLACE_MIN_CONFIDENCE", 0.9, float))
         anchor_check = bool(_setting("GRILLO_COMPACT_ANCHOR_CHECK", True, bool))
         source_text = f"{content}\n{thoughts}"
+        known_false = await get_known_false_claims_block()
 
         engine_name = await get_active_cortex_engine(scope="grillo")
         scope_model = await get_active_cortex_scope(scope="grillo")
@@ -958,20 +963,22 @@ class GrilloCompactorPlugin:
             return {"row_id": day_id, "day": day_label, "status": "no_engine"}
 
         async def ask(instruction: str = "") -> dict:
+            payload = {
+                "description": self._DAY_UNIT_PROMPT.format(max_chars=max_chars),
+                "day": day_label,
+                "entry": content,
+                "private_thoughts": thoughts,
+            }
+            if known_false:
+                payload["known_false_claims"] = known_false
             prompt = {
-                "input": {
-                    "type": "compaction_day_unit",
-                    "payload": {
-                        "description": self._DAY_UNIT_PROMPT.format(max_chars=max_chars),
-                        "day": day_label,
-                        "entry": content,
-                        "private_thoughts": thoughts,
-                    },
-                },
+                "input": {"type": "compaction_day_unit", "payload": payload},
                 "context": {},
                 "instructions": (
                     "Summarise this single day as the memory she will read back, and list its anchors. "
-                    "Reply ONLY with the JSON object." + (("\n" + instruction) if instruction else "")
+                    "Reply ONLY with the JSON object."
+                    + (_KNOWN_FALSE_INSTRUCTION if known_false else "")
+                    + (("\n" + instruction) if instruction else "")
                 ),
             }
             with scope_model_override(engine, scope_model):
@@ -1414,13 +1421,15 @@ class GrilloCompactorPlugin:
                 max_chars=self.max_summary_chars,
             )
 
+            cluster_payload = {"description": header, "entries": entries}
+            cluster_false = await get_known_false_claims_block()
+            if cluster_false:
+                cluster_payload["known_false_claims"] = cluster_false
             prompt = {
-                "input": {
-                    "type": "compaction_clusters",
-                    "payload": {"description": header, "entries": entries},
-                },
+                "input": {"type": "compaction_clusters", "payload": cluster_payload},
                 "context": {},
-                "instructions": "Cluster the entries and for each cluster provide the requested fields. Reply ONLY with valid JSON.",
+                "instructions": "Cluster the entries and for each cluster provide the requested fields. Reply ONLY with valid JSON."
+                + (_KNOWN_FALSE_INSTRUCTION if cluster_false else ""),
             }
 
             # Call LLM

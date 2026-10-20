@@ -8,6 +8,7 @@ delivery collaborators mocked out.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -614,3 +615,140 @@ async def test_parse_recon_disabled_is_noop(
 
     assert result == []
     apply_mock.assert_not_awaited()
+
+
+# ------------------------------------------------------------- retractions
+
+
+def _false_claim() -> Any:
+    from core.soul.models import RetractedClaim
+
+    return RetractedClaim(
+        id="rtr-1",
+        subject="trip to Ca' Senz'Autobus",
+        claim="Jay and the persona are going to Ca' Senz'Autobus",
+        reason="it does not exist",
+        status="active",
+    )
+
+
+def _wire_rewrite(
+    plugin: GrilloGrowthPlugin,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    claims: list[Any],
+    replies: list[dict[str, Any] | None],
+) -> list[dict[str, Any]]:
+    """Mock everything around ``_ask_llm_for_rewrite``; return the prompts seen."""
+    seen: list[dict[str, Any]] = []
+
+    async def _generate(engine: Any, prompt: dict[str, Any]) -> dict[str, Any] | None:
+        seen.append(prompt)
+        return replies[min(len(seen), len(replies)) - 1]
+
+    class _Registry:
+        def get_engine(self, name: str) -> object:
+            return object()
+
+    monkeypatch.setattr(
+        gg,
+        "get_current_growth",
+        AsyncMock(
+            return_value=(
+                "You helped Jay with InsightFace. You are preparing for your trip "
+                "to Ca' Senz'Autobus with Jay."
+            )
+        ),
+    )
+    monkeypatch.setattr(plugin, "_current_likes_dislikes", lambda: (["a"], ["b"]))
+    monkeypatch.setattr(plugin, "_get_persona_injection", AsyncMock(return_value="p"))
+    monkeypatch.setattr(gg, "get_active_cortex_engine", AsyncMock(return_value="x"))
+    monkeypatch.setattr(gg, "get_cortex_registry", lambda: _Registry())
+    monkeypatch.setattr(gg, "load_claims", AsyncMock(return_value=claims))
+    monkeypatch.setattr(plugin, "_generate_and_parse", _generate)
+    monkeypatch.setattr(plugin, "_reads_as_abstract", lambda *a, **k: False)
+    return seen
+
+
+_CLEAN = {"self_growth": "You fixed InsightFace with Jay.", "likes": [], "dislikes": []}
+_DIRTY = {
+    "self_growth": "You are going to Ca' Senz'Autobus trip with Jay.",
+    "likes": [],
+    "dislikes": [],
+}
+
+
+@pytest.mark.asyncio
+async def test_rewrite_strips_and_announces_a_retracted_claim(
+    plugin: GrilloGrowthPlugin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _wire_rewrite(plugin, monkeypatch, claims=[_false_claim()], replies=[_CLEAN])
+
+    result = await plugin._ask_llm_for_rewrite(
+        "2026-10-01: pizza\n2026-10-02: packing for the trip to Ca' Senz'Autobus",
+        ["went to the lake", "trip to Ca' Senz'Autobus is planned"],
+    )
+
+    assert result is not None and result["self_growth"] == _CLEAN["self_growth"]
+    payload = seen[0]["input"]["payload"]
+    assert "FALSE" in payload["known_false_claims"]
+    assert "Senz" not in payload["current_self_growth"]
+    assert "InsightFace" in payload["current_self_growth"]
+    assert "Senz" not in payload["past_week_diary"]
+    assert "pizza" in payload["past_week_diary"]
+    assert "Senz" not in payload["recalled_memories"]
+    assert "known_false_claims" in seen[0]["instructions"]
+
+
+@pytest.mark.asyncio
+async def test_rewrite_retries_once_when_the_reply_restates_the_claim(
+    plugin: GrilloGrowthPlugin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _wire_rewrite(
+        plugin, monkeypatch, claims=[_false_claim()], replies=[_DIRTY, _CLEAN]
+    )
+    result = await plugin._ask_llm_for_rewrite("diary", [])
+    assert result is not None and result["self_growth"] == _CLEAN["self_growth"]
+    assert len(seen) == 2
+    assert "restated a statement" in seen[1]["instructions"]
+
+
+@pytest.mark.asyncio
+async def test_rewrite_is_skipped_when_the_retry_still_restates_the_claim(
+    plugin: GrilloGrowthPlugin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _wire_rewrite(plugin, monkeypatch, claims=[_false_claim()], replies=[_DIRTY])
+    assert await plugin._ask_llm_for_rewrite("diary", []) is None
+
+
+@pytest.mark.asyncio
+async def test_rewrite_without_claims_is_unchanged(
+    plugin: GrilloGrowthPlugin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = _wire_rewrite(plugin, monkeypatch, claims=[], replies=[_DIRTY])
+    result = await plugin._ask_llm_for_rewrite("diary", [])
+    assert result is not None
+    assert "known_false_claims" not in seen[0]["input"]["payload"]
+    assert "known_false_claims" not in seen[0]["instructions"]
+
+
+@pytest.mark.asyncio
+async def test_pending_proposal_is_discarded_when_it_restates_a_claim(
+    plugin: GrilloGrowthPlugin, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        plugin,
+        "_load_pending_proposal",
+        lambda: {"self_growth": "You wait for the trip to Ca' Senz'Autobus."},
+    )
+    clear = AsyncMock()
+    monkeypatch.setattr(plugin, "_clear_pending_proposal", clear)
+    assert await plugin.discard_pending_proposal_matching([_false_claim()]) is True
+    clear.assert_awaited_once()
+
+    clear.reset_mock()
+    monkeypatch.setattr(
+        plugin, "_load_pending_proposal", lambda: {"self_growth": "You like tea."}
+    )
+    assert await plugin.discard_pending_proposal_matching([_false_claim()]) is False
+    clear.assert_not_awaited()
