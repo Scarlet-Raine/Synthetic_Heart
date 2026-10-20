@@ -1020,6 +1020,10 @@ class SynthWebUIInterface:
         # component pane). GET renders them, PUT replaces them with the text.
         self.app.get("/api/soul/situational-notes")(self.get_situational_notes)
         self.app.put("/api/soul/situational-notes")(self.put_situational_notes)
+        # Retracted claims (what the trainer has said is false): list them, add
+        # one, and confirm / reject / lift / restore a stored one.
+        self.app.get("/api/soul/retractions")(self.get_retractions)
+        self.app.post("/api/soul/retractions")(self.post_retraction)
         # On-demand run of the nightly memory compaction (Settings → Memory Compaction).
         self.app.get("/api/grillo/compaction")(self.grillo_compaction_status)
         self.app.post("/api/grillo/compaction")(self.start_grillo_compaction)
@@ -10594,6 +10598,105 @@ class SynthWebUIInterface:
                 "success": True,
                 "text": await self._situational_notes_text(repository),
                 **counts,
+            }
+        )
+
+    # ------------------------------------------------------------------
+    # Retracted claims
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _retraction_to_dict(claim: Any) -> dict[str, Any]:
+        def _iso(value: Any) -> str | None:
+            return value.isoformat() if hasattr(value, "isoformat") else None
+
+        return {
+            "id": claim.id,
+            "subject": claim.subject,
+            "claim": claim.claim,
+            "reason": claim.reason,
+            "status": claim.status,
+            "asserted_by": claim.asserted_by,
+            "source_ref": claim.source_ref,
+            "created_at": _iso(claim.created_at),
+            "updated_at": _iso(claim.updated_at),
+            "lifted_at": _iso(claim.lifted_at),
+        }
+
+    async def get_retractions(self) -> JSONResponse:
+        """List every stored retraction, newest first, whatever its status."""
+        repository = self._soul_plugin().get_repository()
+        try:
+            claims = await repository.list_retracted_claims()
+        except Exception as exc:
+            log_error(f"{LOG_PREFIX} Failed to read retractions: {exc}")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return JSONResponse(
+            {
+                "success": True,
+                "retractions": [self._retraction_to_dict(c) for c in claims],
+            }
+        )
+
+    async def post_retraction(self, request: Request) -> JSONResponse:
+        """Add a retraction, or decide on a stored one.
+
+        ``{"subject": ..., "claim": ..., "reason": ...}`` adds one in force (the
+        operator speaks with the trainer's authority). ``{"id": ..., "action":
+        "confirm" | "reject" | "lift" | "restore"}`` decides on a stored one.
+        """
+        from core.soul.retraction_flow import apply_retractions, decide_retraction
+
+        repository = self._soul_plugin().get_repository()
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = None
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="a JSON object is required")
+        try:
+            if payload.get("id"):
+                claim = await decide_retraction(
+                    repository, str(payload["id"]), str(payload.get("action") or "")
+                )
+                if claim is None:
+                    raise HTTPException(status_code=404, detail="unknown retraction")
+                log_info(
+                    f"{LOG_PREFIX} Retraction {claim.id} -> {claim.status} (WebUI)"
+                )
+                return JSONResponse(
+                    {"success": True, "retraction": self._retraction_to_dict(claim)}
+                )
+            subject = str(payload.get("subject") or "").strip()
+            if not subject:
+                raise HTTPException(status_code=400, detail="subject is required")
+            outcome = await apply_retractions(
+                repository,
+                [
+                    {
+                        "subject": subject,
+                        "claim": str(payload.get("claim") or subject).strip(),
+                        "reason": str(payload.get("reason") or "").strip(),
+                    }
+                ],
+                trainer=True,
+                asserted_by="webui",
+                source_ref="webui",
+            )
+        except HTTPException:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            log_error(f"{LOG_PREFIX} Failed to save a retraction: {exc}")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        log_info(f"{LOG_PREFIX} Retraction added from the WebUI: {outcome}")
+        return JSONResponse(
+            {
+                "success": True,
+                "stored": outcome.stored,
+                "retired_notes": outcome.retired_notes,
+                "abandoned_goals": outcome.abandoned_goals,
+                "discarded_proposal": outcome.discarded_proposal,
             }
         )
 
