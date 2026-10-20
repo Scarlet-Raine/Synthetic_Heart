@@ -3046,6 +3046,30 @@ def _add_core_injections(injections: dict[str, Any]) -> dict[str, Any]:
     return injections
 
 
+async def _add_retraction_injections(injections: dict[str, Any]) -> dict[str, Any]:
+    """Add the retraction blocks (known-false claims, pending confirmations).
+
+    Sourced from the SOUL store rather than a plugin's ``get_static_injection``
+    so they also ride when nothing else injects. Both lookups fail safe to an
+    empty block: a prompt is never lost to the store.
+    """
+    try:
+        from core.soul.retractions import (
+            get_known_false_claims_block,
+            get_pending_retractions_block,
+        )
+
+        known = await get_known_false_claims_block()
+        if known:
+            injections["known_false_claims"] = known
+        pending = await get_pending_retractions_block()
+        if pending:
+            injections["pending_retractions"] = pending
+    except Exception as exc:  # pragma: no cover - safety net
+        log_debug(f"[action_parser] retraction injections skipped: {exc}")
+    return injections
+
+
 async def gather_static_injections(message=None, context_memory=None):
     """Gathers static contextual data from all plugins that support 'static_inject'.
 
@@ -3172,7 +3196,7 @@ async def gather_static_injections(message=None, context_memory=None):
         # No plugin supplies an injection this turn; the core-sourced blocks
         # (the standing scene note) still ride, because they do not depend on a
         # plugin being enabled.
-        return _add_core_injections({})
+        return await _add_retraction_injections(_add_core_injections({}))
 
     gather_start = time.time()
     log_debug(
@@ -3222,6 +3246,7 @@ async def gather_static_injections(message=None, context_memory=None):
     # Core-sourced blocks last, so the logged key list below is the truth about
     # what this turn carries.
     injections = _add_core_injections(injections)
+    injections = await _add_retraction_injections(injections)
 
     log_info(
         f"[action_parser] 📊 gather_static_injections() returning {len(injections)} keys: {list(injections.keys())}"

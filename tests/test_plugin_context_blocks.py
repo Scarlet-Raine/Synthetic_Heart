@@ -13,7 +13,9 @@ render through the same table, on the same routes, as the ambient blocks.
 
 from pathlib import Path
 
-from core.action_parser import _add_core_injections
+import pytest
+
+from core.action_parser import _add_core_injections, _add_retraction_injections
 from core.prompt_engine import (
     _PLUGIN_CONTEXT_BLOCKS,
     _apply_plugin_block_supersedes,
@@ -246,3 +248,60 @@ def test_core_injections_keep_the_other_keys_and_never_raise(monkeypatch):
 
     monkeypatch.setattr("core.config_manager.config_registry.get_value", _boom)
     assert _add_core_injections({"home": "kitchen on"}) == {"home": "kitchen on"}
+
+
+def test_retraction_blocks_render_and_are_considered_rendered():
+    summary = _build_context_summary(
+        {
+            "known_false_claims": "- the trip does not exist",
+            "pending_retractions": "- [rtr-1] someone says X is false",
+        }
+    )
+    assert "[Known false claims]\n- the trip does not exist" in summary
+    assert "[Retractions awaiting the trainer]" in summary
+    assert (
+        _unrendered_injection_keys(["known_false_claims", "pending_retractions"]) == []
+    )
+
+
+def test_blank_retraction_blocks_add_nothing():
+    summary = _build_context_summary({"known_false_claims": "  "})
+    assert "[Known false claims]" not in summary
+
+
+@pytest.mark.asyncio
+async def test_retraction_injections_carry_active_and_pending_claims():
+    from core.soul.models import RetractedClaim
+    from core.soul.repository import InMemorySoulRepository
+
+    repo = InMemorySoulRepository()
+    await repo.upsert_retracted_claim(
+        RetractedClaim(
+            id="", subject="Ca Senz Autobus", claim="the trip", status="active"
+        )
+    )
+    await repo.upsert_retracted_claim(
+        RetractedClaim(id="", subject="Other thing", claim="other", status="pending")
+    )
+
+    class _Soul:
+        def get_repository(self):
+            return repo
+
+    from core import core_initializer
+
+    original = dict(core_initializer.PLUGIN_REGISTRY)
+    core_initializer.PLUGIN_REGISTRY["soul_plugin"] = _Soul()
+    try:
+        injections = await _add_retraction_injections({"home": "kitchen on"})
+    finally:
+        core_initializer.PLUGIN_REGISTRY.clear()
+        core_initializer.PLUGIN_REGISTRY.update(original)
+    assert injections["home"] == "kitchen on"
+    assert "the trip" in injections["known_false_claims"]
+    assert "other" in injections["pending_retractions"]
+
+
+@pytest.mark.asyncio
+async def test_retraction_injections_never_raise_without_soul():
+    assert await _add_retraction_injections({"home": "x"}) == {"home": "x"}

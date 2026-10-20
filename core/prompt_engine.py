@@ -1195,6 +1195,13 @@ _PLUGIN_CONTEXT_BLOCKS: tuple[tuple[str, str, str | None], ...] = (
     # it. Its own action path is unaffected; only the ordinary prompt gains the
     # lines, and only while an event falls inside the lookahead window.
     ("upcoming_events", "[Upcoming events]", None),
+    # Retractions (core/soul/retractions.py): what the trainer has said is FALSE,
+    # and what someone else said is false and awaits the trainer. Sourced by
+    # ``core.action_parser._add_retraction_injections``, and carried by the same
+    # table so the diary, the growth text and recalled memories that still restate
+    # the claim are read next to the statement that it is untrue.
+    ("known_false_claims", "[Known false claims]", None),
+    ("pending_retractions", "[Retractions awaiting the trainer]", None),
 )
 
 # Injected keys that some renderer already consumes. The drop detector in
