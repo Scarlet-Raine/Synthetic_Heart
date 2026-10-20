@@ -23,6 +23,15 @@ from typing import Any, Dict, List
 
 from core.config_manager import config_registry
 from core.logging_utils import log_debug, log_info, log_warning
+from core.soul.retraction_flow import (
+    apply_retractions,
+    describe_sender,
+    is_trainer_turn,
+    lift_retractions,
+    parse_lifted,
+    parse_retractions,
+    source_reference,
+)
 from core.transport_layer import extract_json_from_text, run_corrector_middleware
 
 
@@ -118,12 +127,26 @@ _EXTRACT_INSTRUCTIONS = (
     "place on 2026-09-21'), and never a bare relative word ('today', 'tomorrow', "
     "'tonight', 'this morning', 'yesterday'): 'tomorrow' written today is a false "
     "claim tomorrow.\n"
+    "A THIRD channel, 'retracted', is for statements the HUMAN says are FALSE: a "
+    "joke, a mistake, invented, or something that does not exist ('that place does "
+    "not exist', 'forget it, it was a joke', 'you made that up'). Only the human's "
+    "own words can retract. What the persona replied never counts, and a persona "
+    "repeating or insisting on a claim is not evidence for it. This is not for a "
+    "circumstance that was true and has ended (use 'ended'). List each as "
+    '{"subject": a SHORT canonical noun phrase naming what was claimed, "claim": '
+    'the false statement in one sentence, "reason": what the human said}. The '
+    "'known false claims' list shows retractions already in force: do not repeat "
+    "them, and if the human now says one of them is true after all, list its "
+    "subject under 'lifted'.\n"
+    "A note must rest on the HUMAN's words. Never write a note from something only "
+    "the persona asserted, and never a note about a known false claim.\n"
     'Return ONLY a JSON object: {"notes": [{"note_type": ..., "subject": ..., '
     '"summary": ..., "priority": 0, "confidence": 0.5, '
     '"valid_from": "2026-05-05T00:00:00+00:00", '
     '"valid_until": "2026-05-12T00:00:00+00:00"}], "ended": ["<subject that is now '
-    'over>"]} — return an empty notes list and an empty ended list '
-    "when nothing time-bounded was said."
+    'over>"], "retracted": [{"subject": ..., "claim": ..., "reason": ...}], '
+    '"lifted": ["<subject>"]} — return empty lists for whatever was not said; when '
+    "nothing at all was said, all four are empty."
 )
 
 
@@ -221,8 +244,11 @@ class DebriefSituationalNotesPlugin:
         llm_text: str,
         context: Dict[str, Any],
         original_message: Any,
-    ) -> tuple[List[Dict[str, Any]], List[str]]:
-        """Extract note dicts and ended subjects, correcting broken JSON once."""
+    ) -> tuple[List[Dict[str, Any]], List[str], List[Dict[str, str]], List[str]]:
+        """Extract notes, ended subjects, retractions and lifted subjects.
+
+        Broken JSON is sent to the corrector once.
+        """
         try:
             parsed, metadata = extract_json_from_text(llm_text, return_metadata=True)
         except Exception as exc:
@@ -234,14 +260,16 @@ class DebriefSituationalNotesPlugin:
 
         candidates = self._extract_note_candidates(parsed)
         ended = self._extract_ended_subjects(parsed)
-        if candidates or ended:
-            return candidates, ended
+        retracted = parse_retractions(parsed)
+        lifted = parse_lifted(parsed)
+        if candidates or ended or retracted or lifted:
+            return candidates, ended, retracted, lifted
         # An empty but well-formed answer is the normal "nothing temporal was
         # said" case; only bother the corrector when the payload looked broken.
         if isinstance(parsed, (dict, list)) and not (
             metadata.get("had_errors") or metadata.get("had_extra_text")
         ):
-            return [], []
+            return [], [], [], []
 
         corrected_text = await run_corrector_middleware(
             text=llm_text,
@@ -251,16 +279,19 @@ class DebriefSituationalNotesPlugin:
             thread_id=getattr(original_message, "thread_id", None),
         )
         if not isinstance(corrected_text, str) or not corrected_text.strip():
-            return [], []
+            return [], [], [], []
         try:
             corrected = extract_json_from_text(corrected_text, return_metadata=False)
         except Exception as exc:
             log_warning(
                 f"[debrief_situational_notes] corrected output still not JSON: {exc}"
             )
-            return [], []
-        return self._extract_note_candidates(corrected), self._extract_ended_subjects(
-            corrected
+            return [], [], [], []
+        return (
+            self._extract_note_candidates(corrected),
+            self._extract_ended_subjects(corrected),
+            parse_retractions(corrected),
+            parse_lifted(corrected),
         )
 
     @staticmethod
@@ -350,6 +381,90 @@ class DebriefSituationalNotesPlugin:
             "exchange shows is out of date must be retired by copying its subject "
             "exactly into 'ended'):\n" + "\n".join(lines)
         )
+
+    async def _known_false_block(self) -> str:
+        """The retractions in force, so the model neither repeats nor notes them."""
+        from core.soul.retractions import load_claims
+
+        claims = await load_claims(("active",))
+        pending = await load_claims(("pending",))
+        blocks = []
+        if claims:
+            lines = [f"- {claim.subject}: {claim.claim}" for claim in claims[:12]]
+            blocks.append(
+                "known false claims (retractions already in force; never write a "
+                "note about these, and list a subject under 'lifted' only if the "
+                "human now says it is true):\n" + "\n".join(lines)
+            )
+        if pending:
+            lines = [f"- {claim.subject}: {claim.claim}" for claim in pending[:12]]
+            blocks.append(
+                "pending retractions (someone other than the trainer said these "
+                "are false; they change nothing until the trainer decides. If the "
+                "trainer confirms one, list it under 'retracted' with the SAME "
+                "subject; if the trainer says it is true, list its subject under "
+                "'lifted'):\n" + "\n".join(lines)
+            )
+        return "\n\n".join(blocks)
+
+    async def _drop_known_false(
+        self, candidates: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Discard candidate notes that restate a retraction in force.
+
+        Deterministic backstop for the instruction: the persona repeating a false
+        claim is exactly how a retracted trip kept coming back as a fresh note.
+        """
+        if not candidates:
+            return candidates
+        from core.soul.retractions import claim_matching, load_claims
+
+        claims = await load_claims(("active",))
+        if not claims:
+            return candidates
+        kept = []
+        for raw in candidates:
+            subject = raw.get("subject", "")
+            text = f"{subject} {raw.get('summary', '')}"
+            if claim_matching(claims, subject=subject, text=text) is not None:
+                log_info(
+                    "[debrief_situational_notes] dropped a note about a retracted "
+                    f"claim: '{subject}'"
+                )
+                continue
+            kept.append(raw)
+        return kept
+
+    async def _apply_retractions(
+        self,
+        retracted: List[Dict[str, str]],
+        lifted: List[str],
+        *,
+        context: Dict[str, Any],
+        original_message: Any,
+    ) -> None:
+        repository = self._get_soul_repository()
+        if repository is None:
+            return
+        trainer = is_trainer_turn(context, original_message)
+        try:
+            outcome = await apply_retractions(
+                repository,
+                retracted,
+                trainer=trainer,
+                asserted_by=describe_sender(context, original_message),
+                source_ref=source_reference(context, original_message),
+            )
+            lifted_count = await lift_retractions(repository, lifted, trainer=trainer)
+        except Exception as exc:
+            log_warning(f"[debrief_situational_notes] retraction failed: {exc!r}")
+            return
+        if outcome.stored or outcome.pending or lifted_count:
+            log_info(
+                f"[debrief_situational_notes] retractions: {outcome.stored} in "
+                f"force, {outcome.pending} awaiting the trainer, {lifted_count} "
+                "lifted"
+            )
 
     async def _store_notes(
         self, candidates: List[Dict[str, Any]], session_id: str | None
@@ -549,6 +664,9 @@ class DebriefSituationalNotesPlugin:
         )
         if filed_block:
             user_prompt = f"{user_prompt}\n\n{filed_block}"
+        claims_block = await self._known_false_block()
+        if claims_block:
+            user_prompt = f"{user_prompt}\n\n{claims_block}"
 
         try:
             from core.config import derive_cortex_scope, get_active_cortex_engine
@@ -585,13 +703,26 @@ class DebriefSituationalNotesPlugin:
             log_warning(f"[debrief_situational_notes] LLM generation failed: {exc!r}")
             return None
 
-        candidates, ended_subjects = await self._parse_notes_output(
+        (
+            candidates,
+            ended_subjects,
+            retracted,
+            lifted,
+        ) = await self._parse_notes_output(
             llm_text=llm_text,
             context=context,
             original_message=original_message,
         )
-        if not candidates and not ended_subjects:
+        if not (candidates or ended_subjects or retracted or lifted):
             return None
+
+        # Retractions first: a note about something the trainer has just said is
+        # false must not be stored by the same turn that learned it.
+        if retracted or lifted:
+            await self._apply_retractions(
+                retracted, lifted, context=context, original_message=original_message
+            )
+        candidates = await self._drop_known_false(candidates)
 
         session_id = context.get("session_id") or getattr(
             original_message, "session_id", None
