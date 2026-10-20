@@ -76,6 +76,32 @@ class SituationalNote:
         return now >= self.valid_until
 
 
+# Lifecycle of a RetractedClaim. ``pending`` waits for the trainer, ``active``
+# is in force, ``lifted`` was withdrawn later and ``rejected`` was refused.
+RETRACTION_STATUSES = ("pending", "active", "lifted", "rejected")
+
+
+@dataclass(slots=True)
+class RetractedClaim:
+    """Something the persona believed or said that the human has said is false.
+
+    A SituationalNote expires on its own; a retraction does not. It stands until
+    someone lifts it, and every prompt and generator is told to treat ``claim``
+    as untrue. Rows are never deleted, only moved between statuses.
+    """
+
+    id: str
+    subject: str
+    claim: str
+    reason: str = ""
+    status: str = "pending"
+    asserted_by: str = ""
+    source_ref: str = ""
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    lifted_at: datetime | None = None
+
+
 @dataclass(slots=True)
 class MemCell:
     """Atomic episodic memory unit."""
@@ -425,6 +451,17 @@ def situational_note_id(note_type: str, subject: str, summary: str) -> str:
         str(part or "").strip().casefold() for part in (note_type, subject, summary)
     )
     return f"tsc-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
+
+
+def retracted_claim_id(subject: str, claim: str) -> str:
+    """Build a stable id for one retraction.
+
+    Derived from the content, like :func:`situational_note_id`, so the debrief
+    re-reading the same transcript upserts one row instead of adding another.
+    """
+
+    raw = "|".join(str(part or "").strip().casefold() for part in (subject, claim))
+    return f"rtr-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
 
 
 def now_utc() -> datetime:

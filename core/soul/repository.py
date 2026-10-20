@@ -19,9 +19,11 @@ from .models import (
     MemCellRecall,
     MemCellSummary,
     MemScene,
+    RetractedClaim,
     SituationalNote,
     compute_recall_salience,
     now_utc,
+    retracted_claim_id,
     situational_note_id,
 )
 
@@ -223,6 +225,14 @@ class SoulRepository(Protocol):
 
     async def archive_expired_situational_notes(self, now: datetime) -> int: ...
 
+    async def upsert_retracted_claim(self, claim: RetractedClaim) -> str: ...
+
+    async def list_retracted_claims(
+        self, statuses: Collection[str] | None = None
+    ) -> list[RetractedClaim]: ...
+
+    async def set_retraction_status(self, claim_id: str, new_status: str) -> None: ...
+
     async def add_dsp_extraction(self, extraction: DspExtraction) -> None: ...
 
     async def list_recent_dsp_extractions(self, limit: int) -> list[DspExtraction]: ...
@@ -272,6 +282,7 @@ class InMemorySoulRepository:
     kg_triples: list[KgTriple] = field(default_factory=list)
     foresight_signals: list[ForesightSignal] = field(default_factory=list)
     situational_notes: dict[str, SituationalNote] = field(default_factory=dict)
+    retracted_claims: dict[str, RetractedClaim] = field(default_factory=dict)
     dsp_extractions: list[DspExtraction] = field(default_factory=list)
     active_dsp: DspVersion | None = None
 
@@ -370,6 +381,41 @@ class InMemorySoulRepository:
         for note_id in expired_ids:
             self.situational_notes[note_id].status = "archived"
         return len(expired_ids)
+
+    async def upsert_retracted_claim(self, claim: RetractedClaim) -> str:
+        claim_id = claim.id or retracted_claim_id(claim.subject, claim.claim)
+        claim.id = claim_id
+        now = now_utc()
+        existing = self.retracted_claims.get(claim_id)
+        if existing is not None:
+            # A second, weaker account must not demote a retraction in force.
+            if existing.status == "active" and claim.status == "pending":
+                claim.status = "active"
+            claim.created_at = existing.created_at
+        claim.created_at = claim.created_at or now
+        claim.updated_at = now
+        self.retracted_claims[claim_id] = claim
+        return claim_id
+
+    async def list_retracted_claims(
+        self, statuses: Collection[str] | None = None
+    ) -> list[RetractedClaim]:
+        items = [
+            c
+            for c in self.retracted_claims.values()
+            if statuses is None or c.status in statuses
+        ]
+        items.sort(key=lambda c: c.created_at or now_utc(), reverse=True)
+        return items
+
+    async def set_retraction_status(self, claim_id: str, new_status: str) -> None:
+        claim = self.retracted_claims.get(claim_id)
+        if claim is None:
+            return
+        claim.status = new_status
+        claim.updated_at = now_utc()
+        if new_status == "lifted":
+            claim.lifted_at = claim.updated_at
 
     async def add_dsp_extraction(self, extraction: DspExtraction) -> None:
         self.dsp_extractions.append(extraction)
@@ -697,6 +743,21 @@ class PostgresSoulRepository:
             "CREATE INDEX IF NOT EXISTS idx_situational_active ON situational_notes(status, valid_until) WHERE status='active'",
             "CREATE INDEX IF NOT EXISTS idx_situational_subject ON situational_notes(subject)",
             "CREATE INDEX IF NOT EXISTS idx_situational_valid_until ON situational_notes(valid_until)",
+            """
+            CREATE TABLE IF NOT EXISTS retracted_claims (
+                id TEXT PRIMARY KEY,
+                subject TEXT NOT NULL,
+                claim TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                status VARCHAR(16) NOT NULL DEFAULT 'pending',
+                asserted_by TEXT NOT NULL DEFAULT '',
+                source_ref TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                lifted_at TIMESTAMPTZ
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_retracted_claims_status ON retracted_claims(status)",
         ]
 
         async with pool.acquire() as conn:
@@ -1088,6 +1149,88 @@ class PostgresSoulRepository:
                 now,
             )
         return _affected_rows(status, "UPDATE")
+
+    async def upsert_retracted_claim(self, claim: RetractedClaim) -> str:
+        if not claim.id:
+            claim.id = retracted_claim_id(claim.subject, claim.claim)
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            # A second, weaker account (``pending``) must not demote a retraction
+            # already in force.
+            await conn.execute(
+                """
+                INSERT INTO retracted_claims (
+                    id, subject, claim, reason, status, asserted_by, source_ref,
+                    created_at, updated_at
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+                ON CONFLICT (id)
+                DO UPDATE SET
+                    reason = EXCLUDED.reason,
+                    status = CASE
+                        WHEN retracted_claims.status = 'active'
+                             AND EXCLUDED.status = 'pending'
+                        THEN 'active'
+                        ELSE EXCLUDED.status
+                    END,
+                    asserted_by = EXCLUDED.asserted_by,
+                    source_ref = EXCLUDED.source_ref,
+                    lifted_at = CASE
+                        WHEN EXCLUDED.status = 'lifted' THEN NOW() ELSE NULL
+                    END,
+                    updated_at = NOW()
+                """,
+                claim.id,
+                claim.subject,
+                claim.claim,
+                claim.reason,
+                claim.status,
+                claim.asserted_by,
+                claim.source_ref,
+            )
+        return claim.id
+
+    async def list_retracted_claims(
+        self, statuses: Collection[str] | None = None
+    ) -> list[RetractedClaim]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            if statuses is None:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, subject, claim, reason, status, asserted_by,
+                           source_ref, created_at, updated_at, lifted_at
+                    FROM retracted_claims
+                    ORDER BY created_at DESC
+                    """
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, subject, claim, reason, status, asserted_by,
+                           source_ref, created_at, updated_at, lifted_at
+                    FROM retracted_claims
+                    WHERE status = ANY($1::text[])
+                    ORDER BY created_at DESC
+                    """,
+                    list(statuses),
+                )
+        return [self._row_to_retracted_claim(row) for row in rows]
+
+    async def set_retraction_status(self, claim_id: str, new_status: str) -> None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE retracted_claims
+                SET status = $2::text,
+                    lifted_at = CASE WHEN $2::text = 'lifted' THEN NOW() ELSE lifted_at END,
+                    updated_at = NOW()
+                WHERE id = $1
+                """,
+                claim_id,
+                new_status,
+            )
 
     async def add_dsp_extraction(self, extraction: DspExtraction) -> None:
         pool = await self._get_pool()
@@ -1548,6 +1691,28 @@ class PostgresSoulRepository:
             except Exception:
                 return []
         return []
+
+    @staticmethod
+    def _row_to_retracted_claim(row: Any) -> RetractedClaim:
+        def _to_dt(val: Any) -> datetime | None:
+            if val is None:
+                return None
+            if isinstance(val, str):
+                return datetime.fromisoformat(val)
+            return val
+
+        return RetractedClaim(
+            id=str(row["id"]),
+            subject=str(row["subject"]),
+            claim=str(row["claim"]),
+            reason=str(row["reason"] or ""),
+            status=str(row["status"] or "pending"),
+            asserted_by=str(row["asserted_by"] or ""),
+            source_ref=str(row["source_ref"] or ""),
+            created_at=_to_dt(row["created_at"]),
+            updated_at=_to_dt(row["updated_at"]),
+            lifted_at=_to_dt(row["lifted_at"]),
+        )
 
     @staticmethod
     def _row_to_situational_note(row: Any) -> SituationalNote:
