@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import threading
 import time
@@ -666,14 +667,24 @@ async def gather_recon_contributions(
         try:
             # Pass the message/context so plugins can tailor their instruction
             # (e.g. whether the user attached files). Older plugins take none.
-            instruction = str(
-                plugin.get_recon_instruction(
-                    message=message, context_memory=context_memory
-                )
+            instruction = plugin.get_recon_instruction(
+                message=message, context_memory=context_memory
             )
         except TypeError:
-            instruction = str(plugin.get_recon_instruction())
-        recon_specs.append((plugin, key, instruction))
+            instruction = plugin.get_recon_instruction()
+        try:
+            # Stateful contributors may load a small snapshot without blocking
+            # the event loop. Existing synchronous contributors are unchanged.
+            if inspect.isawaitable(instruction):
+                instruction = await asyncio.wait_for(instruction, timeout=5)
+            recon_specs.append((plugin, key, str(instruction)))
+        except Exception as exc:
+            log_warning(
+                f"[recon] Instruction unavailable for {key}: {type(exc).__name__}"
+            )
+
+    if not recon_specs:
+        return []
 
     # Build combined system prompt
     keys = [key for _, key, _ in recon_specs]
@@ -741,11 +752,12 @@ async def gather_recon_contributions(
     keys_set = set(keys)
     needs_language = "language_hint" in keys_set
     needs_tone = "tone_hint" in keys_set
+    hints_only = keys_set <= {"language_hint", "tone_hint"}
 
     llm_text = None
     parsed: dict[str, Any] | None = None
     cached_hint = _get_cached_hint(cache_key)
-    if cached_hint:
+    if cached_hint and hints_only:
         has_lang = bool(cached_hint.get("language_code"))
         has_tone = bool(
             cached_hint.get("message_tone") or cached_hint.get("conversation_tone")
@@ -764,7 +776,7 @@ async def gather_recon_contributions(
             log_debug("[recon] Hint cache hit — skipping Recon LLM call")
 
     # If only language is required and local precheck found a value, skip LLM.
-    if parsed is None and local_language and needs_language and not needs_tone:
+    if parsed is None and local_language and keys_set == {"language_hint"}:
         parsed = {"language_hint": {"language_code": local_language}}
         log_debug(
             f"[recon] Local lingua precheck resolved language={local_language}; skipping Recon LLM call"
