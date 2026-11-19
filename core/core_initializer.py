@@ -12,6 +12,15 @@ from pathlib import Path
 from typing import Any
 from core.logging_utils import log_info, log_error, log_warning, log_debug
 from core.config import list_available_cortex_engines
+
+# Imported for its side effect: registers the CALL_* config vars (and the call
+# manager singleton is created lazily) before the config registry is loaded.
+import core.call_manager  # noqa: F401,E402
+
+# Importing this makes packages installed on first use of an engine (e.g. Vosk)
+# importable (it appends their persistent directory to sys.path) before any
+# engine loads, and registers AUTO_INSTALL_ENGINE_PACKAGES.
+import core.package_installer  # noqa: F401,E402
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 from enum import Enum
@@ -91,7 +100,7 @@ VENDORED_RUNTIME_DIR_SEGMENTS: frozenset[str] = frozenset(
 NON_PLUGIN_DIR_SEGMENTS: frozenset[str] = frozenset({"tests", "test", "__pycache__"})
 
 
-def is_plugin_candidate(py_file: Path) -> bool:
+def is_plugin_candidate(py_file: Path, root: Path | None = None) -> bool:
     """Whether a ``.py`` found by the recursive plugin scan is a plugin.
 
     Skips package markers and private modules, vendored third-party runtime
@@ -106,15 +115,22 @@ def is_plugin_candidate(py_file: Path) -> bool:
     """
     if py_file.name == "__init__.py" or py_file.name.startswith("_"):
         return False
-    if any(part in VENDORED_RUNTIME_DIR_SEGMENTS for part in py_file.parts):
+    # Judge only the part of the path below the scan root: the checkout itself
+    # may live under a directory called ``test`` or ``tests`` (``~/tests/synth``),
+    # which must not disqualify every plugin.
+    parts = py_file.parts
+    if root is not None:
+        try:
+            parts = py_file.relative_to(root).parts
+        except ValueError:
+            pass
+    if any(part in VENDORED_RUNTIME_DIR_SEGMENTS for part in parts):
         return False
-    if any(part in NON_PLUGIN_DIR_SEGMENTS for part in py_file.parts):
+    if any(part in NON_PLUGIN_DIR_SEGMENTS for part in parts):
         return False
     if py_file.name == "conftest.py" or py_file.name.startswith("test_"):
         return False
     return True
-
-
 
 
 def derive_plugin_category(
@@ -1268,7 +1284,7 @@ class CoreInitializer:
                 continue
 
             for py_file in base_path.rglob("*.py"):
-                if not is_plugin_candidate(py_file):
+                if not is_plugin_candidate(py_file, base_path):
                     continue
 
                 if (
